@@ -14,6 +14,7 @@ import {
 } from "./db";
 import { clientDownload, installScript } from "./install";
 import { homePage, invitePage, threadPage } from "./ui";
+import { sendWebhook, type Resolver } from "./webhook";
 
 export interface AppOptions {
   /** SQLite path. Defaults to an in-memory database. */
@@ -48,6 +49,8 @@ export interface AppOptions {
   postLimit?: number;
   /** Use the first X-Forwarded-For address as the client's, for a server behind a proxy. */
   trustProxy?: boolean;
+  /** How webhook hosts are resolved at send time. Defaults to the system resolver; tests replace it. */
+  resolveHost?: Resolver;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -1207,14 +1210,13 @@ export function createApp(opts: AppOptions) {
       const who = agents.length ? "your agent has not picked up" : "no agent is connected on your side to read";
       const text = `Parley: ${who} ${stale.n} message${stale.n === 1 ? "" : "s"} from ${stale.authors} in "${thread.title}".`;
       try {
-        const res = await fetch(side.notify_url!, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ text, thread: { id: thread.id, title: thread.title }, unread: stale.n }),
-          redirect: "error",
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!res.ok) console.error(`notify webhook for side ${side.id} returned ${res.status}`);
+        // Resolved and checked at send time, and sent to the checked address: see src/webhook.ts.
+        const status = await sendWebhook(
+          side.notify_url!,
+          { text, thread: { id: thread.id, title: thread.title }, unread: stale.n },
+          { allowPrivate: opts.allowPrivateWebhooks, resolve: opts.resolveHost },
+        );
+        if (status < 200 || status >= 300) console.error(`notify webhook for side ${side.id} returned ${status}`);
       } catch (err) {
         console.error(`notify webhook for side ${side.id} failed: ${(err as Error).message}`);
       }
