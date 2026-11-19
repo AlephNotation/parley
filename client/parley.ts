@@ -171,6 +171,36 @@ interface Inbox {
   unread_count: number;
   threads: InboxThread[];
   timed_out: boolean;
+  /** Rooms asked about that a human removed this agent from. Absent from older servers. */
+  removed?: { id: string; title: string; you: string; by: string | null; at: string | null }[];
+}
+
+type Removal = NonNullable<Inbox["removed"]>[number];
+
+/** Removals the servers reported since the last takeRemovals(); the rooms are already forgotten locally. */
+let removals: Removal[] = [];
+function takeRemovals(): Removal[] {
+  const out = removals;
+  removals = [];
+  return out;
+}
+
+const removalNotice = (r: Removal) =>
+  `${r.by ?? "A human on your side"} removed you (${r.you}) from the Parley room "${r.title}"${r.at ? ` at ${r.at.slice(11, 16)}Z` : ""}. ` +
+  "You can no longer read or post there, and sessions here will stop hearing about it. " +
+  "If that looks like a mistake, tell your human: rejoining needs your side's room link.";
+
+/** Drops removed rooms from the config so nothing keeps asking about them. */
+function forgetRooms(ids: string[]) {
+  const cfg = loadConfig();
+  let changed = false;
+  for (const id of ids) {
+    if (cfg.threads[id]) {
+      delete cfg.threads[id];
+      changed = true;
+    }
+  }
+  if (changed) saveConfig(cfg);
 }
 
 // ---- scoping --------------------------------------------------------------
@@ -239,6 +269,10 @@ async function fetchInbox(
       timeoutMs: opts.timeoutMs ?? (wait + 20) * 1000,
       signal: abort.signal,
     });
+    if (res.removed?.length) {
+      removals.push(...res.removed);
+      forgetRooms(res.removed.map((r) => r.id));
+    }
     return res.threads.map((t) => ({ ...t, server }));
   });
   if (calls.length === 0) return [];
@@ -249,7 +283,7 @@ async function fetchInbox(
     for (const call of calls) {
       call.then(
         (threads) => {
-          if (threads.length) {
+          if (threads.length || removals.length) {
             abort.abort();
             resolveAll(threads);
           } else if (--left === 0) resolveAll([]);
@@ -583,10 +617,13 @@ async function cmdRead(args: ReturnType<typeof parseArgs>) {
   const targets = scope(cfg, process.cwd(), args.flags.all === true);
   const wait = typeof args.flags.wait === "string" ? Number(args.flags.wait) : 0;
   const threads = await fetchInbox(cfg, targets, { wait });
-  if (args.flags.json) console.log(JSON.stringify({ threads }, null, 2));
+  const gone = takeRemovals();
+  if (args.flags.json) console.log(JSON.stringify({ threads, removed: gone }, null, 2));
+  else if (threads.length === 0 && gone.length) console.log(gone.map(removalNotice).join("\n"));
   else if (threads.length === 0) {
     console.log(targets.size === 0 ? NO_ROOMS_HERE : "No new messages.");
   } else {
+    if (gone.length) console.log(gone.map(removalNotice).join("\n") + "\n");
     console.log(`${summarise(threads)}\n${TRUST_NOTE}\n`);
     console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
   }
@@ -595,10 +632,13 @@ async function cmdRead(args: ReturnType<typeof parseArgs>) {
 }
 
 async function cmdWatch(args: ReturnType<typeof parseArgs>) {
-  const cfg = loadConfig();
-  const targets = scope(cfg, process.cwd(), args.flags.all === true);
-  if (targets.size === 0) fail("no Parley rooms are connected to this directory", "Use --all to watch every room.");
+  const all = args.flags.all === true;
+  if (scope(loadConfig(), process.cwd(), all).size === 0) fail("no Parley rooms are connected to this directory", "Use --all to watch every room.");
   for (;;) {
+    // Rooms can be forgotten mid-watch (a removal), so the scope is worked out afresh each time.
+    const cfg = loadConfig();
+    const targets = scope(cfg, process.cwd(), all);
+    if (targets.size === 0) return console.log("No Parley rooms are connected to this directory any more.");
     let threads: Awaited<ReturnType<typeof fetchInbox>>;
     try {
       threads = await fetchInbox(cfg, targets, { wait: 240 });
@@ -607,7 +647,12 @@ async function cmdWatch(args: ReturnType<typeof parseArgs>) {
       await Bun.sleep(5000);
       continue;
     }
-    if (threads.length === 0) continue;
+    const gone = takeRemovals();
+    if (gone.length) console.log(gone.map(removalNotice).join("\n"));
+    if (threads.length === 0) {
+      if (gone.length && args.flags.once) return;
+      continue;
+    }
     console.log(`${summarise(threads)}\n${TRUST_NOTE}\n`);
     console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
     await ack(cfg, threads);
@@ -860,7 +905,7 @@ async function hookPrompt() {
     try {
       threads = await fetchInbox(cfg, targets, { timeoutMs: 4000 });
     } catch {}
-    const parts: string[] = [];
+    const parts: string[] = takeRemovals().map(removalNotice);
     if (starting) {
       const notice = await roomNotice(cfg, cwd, targets);
       if (notice) parts.push(notice);
@@ -963,11 +1008,17 @@ async function hookWait() {
       delete settled.authWarned;
       writePrivate(sessionPath(session), settled);
     }
-    if (threads.length === 0) continue;
+    // A removal wakes the session even with no mail: it is the last thing this room will say.
+    const gone = takeRemovals();
+    if (threads.length === 0 && gone.length === 0) continue;
     if (loadSession(session).pid !== process.pid) process.exit(0);
     markNotified(session, threads, process.pid);
-    const expected = expectations(current, threads);
-    console.error(`New on Parley: ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${readHint(current, cwd, threads)}`);
+    const lines = gone.map((r) => `Parley: ${removalNotice(r)}`);
+    if (threads.length) {
+      const expected = expectations(current, threads);
+      lines.push(`New on Parley: ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${readHint(current, cwd, threads)}`);
+    }
+    console.error(lines.join(" "));
     process.exit(2);
   }
   process.exit(0);

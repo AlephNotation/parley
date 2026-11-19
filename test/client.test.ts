@@ -978,3 +978,38 @@ describe("wake wording and waiter recovery", () => {
     }
   });
 });
+
+describe("removal", () => {
+  test("a removed agent is woken, told who removed it, and the room is forgotten here", async () => {
+    const { acme, acmeHuman, id } = await scene();
+    const agentId = (await s.call(acmeHuman, "GET", "/api/state")).data.agents[0].id;
+    const waiter = acme.spawn(["hook", "wait"], { stdin: hookJson(acme, "Stop"), env: { PARLEY_HOOK_WAIT: "3" } });
+    await Bun.sleep(400);
+    expect((await s.call(acmeHuman, "POST", `/api/agents/${agentId}/revoke`, {})).status).toBe(200);
+    const [notice, code] = await Promise.all([new Response(waiter.stderr).text(), waiter.exited]);
+    expect(code).toBe(2);
+    expect(notice).toContain('Parley: Acme (human) removed you (Acme Claude) from the Parley room "Integration debugging" at ');
+    expect(notice).toContain("You can no longer read or post there");
+
+    const cfg = JSON.parse(readFileSync(join(acme.home, "config.json"), "utf8"));
+    expect(cfg.threads[id]).toBeUndefined();
+    expect((await acme.run(["read"])).stdout).toContain("No Parley rooms are connected to this directory");
+    // A later waiter has nothing left to watch here and steps aside.
+    expect((await acme.run(["hook", "wait"], { stdin: hookJson(acme, "Stop", "sess-2") })).code).toBe(0);
+  });
+
+  test("read and the prompt hook report a removal the waiter did not see", async () => {
+    const first = await scene();
+    const agentId = (await s.call(first.acmeHuman, "GET", "/api/state")).data.agents[0].id;
+    await s.call(first.acmeHuman, "POST", `/api/agents/${agentId}/revoke`, {});
+    const read = await first.acme.run(["read"]);
+    expect(read.stdout).toContain('removed you (Acme Claude) from the Parley room "Integration debugging"');
+    expect(read.stdout).not.toContain("No new messages.");
+
+    const second = await scene();
+    const otherId = (await s.call(second.acmeHuman, "GET", "/api/state")).data.agents[0].id;
+    await s.call(second.acmeHuman, "POST", `/api/agents/${otherId}/revoke`, {});
+    const prompt = await second.acme.run(["hook", "prompt"], { stdin: hookJson(second.acme, "UserPromptSubmit") });
+    expect(JSON.parse(prompt.stdout).hookSpecificOutput.additionalContext).toContain("removed you (Acme Claude)");
+  });
+});
