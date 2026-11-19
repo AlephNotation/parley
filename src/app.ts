@@ -42,6 +42,8 @@ export interface AppOptions {
   sweepIntervalMs?: number;
   /** Allow notification webhooks to plain-http and private hosts. For local development and tests only. */
   allowPrivateWebhooks?: boolean;
+  /** How long a room-wide message every agent read may go unanswered before the page flags it. */
+  unownedAfterMs?: number;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -117,6 +119,7 @@ function slug(value: string): string {
 export function createApp(opts: AppOptions) {
   const db = openDb(opts.dbPath ?? ":memory:");
   const streakLimit = opts.streakLimit ?? 30;
+  const unownedAfterMs = opts.unownedAfterMs ?? 5 * 60 * 1000;
   const maxWait = opts.maxWaitSeconds ?? 240;
   const notifyDelayMs = opts.notifyDelayMs ?? 120_000;
   const pageMessages = opts.pageMessages ?? 1000;
@@ -624,7 +627,50 @@ export function createApp(opts: AppOptions) {
       // A page shows the tail of a long room, never a frozen head.
       messages: latestMessages(p, pageMessages).map(view),
       pending: pendingFor(p).map(view),
+      unowned: unowned(p.thread_id),
     });
+  }
+
+  /**
+   * The bystander case: the room's latest speaker posted room-wide, every other agent has read it, and
+   * nobody has said anything since, for longer than `unownedAfterMs`. Each agent decided it was not
+   * theirs, so nobody owns it, and only a human can fix that. Returns what the page should flag, or null.
+   * Only the tail of the room is considered: once anyone else speaks, the message has had a response.
+   */
+  function unowned(threadId: string) {
+    const tail = db
+      .query(
+        `SELECT * FROM messages WHERE thread_id = ? AND status = 'sent' AND kind != 'system' AND visible_to IS NULL
+         ORDER BY seq DESC LIMIT 50`,
+      )
+      .all(threadId) as MessageRow[];
+    if (tail.length === 0) return null;
+    // The latest speaker's unbroken run of messages at the end of the room.
+    const author = tail[0]!.participant_id;
+    const run: MessageRow[] = [];
+    for (const m of tail) {
+      if (m.participant_id !== author) break;
+      run.push(m);
+    }
+    const roomWide = run.filter((m) => m.audience === "room").reverse();
+    const first = roomWide[0];
+    if (!first) return null;
+    if (Date.now() - (first.delivered_at ?? first.created_at) < unownedAfterMs) return null;
+    const others = db
+      .query("SELECT name, read_seq FROM participants WHERE thread_id = ? AND kind = 'agent' AND revoked = 0 AND id IS NOT ?")
+      .all(threadId, author) as { name: string; read_seq: number }[];
+    // With no other agent there is nobody to be a bystander; the unread-mail webhook covers that case.
+    if (others.length === 0) return null;
+    const last = roomWide.at(-1)!;
+    if (!others.every((a) => a.read_seq >= last.seq!)) return null;
+    return {
+      /** The room-wide messages nobody picked up, oldest first. */
+      seqs: roomWide.map((m) => m.seq!),
+      from: first.author,
+      since: new Date(first.delivered_at ?? first.created_at).toISOString(),
+      /** Every other agent, all of whom have read them. */
+      read_by: others.map((a) => a.name),
+    };
   }
 
   async function reviewMessage(req: Request, id: number, action: "approve" | "reject"): Promise<Response> {

@@ -23,6 +23,7 @@ bun test
 | `PARLEY_PUBLIC_URL` | derived from the request | Origin used in generated links |
 | `PARLEY_DIST` | `dist` | Directory of compiled client binaries |
 | `PARLEY_STREAK_LIMIT` | `30` | Agent messages in a row, with no human involved, before a room pauses itself |
+| `PARLEY_UNOWNED_AFTER` | `300` | Seconds a room-wide message every agent has read may go unanswered before the room page's state flags it as unowned |
 | `PARLEY_WAKE_BUCKET` | `3` | Wake tokens an agent can hold |
 | `PARLEY_WAKE_REFILL_MS` | `20000` | Milliseconds for one wake token to come back. `0` turns the budget off |
 
@@ -186,8 +187,8 @@ Agents, with the agent token:
 
 - The room page has no way to address a message yet, so a human's post always
   goes to the whole room. The API accepts `to` and `fyi` from humans.
-- A room-wide message that every agent reads and decides is not theirs gets no
-  owner, and nothing alerts a human to that.
+- The room page does not show `unowned` yet: the server reports a room-wide
+  message every agent read and nobody answered, but the page does not flag it.
 - An agent removed from a room is not told; it finds out when its next post is
   refused.
 - Human identity: anyone holding a side's link is that side's human, and can
