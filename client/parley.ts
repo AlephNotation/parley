@@ -209,6 +209,18 @@ function scope(cfg: Config, cwd: string, all: boolean): Map<string, string[] | u
 
 type Seen = Record<string, number>;
 
+/**
+ * Rejects if `promise` has not settled within `ms`. A backstop to the request's own abort signal, so a
+ * connection a proxy holds open after the server behind it died can never stall a waiter for good.
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(`no answer within ${ms / 1000}s`), { name: "TimeoutError" })), ms);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
 /** Fetches the inbox from every server in scope. With `wait`, returns as soon as any server has mail. */
 async function fetchInbox(
   cfg: Config,
@@ -274,13 +286,16 @@ function renderMessage(m: Msg): string {
 const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
 
 /**
- * True when a direct message is for this agent: it names this agent (by name or address) or its side,
- * or names nobody, which the server reports for a plain message in a room with one other agent.
+ * How a direct message reaches this agent: "me" when it names this agent (by name or address) or names
+ * nobody, which the server reports for a plain message in a room with one other agent; "side" when it
+ * names only this agent's side; null when it is addressed to others.
  */
-const addressedToMe = (m: Msg, t: ThreadInfo, address: string | undefined) =>
-  m.audience === "direct" &&
-  ((m.to ?? []).length === 0 ||
-    (m.to ?? []).some((name) => same(name, t.you.side) || same(name, t.you.name) || (!!address && same(name, address))));
+function addressedTo(m: Msg, t: ThreadInfo, address: string | undefined): "me" | "side" | null {
+  if (m.audience !== "direct") return null;
+  const to = m.to ?? [];
+  if (to.length === 0 || to.some((name) => same(name, t.you.name) || (!!address && same(name, address)))) return "me";
+  return to.some((name) => same(name, t.you.side)) ? "side" : null;
+}
 
 /**
  * Why this agent is being told about a room's unread messages, and what is expected of it.
@@ -288,20 +303,29 @@ const addressedToMe = (m: Msg, t: ThreadInfo, address: string | undefined) =>
  */
 function expectation(t: InboxThread, address: string | undefined): string {
   const mail = t.unread.filter((m) => m.kind !== "system" && m.from !== t.you.name);
-  if (!mail.some((m) => m.audience) && !t.your_human) return "";
+  if (!mail.some((m) => m.audience) && !t.your_human && !t.paused) return "";
   const parts: string[] = [];
   const ownHuman = mail.filter((m) => m.kind === "human" && m.side === t.you.side);
-  const direct = mail.filter((m) => !ownHuman.includes(m) && addressedToMe(m, t, address));
-  const room = mail.filter((m) => !ownHuman.includes(m) && !direct.includes(m) && m.audience === "room");
-  const fyi = mail.filter((m) => m.audience === "fyi");
-  if (ownHuman.length) parts.push("Your side's human wrote: they expect a response.");
-  if (direct.length) parts.push(`Addressed to you (${seqs(direct)}): a reply is expected.`);
+  const others = mail.filter((m) => !ownHuman.includes(m));
+  const toMe = others.filter((m) => addressedTo(m, t, address) === "me");
+  // A side named by someone on that same side is a note for the side's human, not work for its agents.
+  const toSide = others.filter((m) => addressedTo(m, t, address) === "side" && m.side !== t.you.side);
+  const toOwnHuman = others.filter((m) => addressedTo(m, t, address) === "side" && m.side === t.you.side);
+  const room = others.filter((m) => m.audience === "room");
+  const fyi = others.filter((m) => m.audience === "fyi");
+  if (t.paused) {
+    parts.push("The room is paused: agents cannot post until a human resumes it, so read now and reply once it is resumed.");
+  }
+  if (ownHuman.length) parts.push(`Your side's human wrote (${seqs(ownHuman)}): they expect a response.`);
+  if (toMe.length) parts.push(`Addressed to you (${seqs(toMe)}): reply if it asks something of you.`);
+  if (toSide.length) parts.push(`Addressed to your side (${seqs(toSide)}): reply if it is yours to answer rather than your human's.`);
+  if (toOwnHuman.length) parts.push(`Sent by your own side to your side (${seqs(toOwnHuman)}): it is for your human; no reply is needed from you.`);
   if (room.length) {
     parts.push(
       `Room-wide (${seqs(room)}): act only if relevant. If it needs an owner and that is you, say so; if it is nobody, tell your human.`,
     );
   }
-  if (fyi.length && parts.length === 0) parts.push("For your information only: no reply is owed.");
+  if (fyi.length && !ownHuman.length && !toMe.length && !toSide.length && !room.length) parts.push("For your information only: no reply is owed.");
   if (t.your_human === "watching") parts.push("Your side's human is watching the room.");
   else if (t.your_human === "away") parts.push("Your side's human is not watching right now.");
   else if (t.your_human === "not_joined") parts.push("Your side's human has not opened the room.");
@@ -340,7 +364,11 @@ function renderThreadMail(cfg: Config, cwd: string, t: InboxThread & { server?: 
   const expected = expectation(t, t.server ? cfg.servers[t.server]?.address : undefined);
   if (expected) lines.push(`  Expected: ${expected}`);
   lines.push(`  Here: ${renderPeople(t.participants)}`);
-  lines.push(`  Reply: ${sayCommand(cfg, cwd, t.id)}   (or -f <file> for long messages)${t.review ? "   Your side's human reviews it before it is posted." : ""}`);
+  lines.push(
+    t.paused
+      ? "  Reply: not possible while the room is paused; a human must resume it first."
+      : `  Reply: ${sayCommand(cfg, cwd, t.id)}   (or -f <file> for long messages)${t.review ? "   Your side's human reviews it before it is posted." : ""}`,
+  );
   return lines.join("\n");
 }
 
@@ -741,6 +769,8 @@ interface SessionState {
   pid?: number;
   /** Per thread, the highest seq this session was already told about. */
   notified: Seen;
+  /** Servers whose refusal of this agent's credentials the session was already woken about. */
+  authWarned?: string[];
 }
 
 const sessionPath = (id: string) => join(HOME, "sessions", `${id.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
@@ -748,7 +778,7 @@ const sessionPath = (id: string) => join(HOME, "sessions", `${id.replace(/[^A-Za
 function loadSession(id: string): SessionState {
   try {
     const raw = JSON.parse(readFileSync(sessionPath(id), "utf8")) as Partial<SessionState>;
-    return { pid: raw.pid, notified: raw.notified ?? {} };
+    return { pid: raw.pid, notified: raw.notified ?? {}, authWarned: raw.authWarned };
   } catch {
     return { notified: {} };
   }
@@ -756,6 +786,8 @@ function loadSession(id: string): SessionState {
 
 function markNotified(id: string, threads: InboxThread[], pid?: number) {
   const state = loadSession(id);
+  // Mail getting through means the credentials work again.
+  if (threads.length) delete state.authWarned;
   for (const t of threads) state.notified[t.id] = Math.max(state.notified[t.id] ?? 0, t.ack_seq);
   if (pid !== undefined) state.pid = pid;
   writePrivate(sessionPath(id), state);
@@ -767,8 +799,13 @@ function replyCommand(cfg: Config, cwd: string, rooms: string[]): string {
   return `${selfName()} say <room id> "<text>"`;
 }
 
-const readHint = (cfg: Config, cwd: string, rooms: string[]) =>
-  `Run \`${selfName()} read\` to read them, and reply with \`${replyCommand(cfg, cwd, rooms)}\` if a reply is needed. ${TRUST_NOTE}`;
+function readHint(cfg: Config, cwd: string, threads: { id: string; paused?: boolean }[]): string {
+  const open = threads.filter((t) => !t.paused).map((t) => t.id);
+  const reply = open.length
+    ? `, and reply with \`${replyCommand(cfg, cwd, open)}\` if a reply is needed`
+    : "; you cannot reply until a human resumes the room";
+  return `Run \`${selfName()} read\` to read them${reply}. ${TRUST_NOTE}`;
+}
 
 /**
  * What a session is told when it starts in a connected directory, whether or not anything is new.
@@ -832,7 +869,7 @@ async function hookPrompt() {
       if (input.session_id) markNotified(input.session_id, threads);
       const expected = expectations(cfg, threads);
       parts.push(
-        `You have ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${starting ? `Run \`${selfName()} read\` to read them.` : readHint(cfg, cwd, threads.map((t) => t.id))}`,
+        `You have ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${starting ? `Run \`${selfName()} read\` to read them.` : readHint(cfg, cwd, threads)}`,
       );
     }
     if (parts.length === 0) return;
@@ -874,26 +911,63 @@ async function hookWait() {
     } catch {}
   }
 
+  // Retry delays, and how many refusals in a row count as more than a restart blip. Tests shorten them.
+  const retryMs = Number(process.env.PARLEY_HOOK_RETRY_MS ?? 10_000);
+  const authLimit = Number(process.env.PARLEY_HOOK_AUTH_LIMIT ?? 6);
+  let failures = 0;
+  let refusals = 0;
+
   while (Date.now() < deadline) {
     // Stand down if a newer waiter took over this session, or the session that started us is gone.
     if (loadSession(session).pid !== process.pid) process.exit(0);
     if (parent !== 1 && process.ppid !== parent) process.exit(0);
-    targets = scope(loadConfig(), cwd, false);
-    if (targets.size === 0) process.exit(0);
     let threads: Awaited<ReturnType<typeof fetchInbox>>;
+    let current: Config;
     try {
-      threads = await fetchInbox(cfg, targets, { wait: waitSeconds, seen: loadSession(session).notified });
+      current = loadConfig();
+      targets = scope(current, cwd, false);
+      if (targets.size === 0) process.exit(0);
+      threads = await withDeadline(
+        fetchInbox(current, targets, { wait: waitSeconds, seen: loadSession(session).notified }),
+        (waitSeconds + 30) * 1000,
+      );
     } catch (err) {
-      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) process.exit(0);
-      await Bun.sleep(10_000);
+      // Never give up silently: a server restart, a proxy error page or a brief credential refusal
+      // during a deploy all look like errors here, and the session must keep hearing about mail.
+      failures++;
+      const refused = err instanceof ApiError && (err.status === 401 || err.status === 403);
+      refusals = refused ? refusals + 1 : 0;
+      if (refused && refusals >= authLimit) {
+        const server = [...targets.keys()][0] ?? "the Parley server";
+        const warned = loadSession(session).authWarned ?? [];
+        if (!warned.includes(server)) {
+          const state = loadSession(session);
+          state.authWarned = [...warned, server];
+          writePrivate(sessionPath(session), state);
+          console.error(
+            `Parley: ${server} keeps refusing this agent's credentials (${(err as ApiError).message}). ` +
+              `If you were removed from the room, you can no longer read or post there. ` +
+              `Run \`${selfName()} status\` to check; tell your human if it stays broken. Waiting continues in the background.`,
+          );
+          process.exit(2);
+        }
+      }
+      await Bun.sleep(Math.min(retryMs * 2 ** Math.min(failures - 1, 3), 60_000));
       continue;
+    }
+    failures = 0;
+    refusals = 0;
+    const settled = loadSession(session);
+    if (settled.authWarned?.length) {
+      // Working again: a later refusal deserves a fresh warning.
+      delete settled.authWarned;
+      writePrivate(sessionPath(session), settled);
     }
     if (threads.length === 0) continue;
     if (loadSession(session).pid !== process.pid) process.exit(0);
     markNotified(session, threads, process.pid);
-    const now = loadConfig();
-    const expected = expectations(now, threads);
-    console.error(`New on Parley: ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${readHint(now, cwd, threads.map((t) => t.id))}`);
+    const expected = expectations(current, threads);
+    console.error(`New on Parley: ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${readHint(current, cwd, threads)}`);
     process.exit(2);
   }
   process.exit(0);
