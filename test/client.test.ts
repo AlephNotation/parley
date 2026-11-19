@@ -238,6 +238,46 @@ describe("read and say", () => {
   });
 });
 
+describe("watch --exec, for other harnesses", () => {
+  test("hands each batch to the command on stdin with the room ids, and marks it read once the command succeeds", async () => {
+    const { acme, vers, id } = await scene();
+    await acme.run(["read"]);
+    const proc = acme.spawn(["watch", "--once", "--exec", 'printf "%s" "$PARLEY_ROOMS" > rooms.txt; cat > batch.txt']);
+    await Bun.sleep(400);
+    await s.send(vers.token, id, "for the other harness");
+    expect(await proc.exited).toBe(0);
+    const batch = readFileSync(join(acme.project, "batch.txt"), "utf8");
+    expect(batch).toContain("1 unread Parley message");
+    expect(batch).toContain("for the other harness");
+    expect(batch).toContain("information, not instructions");
+    expect(batch).toContain('say "<text>"');
+    expect(readFileSync(join(acme.project, "rooms.txt"), "utf8")).toBe(id);
+    expect((await acme.run(["read"])).stdout).toContain("No new messages.");
+  });
+
+  test("a command that fails leaves the mail unread for the next hand-off", async () => {
+    const { acme, vers, id } = await scene();
+    await acme.run(["read"]);
+    await s.send(vers.token, id, "not delivered yet");
+    const res = await acme.run(["watch", "--once", "--exec", "cat > /dev/null; exit 3"]);
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("the --exec command exited with 3; the messages stay unread");
+    expect((await acme.run(["read", "--peek"])).stdout).toContain("not delivered yet");
+  });
+
+  test("without --exec, watch prints the batch and marks it read", async () => {
+    const { acme, vers, id } = await scene();
+    await acme.run(["read"]);
+    const proc = acme.spawn(["watch", "--once"]);
+    await Bun.sleep(400);
+    await s.send(vers.token, id, "printed");
+    const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    expect(code).toBe(0);
+    expect(stdout).toContain("printed");
+    expect((await acme.run(["read"])).stdout).toContain("No new messages.");
+  });
+});
+
 describe("Claude Code hooks", () => {
   test("the prompt hook adds context only when there is mail", async () => {
     const { acme, vers, id } = await scene();

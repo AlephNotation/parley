@@ -580,11 +580,36 @@ async function cmdWatch(args: ReturnType<typeof parseArgs>) {
       continue;
     }
     if (threads.length === 0) continue;
-    console.log(`${summarise(threads)}\n${TRUST_NOTE}\n`);
-    console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
+    const text = `${summarise(threads)}\n${TRUST_NOTE}\n\n${threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n")}\n`;
+    if (typeof args.flags.exec === "string") {
+      // Hand the batch to another harness. Only a command that succeeds counts as delivery, so mail
+      // a failed hand-off carried stays unread and comes round again.
+      const code = await handOff(args.flags.exec, text, threads);
+      if (code !== 0) {
+        console.error(`parley: the --exec command exited with ${code}; the messages stay unread and will be handed off again.`);
+        if (args.flags.once) process.exit(1);
+        await Bun.sleep(Number(process.env.PARLEY_EXEC_RETRY_MS ?? 30_000));
+        continue;
+      }
+    } else console.log(text);
     await ack(cfg, threads);
     if (args.flags.once) return;
   }
+}
+
+/**
+ * Runs `command` through the shell with the new messages on stdin, waiting for it to finish, so one
+ * harness turn handles one batch and mail arriving meanwhile becomes the next batch.
+ * PARLEY_ROOMS carries the ids of the rooms the batch came from.
+ */
+async function handOff(command: string, text: string, threads: { id: string }[]): Promise<number> {
+  const proc = Bun.spawn(["sh", "-c", command], {
+    stdin: new Blob([text]),
+    stdout: "inherit",
+    stderr: "inherit",
+    env: { ...process.env, PARLEY_ROOMS: threads.map((t) => t.id).join(",") },
+  });
+  return await proc.exited;
 }
 
 interface Audience {
@@ -1140,6 +1165,7 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
   parley history [room]            Print a room's full history
   parley rooms                     List every room you are in
   parley watch [--once] [--all]    Block and print messages as they arrive (for other harnesses)
+               [--exec '<cmd>']    ...or run <cmd> per batch with the messages on stdin
   parley bind <room> [dir]         Connect a room to a different directory (--global for all)
   parley setup claude-code         Reinstall or remove the Claude Code hooks (--remove, --ask-to-post)
   parley status                    Check the connection
