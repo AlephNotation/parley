@@ -3,9 +3,33 @@ import { Database } from "bun:sqlite";
 export type ParticipantKind = "human" | "agent";
 export type MessageKind = ParticipantKind | "system";
 export type MessageStatus = "sent" | "pending" | "rejected";
+/** Who a message is meant to wake: named agents or sides, the whole room, or nobody. */
+export type Audience = "direct" | "room" | "fyi";
 
-/** Bump when the schema changes incompatibly. */
-const SCHEMA_VERSION = 2;
+/** Bump when the schema changes, and add the step from the previous version to MIGRATIONS. */
+const SCHEMA_VERSION = 3;
+
+/** MIGRATIONS[n] upgrades a database from schema version n to n + 1. */
+const MIGRATIONS: Record<number, string> = {
+  2: `
+    ALTER TABLE messages ADD COLUMN audience TEXT NOT NULL DEFAULT 'room';
+    ALTER TABLE messages ADD COLUMN addressed TEXT;
+    ALTER TABLE participants ADD COLUMN tokens REAL NOT NULL DEFAULT 3;
+    ALTER TABLE participants ADD COLUMN tokens_at INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE wakes (
+      message_id INTEGER NOT NULL REFERENCES messages(id),
+      participant_id TEXT NOT NULL REFERENCES participants(id),
+      wake_at INTEGER NOT NULL,
+      PRIMARY KEY (message_id, participant_id)
+    );
+    CREATE INDEX wakes_participant ON wakes (participant_id, wake_at);
+    -- Before this version every message woke every agent, so mail still unread keeps doing so.
+    INSERT INTO wakes (message_id, participant_id, wake_at)
+      SELECT m.id, p.id, 0 FROM messages m JOIN participants p ON p.thread_id = m.thread_id
+      WHERE p.kind = 'agent' AND m.status = 'sent' AND m.seq > p.read_seq
+        AND m.participant_id IS NOT p.id AND (m.visible_to IS NULL OR m.visible_to = p.side_id);
+  `,
+};
 
 export interface ThreadRow {
   id: string;
@@ -49,6 +73,9 @@ export interface ParticipantRow {
   revoked: number;
   /** Highest seq this participant has acknowledged. Everything after it is unread. */
   read_seq: number;
+  /** Attention budget: wake tokens left as of `tokens_at`. A `tokens_at` in the future is a wake already being held until then. */
+  tokens: number;
+  tokens_at: number;
   last_seen: number | null;
   created_at: number;
 }
@@ -79,6 +106,9 @@ export interface MessageRow {
   seq: number | null;
   /** When set, only this side can see the message. */
   visible_to: string | null;
+  audience: Audience;
+  /** JSON array of the agent or side names the sender addressed, as written. Null when none. */
+  addressed: string | null;
   created_at: number;
   delivered_at: number | null;
 }
@@ -90,11 +120,25 @@ export function openDb(path: string): Database {
   const { user_version: found } = db.query("PRAGMA user_version").get() as { user_version: number };
   const hasTables = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'").get() !== null;
   if (hasTables && found !== SCHEMA_VERSION) {
-    db.close();
-    throw new Error(
-      `The database at ${path} uses schema version ${found}, but this build needs version ${SCHEMA_VERSION}. ` +
-        "There is no migration yet: move the file aside (or set PARLEY_DB to a new path) and start again.",
-    );
+    const steps: string[] = [];
+    for (let v = found; v < SCHEMA_VERSION; v++) {
+      const step = MIGRATIONS[v];
+      if (!step) break;
+      steps.push(step);
+    }
+    if (found > SCHEMA_VERSION || steps.length !== SCHEMA_VERSION - found) {
+      db.close();
+      throw new Error(
+        `The database at ${path} uses schema version ${found}, but this build needs version ${SCHEMA_VERSION} ` +
+          "and has no migration between them: move the file aside (or set PARLEY_DB to a new path) and start again.",
+      );
+    }
+    // All steps or none: a failed upgrade leaves the file exactly as it was.
+    db.transaction(() => {
+      for (const step of steps) db.exec(step);
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    })();
+    console.log(`Upgraded the database at ${path} from schema version ${found} to ${SCHEMA_VERSION}.`);
   }
 
   db.exec(`
@@ -132,6 +176,8 @@ export function openDb(path: string): Database {
       mailbox_id TEXT REFERENCES mailboxes(id),
       revoked INTEGER NOT NULL DEFAULT 0,
       read_seq INTEGER NOT NULL DEFAULT 0,
+      tokens REAL NOT NULL DEFAULT 3,
+      tokens_at INTEGER NOT NULL DEFAULT 0,
       last_seen INTEGER,
       created_at INTEGER NOT NULL,
       UNIQUE (mailbox_id, thread_id)
@@ -160,8 +206,17 @@ export function openDb(path: string): Database {
       seq INTEGER,
       visible_to TEXT REFERENCES sides(id),
       created_at INTEGER NOT NULL,
-      delivered_at INTEGER
+      delivered_at INTEGER,
+      audience TEXT NOT NULL DEFAULT 'room',
+      addressed TEXT
     );
+    CREATE TABLE IF NOT EXISTS wakes (
+      message_id INTEGER NOT NULL REFERENCES messages(id),
+      participant_id TEXT NOT NULL REFERENCES participants(id),
+      wake_at INTEGER NOT NULL,
+      PRIMARY KEY (message_id, participant_id)
+    );
+    CREATE INDEX IF NOT EXISTS wakes_participant ON wakes (participant_id, wake_at);
     CREATE INDEX IF NOT EXISTS messages_thread_seq ON messages (thread_id, seq);
     CREATE INDEX IF NOT EXISTS participants_mailbox ON participants (mailbox_id);
     PRAGMA user_version = ${SCHEMA_VERSION};

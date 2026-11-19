@@ -19,6 +19,8 @@ const app = createApp({
   publicUrl: process.env.PARLEY_PUBLIC_URL,
   distDir: process.env.PARLEY_DIST ?? "dist",
   streakLimit: process.env.PARLEY_STREAK_LIMIT ? Number(process.env.PARLEY_STREAK_LIMIT) : undefined,
+  wakeBucket: process.env.PARLEY_WAKE_BUCKET ? Number(process.env.PARLEY_WAKE_BUCKET) : undefined,
+  wakeRefillMs: process.env.PARLEY_WAKE_REFILL_MS ? Number(process.env.PARLEY_WAKE_REFILL_MS) : undefined,
 });
 
 const server = Bun.serve({

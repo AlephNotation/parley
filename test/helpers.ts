@@ -10,6 +10,8 @@ export function startServer(overrides: Partial<AppOptions> = {}) {
     sweepIntervalMs: 0,
     notifyDelayMs: 0,
     allowPrivateWebhooks: true,
+    // Most tests are about something else; the attention budget has its own tests.
+    wakeRefillMs: 0,
     ...overrides,
   });
   const server = Bun.serve({ port: 0, idleTimeout: 30, fetch: app.fetch });

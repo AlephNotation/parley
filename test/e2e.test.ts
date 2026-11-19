@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
+import { SCHEMA_V2 } from "./fixtures-schema-v2";
 import { ADMIN, mail, startServer } from "./helpers";
 
 let s: ReturnType<typeof startServer>;
@@ -375,6 +377,18 @@ describe("human controls", () => {
     expect((await s.call(t.vers.token, "GET", "/api/me")).status).toBe(200);
   });
 
+  test("the page shows the newest messages once a room outgrows it", async () => {
+    const small = startServer({ pageMessages: 5 });
+    try {
+      const t = await small.thread(false);
+      for (let i = 1; i <= 8; i++) await small.call(t.versHuman, "POST", "/api/messages", { body: `msg ${i}` });
+      const state = (await small.call(t.acmeHuman, "GET", "/api/state")).data;
+      expect(state.messages.map((m: any) => m.body)).toEqual(["msg 4", "msg 5", "msg 6", "msg 7", "msg 8"]);
+    } finally {
+      await small.stop();
+    }
+  });
+
   test("the page long-poll returns when the thread changes", async () => {
     const t = await s.setup(true);
     const version = (await s.call(t.versHuman, "GET", "/api/state")).data.version;
@@ -383,6 +397,188 @@ describe("human controls", () => {
     await s.call(t.acmeHuman, "POST", "/api/messages", { body: "hi" });
     const res = await waiting;
     expect(res.data.version).toBeGreaterThan(version);
+  });
+});
+
+describe("who a message wakes", () => {
+  /** Three agents: Vers Claude, Acme Claude and Acme Claude 2, all with nothing unread. */
+  async function three(server = s) {
+    const t = await server.setup(false);
+    const acme2 = await server.seat(t.acmeHuman);
+    for (const token of [t.vers.token, t.acme.token, acme2.token]) {
+      const data = await server.inbox(token);
+      const acks = data.threads.map((x: any) => ({ thread: x.id, seq: x.ack_seq }));
+      if (acks.length) await server.call(token, "POST", "/api/inbox/ack", { acks });
+    }
+    const say = (token: string, body: string, extra: object = {}) => server.call(token, "POST", `/api/threads/${t.id}/messages`, { body, ...extra });
+    return { ...t, acme2, say };
+  }
+  const unread = (data: any) => data.threads.flatMap((x: any) => x.unread);
+
+  test("a message addressed to one agent wakes it and only rides along for the others", async () => {
+    const t = await three();
+    const addressed = s.inbox(t.acme.token, "?wait=3");
+    const bystander = s.inbox(t.acme2.token, "?wait=1");
+    await Bun.sleep(150);
+    const sent = await t.say(t.vers.token, "for you", { to: [t.acme.address] });
+    expect(sent.data.message.audience).toBe("direct");
+    expect(sent.data.note).toContain("Acme Claude is listening and will be notified now");
+    expect(sent.data.note).toContain("Acme Claude 2 is not woken by this");
+
+    expect(unread(await addressed)).toMatchObject([{ body: "for you", audience: "direct", to: [t.acme.address], woke: true }]);
+    expect((await bystander).timed_out).toBe(true);
+    // Not woken, but nothing is lost: it is there the next time the agent looks.
+    expect(unread(await s.inbox(t.acme2.token))).toMatchObject([{ body: "for you", woke: false }]);
+  });
+
+  test("a side can be addressed, and an agent by its name", async () => {
+    const t = await three();
+    await t.say(t.acme.token, "to the side", { to: ["vers"] });
+    await t.say(t.acme.token, "by name", { to: ["Acme Claude 2"] });
+    expect(unread(await s.inbox(t.vers.token)).map((m: any) => [m.body, m.woke])).toEqual([["to the side", true], ["by name", false]]);
+    expect(unread(await s.inbox(t.acme2.token)).map((m: any) => [m.body, m.woke])).toEqual([["to the side", false], ["by name", true]]);
+  });
+
+  test("an fyi wakes nobody and is still delivered", async () => {
+    const t = await three();
+    const waiting = s.inbox(t.acme.token, "?wait=1");
+    await Bun.sleep(150);
+    const sent = await t.say(t.vers.token, "status only", { fyi: true });
+    expect(sent.data.message.audience).toBe("fyi");
+    expect((await waiting).timed_out).toBe(true);
+    expect(unread(await s.inbox(t.acme.token))).toMatchObject([{ body: "status only", audience: "fyi", woke: false }]);
+  });
+
+  test("a plain message is room-wide, unless one agent is all there is to hear it", async () => {
+    const t = await three();
+    expect((await t.say(t.vers.token, "everyone")).data.message.audience).toBe("room");
+    // Naming every other agent is the room by another name.
+    expect((await t.say(t.vers.token, "also everyone", { to: ["Acme"] })).data.message.audience).toBe("room");
+    const pair = await s.setup(false);
+    expect((await s.send(pair.vers.token, pair.id, "just you")).data.message.audience).toBe("direct");
+  });
+
+  test("unknown recipients and contradictory addressing are refused with the valid names", async () => {
+    const t = await three();
+    const unknown = await t.say(t.vers.token, "hello", { to: ["Nobody"] });
+    expect(unknown.status).toBe(400);
+    expect(unknown.data.error.code).toBe("unknown_recipient");
+    expect(unknown.data.error.hint).toContain("Acme");
+    expect(unknown.data.error.hint).toContain("Acme Claude 2");
+    expect((await t.say(t.vers.token, "hello", { to: ["Acme"], fyi: true })).status).toBe(400);
+  });
+
+  test("a held message is addressed when it is approved, not when it was written", async () => {
+    const t = await s.setup(true);
+    await drain(t.acme.token);
+    const held = await s.call(t.vers.token, "POST", `/api/threads/${t.id}/messages`, { body: "reviewed", to: ["Acme"] });
+    const waiting = s.inbox(t.acme.token, "?wait=3");
+    await Bun.sleep(150);
+    await s.call(t.versHuman, "POST", `/api/messages/${held.data.message.id}/approve`, {});
+    expect(unread(await waiting)).toMatchObject([{ body: "reviewed", woke: true }]);
+  });
+
+  test("the inbox says whether the agent's own human is watching", async () => {
+    const t = await s.setup(false);
+    await s.send(t.vers.token, t.id, "hi");
+    expect((await s.inbox(t.acme.token)).threads[0].your_human).toBe("away");
+  });
+
+  describe("attention budget", () => {
+    // Three tokens, one back every 300ms: a room-wide wake costs all three, a direct wake one.
+    let b: ReturnType<typeof startServer>;
+    beforeAll(() => {
+      b = startServer({ wakeBucket: 3, wakeRefillMs: 300 });
+    });
+    afterAll(() => b.stop());
+    const ackAll = async (token: string) => {
+      const data = await b.inbox(token);
+      await b.call(token, "POST", "/api/inbox/ack", { acks: data.threads.map((x: any) => ({ thread: x.id, seq: x.ack_seq })) });
+    };
+
+    test("a second room-wide message is held until the agent can afford the wake, then one wake shows everything", async () => {
+      const t = await three(b);
+      await Bun.sleep(950); // joining and draining spent nothing, but start from a full bucket regardless
+      const first = await t.say(t.vers.token, "one");
+      expect(first.data.note).not.toContain("will be woken in about");
+      expect(unread(await b.inbox(t.acme.token, "?wait=2"))).toMatchObject([{ body: "one", woke: true }]);
+      await ackAll(t.acme.token);
+
+      const began = Date.now();
+      const second = await t.say(t.vers.token, "two");
+      expect(second.data.note).toContain("Acme Claude will be woken in about 1s");
+      expect(second.data.note).toContain("address an agent or side with --to");
+      await t.say(t.vers.token, "three");
+      // Not woken yet, though the mail is already there to read.
+      expect(unread(await b.inbox(t.acme.token)).map((m: any) => [m.body, m.woke])).toEqual([["two", false], ["three", false]]);
+      const woken = await b.inbox(t.acme.token, "?wait=3");
+      expect(Date.now() - began).toBeGreaterThan(500);
+      expect(unread(woken).map((m: any) => [m.body, m.woke])).toEqual([["two", true], ["three", true]]);
+    });
+
+    test("direct messages spend one token each, so a short exchange is never slowed", async () => {
+      const t = await three(b);
+      await Bun.sleep(950);
+      for (const body of ["a", "b", "c"]) {
+        const sent = await t.say(t.vers.token, body, { to: [t.acme.address] });
+        expect(sent.data.note).not.toContain("will be woken in about");
+      }
+      const fourth = await t.say(t.vers.token, "d", { to: [t.acme.address] });
+      expect(fourth.data.note).toContain("Acme Claude will be woken in about 1s");
+      expect(fourth.data.note).toContain("held until it has budget");
+    });
+
+    test("an agent's own human always gets through, and reaches other sides as a room message", async () => {
+      const t = await three(b);
+      await Bun.sleep(950);
+      await t.say(t.vers.token, "spend the budget");
+      await ackAll(t.acme.token);
+      const mine = b.inbox(t.acme.token, "?wait=2");
+      await Bun.sleep(100);
+      const began = Date.now();
+      const sent = await b.call(t.acmeHuman, "POST", "/api/messages", { body: "from your human" });
+      expect(unread(await mine)).toMatchObject([{ body: "from your human", woke: true }]);
+      expect(Date.now() - began).toBeLessThan(250);
+      expect(sent.data.message.audience).toBe("room");
+    });
+  });
+});
+
+describe("upgrading an older database", () => {
+  test("a version 2 database is migrated in place and its unread mail still wakes its agent", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "parley-migrate-")), "parley.db");
+    const old = new Database(path, { create: true });
+    old.exec(SCHEMA_V2);
+    old.exec(`
+      INSERT INTO threads (id, title, created_at) VALUES ('aa', 'Old room', 1);
+      INSERT INTO sides (id, thread_id, name, approval) VALUES ('s1', 'aa', 'Vers', 0), ('s2', 'aa', 'Acme', 0);
+      INSERT INTO mailboxes (id, address, label, token_hash, created_at) VALUES ('m1', 'acme-claude-000000', 'Acme Claude', '${new Bun.CryptoHasher("sha256").update("pm_old").digest("hex")}', 1);
+      INSERT INTO participants (id, thread_id, side_id, kind, name, mailbox_id, read_seq, created_at) VALUES ('p1', 'aa', 's2', 'agent', 'Acme Claude', 'm1', 1, 1);
+      INSERT INTO messages (thread_id, kind, author, body, status, seq, created_at, delivered_at) VALUES
+        ('aa', 'system', 'Parley', 'already read', 'sent', 1, 1, 1),
+        ('aa', 'system', 'Parley', 'still unread', 'sent', 2, 2, 2);
+    `);
+    old.close();
+
+    const upgraded = startServer({ dbPath: path });
+    try {
+      const woken = await upgraded.inbox("pm_old", "?wait=1");
+      expect(woken.timed_out).toBe(false);
+      expect(woken.threads[0].unread).toMatchObject([{ body: "still unread", audience: "room", woke: true }]);
+    } finally {
+      await upgraded.stop();
+    }
+    const after = new Database(path);
+    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(3);
+    after.close();
+  });
+
+  test("a database from a newer build is refused rather than guessed at", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "parley-migrate-")), "parley.db");
+    const future = new Database(path, { create: true });
+    future.exec(SCHEMA_V2.replace("user_version = 2", "user_version = 99"));
+    future.close();
+    expect(() => startServer({ dbPath: path })).toThrow("schema version 99");
   });
 });
 
@@ -442,6 +638,20 @@ describe("notifying humans when no agent picks up mail", () => {
     expect(hook.hits.length).toBe(1);
     expect(hook.hits[0].text).toContain("your agent has not picked up 1 message from Vers Claude");
     expect(hook.hits[0].thread.id).toBe(t.id);
+    hook.stop();
+  });
+
+  test("an fyi nobody picked up does not notify anyone, and plain text is addressed in the URL", async () => {
+    const hook = receiver();
+    const t = await s.setup(false);
+    await s.call(t.acmeHuman, "POST", "/api/settings", { notify_url: hook.url });
+    const sent = await s.call(t.vers.token, "POST", `/api/threads/${t.id}/messages?fyi=1`, "just a status note");
+    expect(sent.data.message.audience).toBe("fyi");
+    await s.app.sweep();
+    expect(hook.hits.length).toBe(0);
+    const direct = await s.call(t.vers.token, "POST", `/api/threads/${t.id}/messages?to=Acme`, "for Acme");
+    expect(direct.data.message.to).toEqual(["Acme"]);
+    await s.call(t.acmeHuman, "POST", "/api/settings", { notify_url: null });
     hook.stop();
   });
 
