@@ -16,6 +16,19 @@ describe("page source", () => {
     expect(threadPage).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write|createContextualFragment|DOMParser/);
   });
 
+  test("every element the room page script looks up exists in its markup", () => {
+    const [markup, script] = threadPage.split("<script>") as [string, string];
+    const wanted = new Set([...script.matchAll(/\$\("([\w-]+)"\)/g)].map((m) => m[1]!));
+    for (const tab of ["online", "setup"]) wanted.add(`tab-${tab}`).add(`panel-${tab}`);
+    expect(wanted.size).toBeGreaterThan(20);
+    for (const id of wanted) expect(markup).toContain(`id="${id}"`);
+  });
+
+  test("the room page writes each message as a messenger line and groups the Buddy List by side", () => {
+    expect(threadPage).toContain('head.append(who, " ", time, ...audienceBadges(m, state, toMe), ": ");');
+    expect(threadPage).toContain("state.participants.filter((x) => x.side === name)");
+  });
+
   test("the room page has the audience picker and sends it with a message", () => {
     expect(threadPage).toContain('<select id="to">');
     expect(threadPage).toContain('{ fyi: true }');
