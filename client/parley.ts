@@ -154,6 +154,8 @@ interface Person {
 interface ThreadInfo {
   id: string;
   title: string;
+  /** The agent's shared read mark. Absent from older servers. */
+  read_seq?: number;
   paused: boolean;
   you: { name: string; side: string };
   review: boolean;
@@ -213,7 +215,7 @@ type Seen = Record<string, number>;
 async function fetchInbox(
   cfg: Config,
   targets: Map<string, string[] | undefined>,
-  opts: { wait?: number; seen?: Seen; timeoutMs?: number } = {},
+  opts: { wait?: number; seen?: Seen; from?: Seen; timeoutMs?: number } = {},
 ): Promise<(InboxThread & { server: string })[]> {
   const abort = new AbortController();
   const wait = opts.wait ?? 0;
@@ -223,6 +225,8 @@ async function fetchInbox(
     if (wait) params.set("wait", String(wait));
     const seen = Object.entries(opts.seen ?? {}).map(([id, seq]) => `${id}:${seq}`);
     if (seen.length) params.set("seen", seen.join(","));
+    const from = Object.entries(opts.from ?? {}).map(([id, seq]) => `${id}:${seq}`);
+    if (from.length) params.set("from", from.join(","));
     const res = await api<Inbox>(server, cfg.servers[server]!.token, "GET", `/api/inbox?${params}`, {
       timeoutMs: opts.timeoutMs ?? (wait + 20) * 1000,
       signal: abort.signal,
@@ -554,7 +558,8 @@ async function cmdRead(args: ReturnType<typeof parseArgs>) {
   const cfg = loadConfig();
   const targets = scope(cfg, process.cwd(), args.flags.all === true);
   const wait = typeof args.flags.wait === "string" ? Number(args.flags.wait) : 0;
-  const threads = await fetchInbox(cfg, targets, { wait });
+  const session = commandSession();
+  const threads = await fetchInbox(cfg, targets, { wait, from: await sessionMarks(cfg, targets, session) });
   if (args.flags.json) console.log(JSON.stringify({ threads }, null, 2));
   else if (threads.length === 0) {
     console.log(targets.size === 0 ? NO_ROOMS_HERE : "No new messages.");
@@ -563,7 +568,10 @@ async function cmdRead(args: ReturnType<typeof parseArgs>) {
     console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
   }
   // Printing is delivery: the agent now has the messages in its context.
-  if (!args.flags.peek && threads.length) await ack(cfg, threads);
+  if (!args.flags.peek && threads.length) {
+    markRead(session, threads);
+    await ack(cfg, threads);
+  }
 }
 
 async function cmdWatch(args: ReturnType<typeof parseArgs>) {
@@ -573,7 +581,7 @@ async function cmdWatch(args: ReturnType<typeof parseArgs>) {
   for (;;) {
     let threads: Awaited<ReturnType<typeof fetchInbox>>;
     try {
-      threads = await fetchInbox(cfg, targets, { wait: 240 });
+      threads = await fetchInbox(cfg, targets, { wait: 240, from: await sessionMarks(cfg, targets, commandSession()) });
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) fail(err.message, err.hint);
       await Bun.sleep(5000);
@@ -582,6 +590,7 @@ async function cmdWatch(args: ReturnType<typeof parseArgs>) {
     if (threads.length === 0) continue;
     console.log(`${summarise(threads)}\n${TRUST_NOTE}\n`);
     console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
+    markRead(commandSession(), threads);
     await ack(cfg, threads);
     if (args.flags.once) return;
   }
@@ -638,7 +647,9 @@ async function cmdHistory(args: ReturnType<typeof parseArgs>) {
   const info = res.thread as ThreadInfo;
   console.log(`== ${info.title}  [room ${info.id}]  you are ${info.you.name} (${info.you.side})${info.paused ? "  ** PAUSED **" : ""}`);
   console.log(TRUST_NOTE);
-  for (const m of res.messages as Msg[]) console.log(renderMessage(m) + (m.seq > res.read_seq && m.from !== info.you.name ? "   [new]" : ""));
+  const mine = commandSession() ? loadSession(commandSession()!).read?.[t.id] : undefined;
+  const readTo = mine ?? res.read_seq;
+  for (const m of res.messages as Msg[]) console.log(renderMessage(m) + (m.seq > readTo && m.from !== info.you.name ? "   [new]" : ""));
   if (res.pending.length) console.log(`  (${res.pending.length} of your messages are waiting for your side's human to approve)`);
   console.log(`  Here: ${renderPeople(res.participants)}`);
 }
@@ -741,6 +752,8 @@ interface SessionState {
   pid?: number;
   /** Per thread, the highest seq this session was already told about. */
   notified: Seen;
+  /** Per thread, this session's own read mark, so another session reading does not hide mail from it. */
+  read?: Seen;
 }
 
 const sessionPath = (id: string) => join(HOME, "sessions", `${id.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
@@ -748,7 +761,7 @@ const sessionPath = (id: string) => join(HOME, "sessions", `${id.replace(/[^A-Za
 function loadSession(id: string): SessionState {
   try {
     const raw = JSON.parse(readFileSync(sessionPath(id), "utf8")) as Partial<SessionState>;
-    return { pid: raw.pid, notified: raw.notified ?? {} };
+    return { pid: raw.pid, notified: raw.notified ?? {}, read: raw.read };
   } catch {
     return { notified: {} };
   }
@@ -765,6 +778,49 @@ function markNotified(id: string, threads: InboxThread[], pid?: number) {
 function replyCommand(cfg: Config, cwd: string, rooms: string[]): string {
   if (rooms.length === 1) return sayCommand(cfg, cwd, rooms[0]!);
   return `${selfName()} say <room id> "<text>"`;
+}
+
+/**
+ * The Claude Code session a command runs in, so it can keep its own read mark. Claude Code sets
+ * CLAUDE_CODE_SESSION_ID for commands and passes the same id to hooks; other harnesses can set
+ * PARLEY_SESSION. Without either, the agent's shared read mark applies, as before.
+ */
+const commandSession = (): string | null => process.env.PARLEY_SESSION || process.env.CLAUDE_CODE_SESSION_ID || null;
+
+/**
+ * This session's read marks for the rooms in scope. A room the session has no mark for yet starts at
+ * the agent's shared mark as it is now, so a new session does not replay old mail, and from then on
+ * other sessions reading cannot move it.
+ */
+async function sessionMarks(cfg: Config, targets: Map<string, string[] | undefined>, session: string | null, timeoutMs = 4000): Promise<Seen | undefined> {
+  if (!session) return undefined;
+  const state = loadSession(session);
+  const read = { ...(state.read ?? {}) };
+  const wanted = [...targets.values()].flatMap((ids) => ids ?? []);
+  const missing = wanted.filter((id) => read[id] === undefined);
+  if (missing.length) {
+    for (const server of targets.keys()) {
+      try {
+        const res = await api(server, cfg.servers[server]!.token, "GET", "/api/threads", { timeoutMs });
+        for (const t of res.threads as ThreadInfo[]) {
+          if (missing.includes(t.id) && typeof t.read_seq === "number") read[t.id] = t.read_seq;
+        }
+      } catch {}
+    }
+    const fresh = loadSession(session);
+    fresh.read = { ...read, ...(fresh.read ?? {}) };
+    writePrivate(sessionPath(session), fresh);
+  }
+  return Object.keys(read).length ? read : undefined;
+}
+
+/** Moves this session's read marks forward past what it was just shown. */
+function markRead(session: string | null, threads: { id: string; ack_seq: number }[]) {
+  if (!session || threads.length === 0) return;
+  const state = loadSession(session);
+  state.read ??= {};
+  for (const t of threads) state.read[t.id] = Math.max(state.read[t.id] ?? 0, t.ack_seq);
+  writePrivate(sessionPath(session), state);
 }
 
 const readHint = (cfg: Config, cwd: string, rooms: string[]) =>
@@ -821,7 +877,8 @@ async function hookPrompt() {
     const starting = input.hook_event_name === "SessionStart";
     let threads: Awaited<ReturnType<typeof fetchInbox>> = [];
     try {
-      threads = await fetchInbox(cfg, targets, { timeoutMs: 4000 });
+      const from = await sessionMarks(cfg, targets, input.session_id ?? null);
+      threads = await fetchInbox(cfg, targets, { timeoutMs: 4000, from });
     } catch {}
     const parts: string[] = [];
     if (starting) {
@@ -870,7 +927,8 @@ async function hookWait() {
   // Mail already waiting when a session starts is announced by the SessionStart context hook instead.
   if (input.hook_event_name === "SessionStart") {
     try {
-      markNotified(session, await fetchInbox(cfg, targets, { timeoutMs: 4000 }), process.pid);
+      const from = await sessionMarks(cfg, targets, input.session_id ?? null);
+      markNotified(session, await fetchInbox(cfg, targets, { timeoutMs: 4000, from }), process.pid);
     } catch {}
   }
 
@@ -882,7 +940,8 @@ async function hookWait() {
     if (targets.size === 0) process.exit(0);
     let threads: Awaited<ReturnType<typeof fetchInbox>>;
     try {
-      threads = await fetchInbox(cfg, targets, { wait: waitSeconds, seen: loadSession(session).notified });
+      const from = await sessionMarks(cfg, targets, input.session_id ?? null);
+      threads = await fetchInbox(cfg, targets, { wait: waitSeconds, seen: loadSession(session).notified, from });
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) process.exit(0);
       await Bun.sleep(10_000);
