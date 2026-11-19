@@ -518,7 +518,8 @@ async function cmdJoin(args: ReturnType<typeof parseArgs>) {
       console.log(`Claude Code sessions started in ${process.cwd()} now know about this room and are told about new messages (hooks in ${path}).`);
       console.log(RUNNING_SESSION_NOTE);
     } catch (err) {
-      console.log(`Could not set up Claude Code here: ${(err as Error).message} Run \`${me} setup claude-code\` once that is fixed.`);
+      const reason = (err as Error).message.replace(/\.?$/, ".");
+      console.log(`Could not set up Claude Code here: ${reason} Run \`${me} setup claude-code\` once that is fixed.`);
     }
   }
   if (t.review) console.log("A human on your side reviews your messages before they are posted.");
@@ -970,7 +971,7 @@ function cmdSetup(args: ReturnType<typeof parseArgs>) {
   try {
     installHooks(path, { remove: args.flags.remove === true, askToPost });
   } catch (err) {
-    fail(`${(err as Error).message} Fix it first`, "Or run `parley setup claude-code --print` and merge the output by hand.");
+    fail(`${(err as Error).message.replace(/\.?$/, ".")} Fix it first.`, "Or run `parley setup claude-code --print` and merge the output by hand.");
   }
   if (args.flags.remove) return console.log(`Removed Parley hooks from ${path}.`);
   console.log(`Wrote Parley hooks to ${path}:`);

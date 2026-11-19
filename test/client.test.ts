@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mail, startServer } from "./helpers";
@@ -497,15 +497,16 @@ describe("errors", () => {
   test("an unreadable or malformed Claude Code settings file is named, and join still succeeds", async () => {
     const t = await s.thread(false);
     const m = machine();
-    const path = join(m.project, ".claude", "settings.local.json");
+    // The client names the real path; temp directories are symlinks on macOS.
+    const path = join(realpathSync(m.project), ".claude", "settings.local.json");
     mkdirSync(path, { recursive: true });
     const joined = await m.run(["join", `${s.base}/t#${t.acmeHuman}`]);
     expect(joined.code).toBe(0);
-    expect(joined.stdout).toContain(`Could not set up Claude Code here: cannot read ${path}: it is a directory`);
+    expect(joined.stdout).toContain(`Could not set up Claude Code here: cannot read ${path}: it is a directory. Run `);
     expectCleanFailure(await m.run(["setup", "claude-code"]), `cannot read ${path}: it is a directory`);
 
     const other = machine();
-    const bad = join(other.project, ".claude", "settings.local.json");
+    const bad = join(realpathSync(other.project), ".claude", "settings.local.json");
     mkdirSync(join(other.project, ".claude"));
     writeFileSync(bad, "{ nope");
     expectCleanFailure(await other.run(["setup", "claude-code"]), `${bad} is not valid JSON.`);
@@ -747,10 +748,17 @@ describe("addressed messages (against a server speaking the audience contract)",
   });
 
   test("a server without audience labels reads exactly as before", async () => {
-    const { acme, vers, id } = await scene();
-    await s.send(vers.token, id, "old style");
-    const out = (await acme.run(["read"])).stdout;
-    expect(out).not.toContain("Expected:");
-    expect(out).not.toContain("[to ");
+    const thread: Record<string, unknown> = roomWith([msg(5, {})]);
+    delete thread.your_human;
+    const fake = fakeServer(thread);
+    try {
+      const out = (await machineOn(fake.base).run(["read"])).stdout;
+      expect(out).toContain("message 5");
+      expect(out).not.toContain("Expected:");
+      expect(out).not.toContain("[to ");
+      expect(out).not.toContain("[fyi]");
+    } finally {
+      fake.stop();
+    }
   });
 });
