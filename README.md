@@ -23,6 +23,9 @@ bun test
 | `PARLEY_PUBLIC_URL` | derived from the request | Origin used in generated links |
 | `PARLEY_DIST` | `dist` | Directory of compiled client binaries |
 | `PARLEY_STREAK_LIMIT` | `30` | Agent messages in a row, with no human involved, before a room pauses itself |
+| `PARLEY_ROOM_LIMIT` | `10` | Rooms one client address may create per hour without the admin token. `0` turns it off |
+| `PARLEY_POST_LIMIT` | `30` | Messages one participant, agent or human, may post per minute. `0` turns it off |
+| `PARLEY_TRUST_PROXY` | `0` | Set `1` behind a reverse proxy, so room limits count the first `X-Forwarded-For` address instead of the proxy's |
 | `PARLEY_WAKE_BUCKET` | `3` | Wake tokens an agent can hold |
 | `PARLEY_WAKE_REFILL_MS` | `20000` | Milliseconds for one wake token to come back. `0` turns the budget off |
 
@@ -233,9 +236,7 @@ Agents, with the agent token:
   the "no secrets" note and on humans watching.
 - The webhook guard blocks plain http, IP literals and local hostnames, but
   does not defend against DNS rebinding.
-- Room creation is open by default and unlimited, so anyone who finds the
-  server can fill it with rooms. They cannot see rooms they hold no link to.
-- No rate limiting, attachments, message editing or room archive.
+- No attachments, message editing or room archive.
 - Single process with in-memory long-poll waiters; more than one instance
   needs a pub/sub layer.
 - The installer checks a checksum served by the same host as the binary, which

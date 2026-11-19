@@ -306,6 +306,74 @@ describe("session read marks", () => {
   });
 });
 
+describe("rate limits", () => {
+  const create = (srv: ReturnType<typeof startServer>, headers: Record<string, string> = {}) =>
+    fetch(srv.base + "/api/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({ title: "Room", sides: ["Vers", "Acme"] }),
+    });
+
+  test("room creation is capped per client address, with a hint and Retry-After, and the admin token is exempt", async () => {
+    const limited = startServer({ roomLimit: 2 });
+    try {
+      expect((await create(limited)).status).toBe(201);
+      expect((await create(limited)).status).toBe(201);
+      const refused = await create(limited);
+      expect(refused.status).toBe(429);
+      const body: any = await refused.json();
+      expect(body.error.code).toBe("room_limit");
+      expect(body.error.message).toMatch(/^Too many rooms created from this address; try again in \d+s\.$/);
+      expect(body.error.hint).toContain("PARLEY_ROOM_LIMIT");
+      expect(Number(refused.headers.get("retry-after"))).toBeGreaterThan(3000);
+      expect((await create(limited, { authorization: `Bearer ${ADMIN}` })).status).toBe(201);
+    } finally {
+      await limited.stop();
+    }
+  });
+
+  test("behind a trusted proxy each forwarded address has its own allowance; otherwise the header is ignored", async () => {
+    const proxied = startServer({ roomLimit: 1, trustProxy: true });
+    const direct = startServer({ roomLimit: 1 });
+    try {
+      expect((await create(proxied, { "x-forwarded-for": "203.0.113.1, 10.0.0.1" })).status).toBe(201);
+      expect((await create(proxied, { "x-forwarded-for": "203.0.113.1" })).status).toBe(429);
+      expect((await create(proxied, { "x-forwarded-for": "203.0.113.2" })).status).toBe(201);
+      expect((await create(direct, { "x-forwarded-for": "203.0.113.1" })).status).toBe(201);
+      expect((await create(direct, { "x-forwarded-for": "203.0.113.2" })).status).toBe(429);
+    } finally {
+      await proxied.stop();
+      await direct.stop();
+    }
+  });
+
+  test("each participant may post a limited number of messages per minute", async () => {
+    const limited = startServer({ postLimit: 3 });
+    try {
+      const t = await limited.setup(false);
+      for (let i = 1; i <= 3; i++) expect((await limited.send(t.vers.token, t.id, `msg ${i}`)).status).toBe(201);
+      const refused = await limited.send(t.vers.token, t.id, "one too many");
+      expect(refused.status).toBe(429);
+      expect(refused.data.error.code).toBe("rate_limited");
+      expect(refused.data.error.hint).toContain("several points in one message");
+      // Others are unaffected, humans included.
+      expect((await limited.send(t.acme.token, t.id, "my turn")).status).toBe(201);
+      expect((await limited.call(t.versHuman, "POST", "/api/messages", { body: "human here" })).status).toBe(201);
+    } finally {
+      await limited.stop();
+    }
+  });
+
+  test("a zero limit turns it off", async () => {
+    const open = startServer({ roomLimit: 0, postLimit: 0 });
+    try {
+      for (let i = 0; i < 12; i++) expect((await create(open)).status).toBe(201);
+    } finally {
+      await open.stop();
+    }
+  });
+});
+
 describe("human controls", () => {
   test("held messages reach no inbox until approved", async () => {
     const t = await s.setup(true);
