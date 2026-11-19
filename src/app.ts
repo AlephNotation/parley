@@ -13,6 +13,7 @@ import {
   type ThreadRow,
 } from "./db";
 import { clientDownload, installScript } from "./install";
+import { describeFindings, findSecrets } from "./secrets";
 import { homePage, invitePage, threadPage } from "./ui";
 
 export interface AppOptions {
@@ -42,6 +43,8 @@ export interface AppOptions {
   sweepIntervalMs?: number;
   /** Allow notification webhooks to plain-http and private hosts. For local development and tests only. */
   allowPrivateWebhooks?: boolean;
+  /** Refuse agent posts that contain credential-shaped strings. Defaults to true. */
+  secretScan?: boolean;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -798,6 +801,19 @@ export function createApp(opts: AppOptions) {
 
   function post(p: ParticipantRow, draft: Draft): Response {
     const { body, to, fyi } = draft;
+    // Agents paste what they are working on, and a room can include other organisations. Humans are
+    // trusted to judge for themselves. The matched text is never echoed or logged.
+    if (p.kind === "agent" && opts.secretScan !== false) {
+      const findings = findSecrets(body);
+      if (findings.length) {
+        throw new HttpError(
+          422,
+          "secret_detected",
+          `Not posted: the message looks like it contains ${describeFindings(findings)}.`,
+          "Remove it or replace it with a placeholder such as <redacted>, then post again. If it is not a real credential, describe it instead of pasting it.",
+        );
+      }
+    }
     if (to) {
       const found = resolveRecipients(p.thread_id, to);
       if (found.unknown.length) {

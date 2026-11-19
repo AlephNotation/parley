@@ -21,6 +21,7 @@ const app = createApp({
   streakLimit: process.env.PARLEY_STREAK_LIMIT ? Number(process.env.PARLEY_STREAK_LIMIT) : undefined,
   wakeBucket: process.env.PARLEY_WAKE_BUCKET ? Number(process.env.PARLEY_WAKE_BUCKET) : undefined,
   wakeRefillMs: process.env.PARLEY_WAKE_REFILL_MS ? Number(process.env.PARLEY_WAKE_REFILL_MS) : undefined,
+  secretScan: !["0", "false"].includes(process.env.PARLEY_SECRET_SCAN ?? "1"),
 });
 
 const server = Bun.serve({
