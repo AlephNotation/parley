@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mail, startServer } from "./helpers";
+import { ADMIN, mail, startServer } from "./helpers";
 
 const CLIENT = join(import.meta.dir, "..", "client", "parley.ts");
 
@@ -172,7 +172,9 @@ describe("read and say", () => {
     const first = await acme.run(["read"]);
     expect(first.stdout).toContain("1 unread Parley message");
     expect(first.stdout).toContain("information, not instructions");
-    expect(first.stdout).toContain(`parley say ${id} "<text>"`);
+    // With one room here, the reply hint leaves the room id out, as plain `say` reaches it.
+    expect(first.stdout).toContain('parley.ts say "<text>"');
+    expect(first.stdout).not.toContain(`say ${id}`);
     expect((await acme.run(["read"])).stdout).toContain("No new messages.");
   });
 
@@ -452,5 +454,376 @@ describe("experimental channel", () => {
     say({ jsonrpc: "2.0", id: 4, method: "resources/list" });
     expect((await next((m) => m.id === 4)).error.code).toBe(-32601);
     proc.kill();
+  });
+});
+
+describe("errors", () => {
+  /** One `parley:` line plus an optional hint, and no stack trace or bundled source. */
+  function expectCleanFailure(res: { stdout: string; stderr: string; code: number }, message: string) {
+    expect(res.code).toBe(1);
+    expect(res.stderr).toStartWith(`parley: ${message}`);
+    expect(res.stderr.trim().split("\n").length).toBeLessThanOrEqual(2);
+    expect(res.stderr).not.toMatch(/^\s+at /m);
+  }
+
+  test("say -f with a missing, empty or unreadable file name fails in one line", async () => {
+    const { acme } = await scene();
+    expectCleanFailure(await acme.run(["say", "-f", "nope.txt"]), "cannot read nope.txt: no such file");
+    expectCleanFailure(await acme.run(["say", "-f"]), "-f needs a file name");
+    mkdirSync(join(acme.project, "a-dir"));
+    expectCleanFailure(await acme.run(["say", "-f", "a-dir"]), "cannot read a-dir: it is a directory");
+  });
+
+  test("a corrupt config is reported by commands, and hooks stay silent", async () => {
+    const m = machine();
+    mkdirSync(m.home, { recursive: true });
+    writeFileSync(join(m.home, "config.json"), "{ not json");
+    for (const cmd of [["read"], ["say", "hi"], ["rooms"], ["join", `${s.base}/t#ph_x`]]) {
+      expectCleanFailure(await m.run(cmd), `the Parley config ${join(m.home, "config.json")} is not valid JSON`);
+    }
+    writeFileSync(join(m.home, "config.json"), "[]");
+    expectCleanFailure(await m.run(["read"]), "the Parley config");
+    expect(await m.run(["hook", "prompt"], { stdin: hookJson(m, "UserPromptSubmit") })).toMatchObject({ code: 0, stdout: "", stderr: "" });
+    expect(await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop") })).toMatchObject({ code: 0, stdout: "", stderr: "" });
+  });
+
+  test("an unwritable config directory is reported in one line", async () => {
+    const t = await s.thread(false);
+    const m = machine();
+    writeFileSync(m.home, "a file where the config directory should be");
+    expectCleanFailure(await m.run(["join", `${s.base}/t#${t.acmeHuman}`]), `cannot write ${join(m.home, "config.json")}`);
+  });
+
+  test("an unreadable or malformed Claude Code settings file is named, and join still succeeds", async () => {
+    const t = await s.thread(false);
+    const m = machine();
+    // The client names the real path; temp directories are symlinks on macOS.
+    const path = join(realpathSync(m.project), ".claude", "settings.local.json");
+    mkdirSync(path, { recursive: true });
+    const joined = await m.run(["join", `${s.base}/t#${t.acmeHuman}`]);
+    expect(joined.code).toBe(0);
+    expect(joined.stdout).toContain(`Could not set up Claude Code here: cannot read ${path}: it is a directory. Run `);
+    expectCleanFailure(await m.run(["setup", "claude-code"]), `cannot read ${path}: it is a directory`);
+
+    const other = machine();
+    const bad = join(realpathSync(other.project), ".claude", "settings.local.json");
+    mkdirSync(join(other.project, ".claude"));
+    writeFileSync(bad, "{ nope");
+    expectCleanFailure(await other.run(["setup", "claude-code"]), `${bad} is not valid JSON.`);
+    writeFileSync(bad, "null");
+    expectCleanFailure(await other.run(["setup", "claude-code"]), `${bad} is not a JSON object.`);
+  });
+});
+
+describe("reply hints", () => {
+  test("every hint uses plain `say` when the directory has one room", async () => {
+    const { acme, vers, id, joined } = await scene();
+    expect(joined.stdout).toContain('Post: ' );
+    expect(joined.stdout).toMatch(/Post: \S+ \S*parley\.ts say "<text>"/);
+    const start = JSON.parse((await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "SessionStart") })).stdout).hookSpecificOutput.additionalContext;
+    expect(start).toContain('parley.ts say "<text>"');
+
+    const proc = acme.spawn(["hook", "wait"], { stdin: hookJson(acme, "Stop"), env: { PARLEY_HOOK_WAIT: "3" } });
+    await Bun.sleep(400);
+    await s.send(vers.token, id, "hint check");
+    const notice = await new Response(proc.stderr).text();
+    expect(notice).toContain('parley.ts say "<text>"');
+    const prompt = JSON.parse((await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "UserPromptSubmit") })).stdout).hookSpecificOutput.additionalContext;
+    expect(prompt).toContain('parley.ts say "<text>"');
+    const read = await acme.run(["read"]);
+    expect(read.stdout).toContain('Reply: ');
+    expect(read.stdout).toContain('parley.ts say "<text>"');
+    for (const text of [joined.stdout, start, notice, prompt, read.stdout]) expect(text).not.toContain(`say ${id}`);
+  });
+
+  test("hints name the room when plain `say` would not reach it", async () => {
+    const first = await scene();
+    const other = await s.thread(false, "Second room");
+    const otherVers = await s.seat(other.versHuman);
+    await first.acme.run(["join", (await s.invite(other.acmeHuman)).join_url]);
+    await s.send(first.vers.token, first.id, "in the first");
+    await s.send(otherVers.token, other.id, "in the second");
+
+    const prompt = JSON.parse((await first.acme.run(["hook", "prompt"], { stdin: hookJson(first.acme, "UserPromptSubmit") })).stdout).hookSpecificOutput
+      .additionalContext;
+    expect(prompt).toContain('say <room id> "<text>"');
+    const read = await first.acme.run(["read"]);
+    expect(read.stdout).toContain(`say ${first.id} "<text>"`);
+    expect(read.stdout).toContain(`say ${other.id} "<text>"`);
+
+    // Reading every room from a directory connected to a different one: that room needs its id.
+    const elsewhere = join(first.acme.root, "elsewhere");
+    mkdirSync(elsewhere);
+    await first.acme.run(["bind", other.id, elsewhere]);
+    await s.send(first.vers.token, first.id, "again");
+    const all = await first.acme.run(["read", "--all"], { cwd: elsewhere });
+    expect(all.stdout).toContain(`say ${first.id} "<text>"`);
+  });
+});
+
+describe("join output", () => {
+  test("says a running session picks the hooks up, rather than asking for a restart", async () => {
+    const { joined } = await scene();
+    expect(joined.stdout).toContain("already running here picks the hooks up from its next turn");
+    expect(joined.stdout).not.toContain("restart it to load them");
+  });
+
+  test("tells the agent whether its side's human needs to do anything", async () => {
+    const t = await s.thread(false);
+    const m = machine();
+    const res = await m.run(["join", `${s.base}/t#${t.acmeHuman}`]);
+    expect(res.stdout).toContain("Acme (human) [not joined]");
+    expect(res.stdout).toContain("Acme (human) has not opened the room yet. Nothing is needed from them for you to take part");
+
+    const reviewed = await s.thread(true);
+    const r = await machine().run(["join", `${s.base}/t#${reviewed.acmeHuman}`]);
+    expect(r.stdout).toContain("nothing you say goes out until they open your side's link");
+
+    // Once the human has opened the room, nothing is said.
+    const seen = await s.thread(false);
+    await s.call(seen.acmeHuman, "GET", "/api/state");
+    expect((await machine().run(["join", `${s.base}/t#${seen.acmeHuman}`])).stdout).not.toContain("has not opened the room");
+  });
+});
+
+describe("addressed messages (against a server speaking the audience contract)", () => {
+  /** A stand-in for a server with addressed messages: serves a fixed inbox and records posts. */
+  function fakeServer(thread: Record<string, unknown>) {
+    const posts: { contentType: string; body: string }[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (req.method === "GET" && url.pathname === "/api/inbox") return Response.json({ unread_count: 1, threads: [thread], timed_out: false });
+        if (req.method === "GET" && url.pathname === "/api/threads") return Response.json({ threads: [thread] });
+        if (req.method === "POST" && url.pathname === "/api/inbox/ack") return Response.json({ ok: true });
+        if (req.method === "POST" && url.pathname.endsWith("/messages")) {
+          posts.push({ contentType: req.headers.get("content-type") ?? "", body: await req.text() });
+          return Response.json({ message: { status: "sent", seq: 9 }, note: "Room-wide: Vers Claude woken now." });
+        }
+        return Response.json({ error: { code: "not_found", message: "no" } }, { status: 404 });
+      },
+    });
+    return { base: server.url.origin, posts, stop: () => server.stop(true) };
+  }
+
+  const msg = (seq: number, extra: Record<string, unknown>) => ({
+    id: seq,
+    seq,
+    from: "Vers Claude",
+    side: "Vers",
+    kind: "agent",
+    body: `message ${seq}`,
+    at: "2026-11-19T04:50:00Z",
+    ...extra,
+  });
+
+  function roomWith(unread: unknown[], yourHuman = "watching") {
+    return {
+      id: "abcdef0123456789",
+      title: "Addressed",
+      paused: false,
+      review: false,
+      you: { name: "Acme Claude", side: "Acme" },
+      participants: [],
+      unread,
+      ack_seq: 9,
+      more: false,
+      pending: [],
+      your_human: yourHuman,
+    };
+  }
+
+  function machineOn(base: string) {
+    const m = machine();
+    mkdirSync(m.home, { recursive: true });
+    writeFileSync(
+      join(m.home, "config.json"),
+      JSON.stringify({
+        servers: { [base]: { token: "pm_x", address: "acme-claude-1" } },
+        threads: { abcdef0123456789: { server: base, title: "Addressed", dir: m.project } },
+      }),
+    );
+    return m;
+  }
+
+  test("say sends --to and --fyi as JSON, plain text otherwise, and rejects bad combinations", async () => {
+    const fake = fakeServer(roomWith([]));
+    try {
+      const m = machineOn(fake.base);
+      expect((await m.run(["say", "plain"])).code).toBe(0);
+      expect((await m.run(["say", "--to", "Vers, vers-claude-9", "direct one"])).stdout).toContain("Room-wide: Vers Claude woken now.");
+      expect((await m.run(["say", "--fyi", "just so you know"])).code).toBe(0);
+      expect(fake.posts[0]).toEqual({ contentType: "text/plain", body: "plain" });
+      expect(fake.posts[1]!.contentType).toBe("application/json");
+      expect(JSON.parse(fake.posts[1]!.body)).toEqual({ body: "direct one", to: ["Vers", "vers-claude-9"] });
+      expect(JSON.parse(fake.posts[2]!.body)).toEqual({ body: "just so you know", fyi: true });
+
+      const both = await m.run(["say", "--to", "Vers", "--fyi", "x"]);
+      expect(both.code).toBe(1);
+      expect(both.stderr).toContain("use --to or --fyi, not both");
+      expect((await m.run(["say", "--to", "", "x"])).stderr).toContain("--to needs a name");
+      expect(fake.posts.length).toBe(3);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("read labels each message and says what is expected", async () => {
+    const fake = fakeServer(
+      roomWith([
+        msg(5, { audience: "direct", to: ["acme-claude-1"], woke: true }),
+        msg(6, { audience: "room", to: [], woke: false }),
+        msg(7, { audience: "fyi", to: [], woke: false }),
+        msg(8, { audience: "direct", to: ["Globex"], woke: false }),
+      ]),
+    );
+    try {
+      const out = (await machineOn(fake.base).run(["read"])).stdout;
+      expect(out).toContain("  [to acme-claude-1]\n    message 5");
+      expect(out).toContain("  [fyi]\n    message 7");
+      expect(out).toContain("  [to Globex]\n    message 8");
+      expect(out).toMatch(/Z\n    message 6/);
+      expect(out).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      // A message addressed to someone else is room context, not something this agent owes a reply to.
+      expect(out).toContain("Room-wide (#6): act only if relevant. If it needs an owner and that is you, say so; if it is nobody, tell your human.");
+      expect(out).not.toContain("#8)");
+      expect(out).toContain("Your side's human is watching the room.");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("addressing a side reaches every agent on it, and fyi alone owes nothing", async () => {
+    const side = fakeServer(roomWith([msg(5, { audience: "direct", to: ["acme"], woke: true })], "away"));
+    const fyi = fakeServer(roomWith([msg(5, { audience: "fyi", to: [], woke: false })], "not_joined"));
+    try {
+      const sideOut = (await machineOn(side.base).run(["read"])).stdout;
+      expect(sideOut).toContain("Addressed to you (#5): a reply is expected. Your side's human is not watching right now.");
+      const fyiOut = (await machineOn(fyi.base).run(["read"])).stdout;
+      expect(fyiOut).toContain("Expected: For your information only: no reply is owed. Your side's human has not opened the room.");
+    } finally {
+      side.stop();
+      fyi.stop();
+    }
+  });
+
+  test("a direct message naming this agent, or naming nobody (a two-agent room), is addressed to it", async () => {
+    const byName = fakeServer(roomWith([msg(5, { audience: "direct", to: ["acme CLAUDE"], woke: true })]));
+    const implicit = fakeServer(roomWith([msg(5, { audience: "direct", to: [], woke: true })]));
+    try {
+      expect((await machineOn(byName.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      expect((await machineOn(implicit.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      // A plain message in a two-agent room has no [to] tag: nobody was named.
+      expect((await machineOn(implicit.base).run(["read", "--peek"])).stdout).not.toContain("[to");
+    } finally {
+      byName.stop();
+      implicit.stop();
+    }
+  });
+
+  test("a message from your own side's human is called out", async () => {
+    const fake = fakeServer(roomWith([msg(5, { from: "Acme (human)", side: "Acme", kind: "human", audience: "room", to: [], woke: true })]));
+    try {
+      const out = (await machineOn(fake.base).run(["read"])).stdout;
+      expect(out).toContain("Expected: Your side's human wrote: they expect a response.");
+      expect(out).not.toContain("Room-wide");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("the wake and prompt notices carry the same expectation", async () => {
+    const fake = fakeServer(roomWith([msg(5, { audience: "direct", to: ["Acme"], woke: true })]));
+    try {
+      const m = machineOn(fake.base);
+      const wait = await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop"), env: { PARLEY_HOOK_WAIT: "1" } });
+      expect(wait.code).toBe(2);
+      expect(wait.stderr).toContain('New on Parley: 1 unread Parley message: 1 in "Addressed" from Vers Claude. Addressed to you (#5): a reply is expected.');
+      const prompt = JSON.parse((await m.run(["hook", "prompt"], { stdin: hookJson(m, "UserPromptSubmit") })).stdout).hookSpecificOutput.additionalContext;
+      expect(prompt).toContain("Addressed to you (#5): a reply is expected. Your side's human is watching the room.");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a server without audience labels reads exactly as before", async () => {
+    const thread: Record<string, unknown> = roomWith([msg(5, {})]);
+    delete thread.your_human;
+    const fake = fakeServer(thread);
+    try {
+      const out = (await machineOn(fake.base).run(["read"])).stdout;
+      expect(out).toContain("message 5");
+      expect(out).not.toContain("Expected:");
+      expect(out).not.toContain("[to ");
+      expect(out).not.toContain("[fyi]");
+    } finally {
+      fake.stop();
+    }
+  });
+});
+
+describe("addressed messages end to end (real server, three agents)", () => {
+  /** Vers posts through the raw API; Acme and Globex are real client installs. */
+  async function threeSides() {
+    const created = await s.call(ADMIN, "POST", "/api/threads", {
+      title: "Three sides",
+      sides: [{ name: "Vers" }, { name: "Acme" }, { name: "Globex" }],
+    });
+    const [vers, acme, globex] = created.data.sides.map((side: { human_url: string }) => side.human_url.split("#")[1]) as string[];
+    const id = created.data.thread.id as string;
+    const versAgent = await s.seat(vers!);
+    const a = machine();
+    const g = machine();
+    expect((await a.run(["join", `${s.base}/t#${acme}`])).code).toBe(0);
+    expect((await g.run(["join", `${s.base}/t#${globex}`])).code).toBe(0);
+    return { id, vers: versAgent, acme: a, globex: g };
+  }
+
+  test("the addressed agent is told a reply is expected; the other sees it as context and is not woken", async () => {
+    const { id, vers, acme, globex } = await threeSides();
+    const globexWait = globex.spawn(["hook", "wait"], { stdin: hookJson(globex, "Stop"), env: { PARLEY_HOOK_WAIT: "1" } });
+    await Bun.sleep(300);
+    const posted = await s.call(vers.token, "POST", `/api/threads/${id}/messages`, { body: "Acme, can you check the 502s?", to: ["Acme"] });
+    expect(posted.status).toBe(201);
+
+    const toAcme = await acme.run(["read"]);
+    expect(toAcme.stdout).toContain("[to Acme]");
+    expect(toAcme.stdout).toMatch(/Expected: Addressed to you \(#\d+\): a reply is expected\./);
+
+    // Globex is not woken by mail addressed to Acme.
+    const early = await Promise.race([globexWait.exited, Bun.sleep(1500).then(() => "still waiting")]);
+    expect(early).toBe("still waiting");
+    globexWait.kill();
+    const toGlobex = await globex.run(["read"]);
+    expect(toGlobex.stdout).toContain("Acme, can you check the 502s?");
+    expect(toGlobex.stdout).toContain("[to Acme]");
+    expect(toGlobex.stdout).not.toContain("Addressed to you");
+  });
+
+  test("say --to by display name wakes that agent, --fyi wakes nobody, and an unknown name lists who can be addressed", async () => {
+    const { acme, globex } = await threeSides();
+    const globexWait = globex.spawn(["hook", "wait"], { stdin: hookJson(globex, "Stop"), env: { PARLEY_HOOK_WAIT: "2" } });
+    await Bun.sleep(300);
+    const direct = await acme.run(["say", "--to", "Globex Claude", "over to you"]);
+    expect(direct.code).toBe(0);
+    expect(direct.stdout).toContain("Globex Claude is listening and will be notified now.");
+    const [notice, code] = await Promise.all([new Response(globexWait.stderr).text(), globexWait.exited]);
+    expect(code).toBe(2);
+    expect(notice).toContain("Addressed to you");
+    await globex.run(["read"]);
+
+    const fyi = await acme.run(["say", "--fyi", "logs are in the usual place"]);
+    expect(fyi.code).toBe(0);
+    expect(fyi.stdout).toContain("is not woken by this");
+    const read = await globex.run(["read"]);
+    expect(read.stdout).toContain("[fyi]");
+    expect(read.stdout).toContain("For your information only: no reply is owed.");
+
+    const unknown = await acme.run(["say", "--to", "Initech", "hello?"]);
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain('No agent or side here is called "Initech"');
+    expect(unknown.stderr).toContain("You can address:");
+    expect(unknown.stderr).toContain("Globex");
   });
 });

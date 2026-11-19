@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { agentInstructions, inviteTexts } from "./agent-instructions";
 import {
   openDb,
+  type Audience,
   type InviteRow,
   type MailboxRow,
   type MessageKind,
@@ -29,6 +30,12 @@ export interface AppOptions {
   maxWaitSeconds?: number;
   /** Directory holding compiled `parley-<os>-<arch>` client binaries. */
   distDir?: string;
+  /** How many of the newest messages a human's page is sent. */
+  pageMessages?: number;
+  /** Wake tokens an agent can hold. A direct wake costs 1, a room-wide wake costs the whole bucket. */
+  wakeBucket?: number;
+  /** Milliseconds for one wake token to come back. 0 turns the attention budget off. */
+  wakeRefillMs?: number;
   /** How long mail may sit unread before the side's humans are told. */
   notifyDelayMs?: number;
   /** How often to look for unread mail to notify about. 0 disables the sweeper. */
@@ -112,6 +119,11 @@ export function createApp(opts: AppOptions) {
   const streakLimit = opts.streakLimit ?? 30;
   const maxWait = opts.maxWaitSeconds ?? 240;
   const notifyDelayMs = opts.notifyDelayMs ?? 120_000;
+  const pageMessages = opts.pageMessages ?? 1000;
+  const wakeBucket = opts.wakeBucket ?? 3;
+  const wakeRefillMs = opts.wakeRefillMs ?? 20_000;
+  /** Timers for wakes being held until an agent's budget can pay for them. */
+  const heldWakes = new Set<ReturnType<typeof setTimeout>>();
   const waiters = new Map<string, Set<() => void>>();
   /** Open long-polls per participant, used to report who is listening. */
   const polls = new Map<string, { open: number; endedAt: number }>();
@@ -199,13 +211,15 @@ export function createApp(opts: AppOptions) {
     body: string;
     deliver: boolean;
     visibleTo?: string;
+    to?: string[];
+    fyi?: boolean;
   }): MessageRow {
     const side = m.participant ? getSide(m.participant.side_id) : null;
     const now = Date.now();
-    return db
+    const row = db
       .query(
-        `INSERT INTO messages (thread_id, participant_id, side_id, side_name, kind, author, body, status, seq, visible_to, created_at, delivered_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        `INSERT INTO messages (thread_id, participant_id, side_id, side_name, kind, author, body, status, seq, visible_to, created_at, delivered_at, audience, addressed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(
         m.threadId,
@@ -220,7 +234,112 @@ export function createApp(opts: AppOptions) {
         m.visibleTo ?? null,
         now,
         m.deliver ? now : null,
+        m.fyi ? "fyi" : m.to?.length ? "direct" : "room",
+        m.to?.length ? JSON.stringify(m.to) : null,
       ) as MessageRow;
+    return m.deliver ? scheduleWakes(row) : row;
+  }
+
+  // ---- waking -------------------------------------------------------------
+  //
+  // Every message is delivered to everyone; who it wakes is a separate question. A message is
+  // addressed to named agents or sides (direct), to the room, or to nobody (fyi). Each agent has
+  // an attention budget, so however senders behave no agent is woken more than it can afford.
+
+  const agentsIn = (threadId: string) =>
+    db
+      .query(
+        `SELECT p.*, m.address FROM participants p JOIN mailboxes m ON m.id = p.mailbox_id
+         WHERE p.thread_id = ? AND p.kind = 'agent' AND p.revoked = 0 ORDER BY p.created_at`,
+      )
+      .all(threadId) as (ParticipantRow & { address: string })[];
+
+  /** Resolves what a sender wrote after --to: an agent's name or address, or a side's name. */
+  function resolveRecipients(threadId: string, names: string[]): { ids: Set<string>; unknown: string[]; valid: string[] } {
+    const agents = agentsIn(threadId);
+    const sides = getSides(threadId);
+    const ids = new Set<string>();
+    const unknown: string[] = [];
+    for (const raw of names) {
+      const name = raw.trim().toLowerCase();
+      const side = sides.find((x) => x.name.toLowerCase() === name);
+      const matched = side ? agents.filter((a) => a.side_id === side.id) : agents.filter((a) => a.name.toLowerCase() === name || a.address === name);
+      if (!side && matched.length === 0) unknown.push(raw);
+      for (const a of matched) ids.add(a.id);
+    }
+    return { ids, unknown, valid: [...sides.map((x) => x.name), ...agents.map((a) => a.name)] };
+  }
+
+  /** Takes `cost` tokens from an agent's budget and returns when the wake may happen: now, or once the budget can pay. */
+  function charge(p: ParticipantRow, cost: number, now: number): number {
+    if (cost === 0 || wakeRefillMs <= 0) return now;
+    // A wake is already being held; it shows everything unread, so this message rides along.
+    if (p.tokens_at > now) return p.tokens_at;
+    const tokens = Math.min(wakeBucket, p.tokens + (now - p.tokens_at) / wakeRefillMs);
+    const at = tokens >= cost ? now : Math.ceil(now + (cost - tokens) * wakeRefillMs);
+    db.query("UPDATE participants SET tokens = ?, tokens_at = ? WHERE id = ?").run(Math.max(0, tokens - cost), at, p.id);
+    return at;
+  }
+
+  /**
+   * Decides, at the moment a message is delivered, which agents it wakes and when.
+   *   direct  wakes the agents addressed, for 1 token each
+   *   room    wakes every other agent, for a whole bucket each
+   *   fyi     wakes nobody
+   * A message from an agent's own side's human, and news from Parley itself, wake for free.
+   * A room message with one other agent to hear it is direct, and naming every agent is room.
+   */
+  function scheduleWakes(m: MessageRow): MessageRow {
+    const now = Date.now();
+    const others = agentsIn(m.thread_id).filter((a) => a.id !== m.participant_id && (m.visible_to === null || m.visible_to === a.side_id));
+    let audience: Audience = m.audience;
+    let targets: Set<string> | null = null;
+    if (m.kind !== "system" && audience !== "fyi") {
+      if (m.addressed) {
+        targets = resolveRecipients(m.thread_id, JSON.parse(m.addressed) as string[]).ids;
+        if (others.length > 1 && others.every((a) => targets!.has(a.id))) targets = null;
+      } else if (others.length === 1) {
+        targets = new Set([others[0]!.id]);
+      }
+      audience = targets ? "direct" : "room";
+      if (audience !== m.audience) db.query("UPDATE messages SET audience = ? WHERE id = ?").run(audience, m.id);
+    }
+    if (audience === "fyi" && m.kind !== "system") return { ...m, audience };
+    for (const agent of others) {
+      if (targets && !targets.has(agent.id)) continue;
+      const free = m.kind === "system" || (m.kind === "human" && m.side_id === agent.side_id);
+      const at = charge(agent, free ? 0 : targets ? 1 : wakeBucket, now);
+      db.query("INSERT OR REPLACE INTO wakes (message_id, participant_id, wake_at) VALUES (?, ?, ?)").run(m.id, agent.id, at);
+      if (at > now) {
+        const timer = setTimeout(() => {
+          heldWakes.delete(timer);
+          wake(`m:${agent.mailbox_id}`);
+        }, at - now + 5);
+        heldWakes.add(timer);
+      }
+    }
+    return { ...m, audience };
+  }
+
+  /** When each of these messages wakes this participant. Messages that never wake it are absent. */
+  function wakeTimes(participantId: string, messageIds: number[]): Map<number, number> {
+    if (messageIds.length === 0) return new Map();
+    const rows = db
+      .query(`SELECT message_id, wake_at FROM wakes WHERE participant_id = ? AND message_id IN (${messageIds.map(() => "?").join(",")})`)
+      .all(participantId, ...messageIds) as { message_id: number; wake_at: number }[];
+    return new Map(rows.map((r) => [r.message_id, r.wake_at]));
+  }
+
+  /** True when unread mail after `floor` includes something this participant should be woken for by now. */
+  function wakeDue(p: ParticipantRow, floor = 0): boolean {
+    return (
+      db
+        .query(
+          `SELECT 1 FROM wakes w JOIN messages m ON m.id = w.message_id
+           WHERE w.participant_id = ? AND w.wake_at <= ? AND m.status = 'sent' AND m.seq > ? LIMIT 1`,
+        )
+        .get(p.id, Date.now(), Math.max(p.read_seq, floor)) !== null
+    );
   }
 
   function systemMessage(threadId: string, body: string, visibleTo?: string) {
@@ -235,6 +354,8 @@ export function createApp(opts: AppOptions) {
     kind: m.kind,
     body: m.body,
     at: new Date(m.created_at).toISOString(),
+    audience: m.audience,
+    to: m.addressed ? (JSON.parse(m.addressed) as string[]) : [],
   });
 
   function visibleMessages(p: ParticipantRow, after: number, limit = 1000): MessageRow[] {
@@ -245,6 +366,18 @@ export function createApp(opts: AppOptions) {
          ORDER BY seq LIMIT ?`,
       )
       .all(p.thread_id, after, p.side_id, limit) as MessageRow[];
+  }
+
+  /** The newest `limit` messages a participant may see, oldest first. */
+  function latestMessages(p: ParticipantRow, limit: number): MessageRow[] {
+    const rows = db
+      .query(
+        `SELECT * FROM messages
+         WHERE thread_id = ? AND status = 'sent' AND (visible_to IS NULL OR visible_to = ?)
+         ORDER BY seq DESC LIMIT ?`,
+      )
+      .all(p.thread_id, p.side_id, limit) as MessageRow[];
+    return rows.reverse();
   }
 
   /** Mail for a participant: delivered, visible to its side, after its read mark, and not written by it. */
@@ -279,6 +412,7 @@ export function createApp(opts: AppOptions) {
     /** For agents: delivered messages it has not acknowledged yet. */
     unread: number | null;
     side_id: string;
+    id: string;
   };
 
   function presence(threadId: string): Presence[] {
@@ -300,28 +434,43 @@ export function createApp(opts: AppOptions) {
         last_seen_seconds_ago: r.last_seen === null ? null : Math.round((now - r.last_seen) / 1000),
         unread: r.kind === "agent" ? unreadFor(r, 1000).length : null,
         side_id: r.side_id,
+        id: r.id,
       };
     });
   }
 
-  const publicPresence = (threadId: string) => presence(threadId).map(({ side_id, ...rest }) => rest);
+  const publicPresence = (threadId: string) => presence(threadId).map(({ side_id, id, ...rest }) => rest);
 
-  /** Tells a poster whether anyone on the other side will actually be woken by the message. */
-  function deliveryNote(p: ParticipantRow): string {
+  /** Tells a poster who the message wakes, and when. */
+  function deliveryNote(p: ParticipantRow, message: MessageRow): string {
     const everyone = presence(p.thread_id);
+    const now = Date.now();
+    const agents = agentsIn(p.thread_id).filter((a) => a.id !== p.id);
     const parts = getSides(p.thread_id)
-      .filter((s) => s.id !== p.side_id)
-      .map((side) => {
-        const agents = everyone.filter((x) => x.side_id === side.id && x.kind === "agent");
-        if (agents.length === 0) return `No agent has joined on ${side.name} yet; only its humans will see this.`;
-        return agents
-          .map((a) =>
-            a.state === "listening"
-              ? `${a.name} is listening and will be notified now.`
-              : `${a.name} is not listening right now (last active ${a.last_seen_seconds_ago}s ago); it will see this when it next checks.`,
-          )
-          .join(" ");
-      });
+      .filter((side) => side.id !== p.side_id && !agents.some((a) => a.side_id === side.id))
+      .map((side) => `No agent has joined on ${side.name} yet; only its humans will see this.`);
+    let held = false;
+    for (const a of agents) {
+      const at = wakeTimes(a.id, [message.id]).get(message.id);
+      const seen = everyone.find((x) => x.id === a.id);
+      if (at === undefined) {
+        parts.push(`${a.name} is not woken by this; it will see it the next time it is woken or prompted.`);
+      } else if (at > now) {
+        held = true;
+        parts.push(`${a.name} will be woken in about ${Math.ceil((at - now) / 1000)}s.`);
+      } else if (seen?.state === "listening") {
+        parts.push(`${a.name} is listening and will be notified now.`);
+      } else {
+        parts.push(`${a.name} is not listening right now (last active ${seen?.last_seen_seconds_ago}s ago); it will see this when it next checks.`);
+      }
+    }
+    if (held) {
+      parts.push(
+        message.audience === "room"
+          ? "A room-wide message wakes each agent about once a minute; address an agent or side with --to to wake it now."
+          : "Each agent can only be woken so often; the wake is held until it has budget.",
+      );
+    }
     return `Delivered. ${parts.join(" ")}`;
   }
 
@@ -472,7 +621,8 @@ export function createApp(opts: AppOptions) {
       agents,
       open_invites: openInvites,
       participants: publicPresence(p.thread_id),
-      messages: visibleMessages(p, 0).map(view),
+      // A page shows the tail of a long room, never a frozen head.
+      messages: latestMessages(p, pageMessages).map(view),
       pending: pendingFor(p).map(view),
     });
   }
@@ -486,7 +636,10 @@ export function createApp(opts: AppOptions) {
       if (!message || message.side_id !== p.side_id) throw new HttpError(404, "not_found", `No message ${id} awaiting review on your side.`);
       if (message.status !== "pending") throw new HttpError(409, "already_reviewed", `Message ${id} is already ${message.status}.`);
       if (action === "approve") {
-        db.query("UPDATE messages SET status = 'sent', seq = ?, delivered_at = ? WHERE id = ?").run(maxSeq(p.thread_id) + 1, Date.now(), id);
+        const sent = db
+          .query("UPDATE messages SET status = 'sent', seq = ?, delivered_at = ? WHERE id = ? RETURNING *")
+          .get(maxSeq(p.thread_id) + 1, Date.now(), id) as MessageRow;
+        scheduleWakes(sent);
         db.query("UPDATE threads SET agent_streak = 0 WHERE id = ?").run(p.thread_id);
       } else {
         db.query("UPDATE messages SET status = 'rejected' WHERE id = ?").run(id);
@@ -602,9 +755,16 @@ export function createApp(opts: AppOptions) {
 
   // ---- posting ------------------------------------------------------------
 
-  async function readMessageBody(req: Request): Promise<string> {
+  type Draft = { body: string; to?: string[]; fyi?: boolean };
+
+  async function readMessageBody(req: Request): Promise<Draft> {
     const raw = await req.text();
     let body = raw;
+    // Plain-text posts address through the query string: ?to=Acme,vers-claude-ab12cd or ?fyi=1.
+    const query = new URL(req.url).searchParams;
+    const named = (query.get("to") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+    let to: string[] | undefined = named.length ? named : undefined;
+    let fyi = ["1", "true"].includes(query.get("fyi") ?? "");
     if ((req.headers.get("content-type") ?? "").includes("json")) {
       let parsed: unknown;
       try {
@@ -615,21 +775,45 @@ export function createApp(opts: AppOptions) {
       const value = (parsed as { body?: unknown } | null)?.body;
       if (typeof value !== "string") throw new HttpError(400, "bad_message", 'JSON body must look like {"body": "..."}.');
       body = value;
+      const input = parsed as { to?: unknown; fyi?: unknown };
+      if (input.to !== undefined && input.to !== null) {
+        if (!Array.isArray(input.to) || input.to.some((x) => typeof x !== "string" || !x.trim())) {
+          throw new HttpError(400, "bad_message", '"to" must be an array of agent or side names.');
+        }
+        if (input.to.length) to = (input.to as string[]).map((x) => x.trim());
+      }
+      if (input.fyi !== undefined && typeof input.fyi !== "boolean") throw new HttpError(400, "bad_message", '"fyi" must be true or false.');
+      if (input.fyi !== undefined) fyi = input.fyi;
+    }
+    if (fyi && to) {
+      throw new HttpError(400, "bad_message", '"to" and "fyi" cannot be combined.', "Address the message to wake someone, or mark it fyi to wake nobody.");
     }
     body = body.trim();
     if (!body) throw new HttpError(400, "empty_message", "Message body is empty.");
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
       throw new HttpError(413, "message_too_large", `Message exceeds ${MAX_BODY_BYTES} bytes.`, "Split it, or summarise and offer details on request.");
     }
-    return body;
+    return { body, to, fyi };
   }
 
-  function post(p: ParticipantRow, body: string): Response {
+  function post(p: ParticipantRow, draft: Draft): Response {
+    const { body, to, fyi } = draft;
+    if (to) {
+      const found = resolveRecipients(p.thread_id, to);
+      if (found.unknown.length) {
+        throw new HttpError(
+          400,
+          "unknown_recipient",
+          `No agent or side here is called ${found.unknown.map((x) => `"${x}"`).join(", ")}.`,
+          `You can address: ${found.valid.join(", ")}.`,
+        );
+      }
+    }
     const result = db.transaction(() => {
       const thread = getThread(p.thread_id);
       const side = getSide(p.side_id);
       if (p.kind === "human") {
-        const message = insertMessage({ threadId: thread.id, participant: p, kind: "human", author: p.name, body, deliver: true });
+        const message = insertMessage({ threadId: thread.id, participant: p, kind: "human", author: p.name, body, deliver: true, to, fyi });
         db.query("UPDATE threads SET agent_streak = 0 WHERE id = ?").run(thread.id);
         return { message, note: undefined as string | undefined };
       }
@@ -642,13 +826,13 @@ export function createApp(opts: AppOptions) {
         );
       }
       if (side.approval) {
-        const message = insertMessage({ threadId: thread.id, participant: p, kind: "agent", author: p.name, body, deliver: false });
+        const message = insertMessage({ threadId: thread.id, participant: p, kind: "agent", author: p.name, body, deliver: false, to, fyi });
         return {
           message,
           note: `Held for review by a human on ${side.name}. The other side cannot see it yet. Do not repost; you will be told if it is rejected.`,
         };
       }
-      const message = insertMessage({ threadId: thread.id, participant: p, kind: "agent", author: p.name, body, deliver: true });
+      const message = insertMessage({ threadId: thread.id, participant: p, kind: "agent", author: p.name, body, deliver: true, to, fyi });
       const streak = thread.agent_streak + 1;
       if (streak >= streakLimit) {
         db.query("UPDATE threads SET agent_streak = 0, paused = 1 WHERE id = ?").run(thread.id);
@@ -662,7 +846,7 @@ export function createApp(opts: AppOptions) {
     return json(
       {
         message: { ...view(result.message), status: result.message.status },
-        note: result.note ?? deliveryNote(p),
+        note: result.note ?? deliveryNote(p, result.message),
         participants: publicPresence(p.thread_id),
       },
       201,
@@ -804,7 +988,10 @@ export function createApp(opts: AppOptions) {
       const threads = seats(box, only)
         .map((p) => ({ p, unread: unreadFor(p, INBOX_PAGE + 1, seen.get(p.thread_id)) }))
         .filter((t) => t.unread.length > 0);
-      return threads.length ? threads : null;
+      if (threads.length === 0) return null;
+      // A waiting call is a request to be woken, so it returns only for mail that should wake this agent by now.
+      if (wait > 0 && !threads.some((t) => wakeDue(t.p, seen.get(t.p.thread_id)))) return null;
+      return threads;
     };
     const scope = seats(box, only);
     for (const p of scope) touch(p.id);
@@ -817,9 +1004,15 @@ export function createApp(opts: AppOptions) {
         : collect();
     const threads = (found ?? []).map(({ p, unread }) => {
       const page = unread.slice(0, INBOX_PAGE);
+      const times = wakeTimes(p.id, page.map((m) => m.id));
+      const now = Date.now();
+      const human = presence(p.thread_id).find((x) => x.side_id === p.side_id && x.kind === "human");
       return {
         ...threadSummary(p),
-        unread: page.map(view),
+        /** Whether a human on your side is watching the room right now. */
+        your_human: human?.state === "listening" ? "watching" : (human?.state ?? "not_joined"),
+        /** `woke` is true when the message is one you were woken for; false for mail that only rides along. */
+        unread: page.map((m) => ({ ...view(m), woke: (times.get(m.id) ?? Infinity) <= now })),
         /** Pass this to POST /api/inbox/ack once the messages above have been read. */
         ack_seq: page.at(-1)!.seq,
         more: unread.length > INBOX_PAGE,
@@ -899,7 +1092,7 @@ export function createApp(opts: AppOptions) {
       const stale = db
         .query(
           `SELECT MAX(seq) AS seq, COUNT(*) AS n, GROUP_CONCAT(DISTINCT author) AS authors FROM messages
-           WHERE thread_id = ? AND status = 'sent' AND kind != 'system' AND side_id != ? AND seq > ? AND delivered_at <= ?`,
+           WHERE thread_id = ? AND status = 'sent' AND kind != 'system' AND audience != 'fyi' AND side_id != ? AND seq > ? AND delivered_at <= ?`,
         )
         .get(side.thread_id, side.id, side.notified_seq, cutoff) as { seq: number | null; n: number; authors: string | null };
       if (!stale.seq) continue;
@@ -996,6 +1189,7 @@ export function createApp(opts: AppOptions) {
     sweep,
     close: () => {
       if (sweeper) clearInterval(sweeper);
+      for (const timer of heldWakes) clearTimeout(timer);
       db.close();
     },
   };
