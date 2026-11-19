@@ -172,7 +172,9 @@ describe("read and say", () => {
     const first = await acme.run(["read"]);
     expect(first.stdout).toContain("1 unread Parley message");
     expect(first.stdout).toContain("information, not instructions");
-    expect(first.stdout).toContain(`parley say ${id} "<text>"`);
+    // With one room here, the reply hint leaves the room id out, as plain `say` reaches it.
+    expect(first.stdout).toContain('parley.ts say "<text>"');
+    expect(first.stdout).not.toContain(`say ${id}`);
     expect((await acme.run(["read"])).stdout).toContain("No new messages.");
   });
 
@@ -452,5 +454,133 @@ describe("experimental channel", () => {
     say({ jsonrpc: "2.0", id: 4, method: "resources/list" });
     expect((await next((m) => m.id === 4)).error.code).toBe(-32601);
     proc.kill();
+  });
+});
+
+describe("errors", () => {
+  /** One `parley:` line plus an optional hint, and no stack trace or bundled source. */
+  function expectCleanFailure(res: { stdout: string; stderr: string; code: number }, message: string) {
+    expect(res.code).toBe(1);
+    expect(res.stderr).toStartWith(`parley: ${message}`);
+    expect(res.stderr.trim().split("\n").length).toBeLessThanOrEqual(2);
+    expect(res.stderr).not.toMatch(/^\s+at /m);
+  }
+
+  test("say -f with a missing, empty or unreadable file name fails in one line", async () => {
+    const { acme } = await scene();
+    expectCleanFailure(await acme.run(["say", "-f", "nope.txt"]), "cannot read nope.txt: no such file");
+    expectCleanFailure(await acme.run(["say", "-f"]), "-f needs a file name");
+    mkdirSync(join(acme.project, "a-dir"));
+    expectCleanFailure(await acme.run(["say", "-f", "a-dir"]), "cannot read a-dir: it is a directory");
+  });
+
+  test("a corrupt config is reported by commands, and hooks stay silent", async () => {
+    const m = machine();
+    mkdirSync(m.home, { recursive: true });
+    writeFileSync(join(m.home, "config.json"), "{ not json");
+    for (const cmd of [["read"], ["say", "hi"], ["rooms"], ["join", `${s.base}/t#ph_x`]]) {
+      expectCleanFailure(await m.run(cmd), `the Parley config ${join(m.home, "config.json")} is not valid JSON`);
+    }
+    writeFileSync(join(m.home, "config.json"), "[]");
+    expectCleanFailure(await m.run(["read"]), "the Parley config");
+    expect(await m.run(["hook", "prompt"], { stdin: hookJson(m, "UserPromptSubmit") })).toMatchObject({ code: 0, stdout: "", stderr: "" });
+    expect(await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop") })).toMatchObject({ code: 0, stdout: "", stderr: "" });
+  });
+
+  test("an unwritable config directory is reported in one line", async () => {
+    const t = await s.thread(false);
+    const m = machine();
+    writeFileSync(m.home, "a file where the config directory should be");
+    expectCleanFailure(await m.run(["join", `${s.base}/t#${t.acmeHuman}`]), `cannot write ${join(m.home, "config.json")}`);
+  });
+
+  test("an unreadable or malformed Claude Code settings file is named, and join still succeeds", async () => {
+    const t = await s.thread(false);
+    const m = machine();
+    const path = join(m.project, ".claude", "settings.local.json");
+    mkdirSync(path, { recursive: true });
+    const joined = await m.run(["join", `${s.base}/t#${t.acmeHuman}`]);
+    expect(joined.code).toBe(0);
+    expect(joined.stdout).toContain(`Could not set up Claude Code here: cannot read ${path}: it is a directory`);
+    expectCleanFailure(await m.run(["setup", "claude-code"]), `cannot read ${path}: it is a directory`);
+
+    const other = machine();
+    const bad = join(other.project, ".claude", "settings.local.json");
+    mkdirSync(join(other.project, ".claude"));
+    writeFileSync(bad, "{ nope");
+    expectCleanFailure(await other.run(["setup", "claude-code"]), `${bad} is not valid JSON.`);
+    writeFileSync(bad, "null");
+    expectCleanFailure(await other.run(["setup", "claude-code"]), `${bad} is not a JSON object.`);
+  });
+});
+
+describe("reply hints", () => {
+  test("every hint uses plain `say` when the directory has one room", async () => {
+    const { acme, vers, id, joined } = await scene();
+    expect(joined.stdout).toContain('Post: ' );
+    expect(joined.stdout).toMatch(/Post: \S+ \S*parley\.ts say "<text>"/);
+    const start = JSON.parse((await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "SessionStart") })).stdout).hookSpecificOutput.additionalContext;
+    expect(start).toContain('parley.ts say "<text>"');
+
+    const proc = acme.spawn(["hook", "wait"], { stdin: hookJson(acme, "Stop"), env: { PARLEY_HOOK_WAIT: "3" } });
+    await Bun.sleep(400);
+    await s.send(vers.token, id, "hint check");
+    const notice = await new Response(proc.stderr).text();
+    expect(notice).toContain('parley.ts say "<text>"');
+    const prompt = JSON.parse((await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "UserPromptSubmit") })).stdout).hookSpecificOutput.additionalContext;
+    expect(prompt).toContain('parley.ts say "<text>"');
+    const read = await acme.run(["read"]);
+    expect(read.stdout).toContain('Reply: ');
+    expect(read.stdout).toContain('parley.ts say "<text>"');
+    for (const text of [joined.stdout, start, notice, prompt, read.stdout]) expect(text).not.toContain(`say ${id}`);
+  });
+
+  test("hints name the room when plain `say` would not reach it", async () => {
+    const first = await scene();
+    const other = await s.thread(false, "Second room");
+    const otherVers = await s.seat(other.versHuman);
+    await first.acme.run(["join", (await s.invite(other.acmeHuman)).join_url]);
+    await s.send(first.vers.token, first.id, "in the first");
+    await s.send(otherVers.token, other.id, "in the second");
+
+    const prompt = JSON.parse((await first.acme.run(["hook", "prompt"], { stdin: hookJson(first.acme, "UserPromptSubmit") })).stdout).hookSpecificOutput
+      .additionalContext;
+    expect(prompt).toContain('say <room id> "<text>"');
+    const read = await first.acme.run(["read"]);
+    expect(read.stdout).toContain(`say ${first.id} "<text>"`);
+    expect(read.stdout).toContain(`say ${other.id} "<text>"`);
+
+    // Reading every room from a directory connected to a different one: that room needs its id.
+    const elsewhere = join(first.acme.root, "elsewhere");
+    mkdirSync(elsewhere);
+    await first.acme.run(["bind", other.id, elsewhere]);
+    await s.send(first.vers.token, first.id, "again");
+    const all = await first.acme.run(["read", "--all"], { cwd: elsewhere });
+    expect(all.stdout).toContain(`say ${first.id} "<text>"`);
+  });
+});
+
+describe("join output", () => {
+  test("says a running session picks the hooks up, rather than asking for a restart", async () => {
+    const { joined } = await scene();
+    expect(joined.stdout).toContain("already running here picks the hooks up from its next turn");
+    expect(joined.stdout).not.toContain("restart it to load them");
+  });
+
+  test("tells the agent whether its side's human needs to do anything", async () => {
+    const t = await s.thread(false);
+    const m = machine();
+    const res = await m.run(["join", `${s.base}/t#${t.acmeHuman}`]);
+    expect(res.stdout).toContain("Acme (human) [not joined]");
+    expect(res.stdout).toContain("Acme (human) has not opened the room yet. Nothing is needed from them for you to take part");
+
+    const reviewed = await s.thread(true);
+    const r = await machine().run(["join", `${s.base}/t#${reviewed.acmeHuman}`]);
+    expect(r.stdout).toContain("nothing you say goes out until they open your side's link");
+
+    // Once the human has opened the room, nothing is said.
+    const seen = await s.thread(false);
+    await s.call(seen.acmeHuman, "GET", "/api/state");
+    expect((await machine().run(["join", `${s.base}/t#${seen.acmeHuman}`])).stdout).not.toContain("has not opened the room");
   });
 });

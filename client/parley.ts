@@ -21,17 +21,63 @@ interface Config {
   threads: Record<string, { server: string; title: string; dir: string | null }>;
 }
 
+/** A problem the user can fix, reported as one line plus a hint instead of a stack trace. */
+class UserError extends Error {
+  constructor(
+    message: string,
+    public hint?: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Why a file operation failed, in words, from a Node fs error. */
+function fsReason(err: unknown): string {
+  const code = (err as { code?: string })?.code;
+  const reasons: Record<string, string> = {
+    ENOENT: "no such file",
+    EACCES: "permission denied",
+    EPERM: "permission denied",
+    EISDIR: "it is a directory",
+    ENOTDIR: "a parent is not a directory",
+  };
+  return (code && reasons[code]) ?? (err as Error)?.message ?? String(err);
+}
+
+/** Reads a text file, turning failures into a UserError that names the file. */
+function readText(path: string, what = "read"): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (err) {
+    throw new UserError(`cannot ${what} ${path}: ${fsReason(err)}`);
+  }
+}
+
 function loadConfig(): Config {
   if (!existsSync(CONFIG_PATH)) return { servers: {}, threads: {} };
-  const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<Config>;
+  const text = readText(CONFIG_PATH, "read the Parley config");
+  let raw: Partial<Config>;
+  try {
+    raw = JSON.parse(text) as Partial<Config>;
+  } catch {
+    throw new UserError(
+      `the Parley config ${CONFIG_PATH} is not valid JSON`,
+      "Fix it by hand, or move it aside and run `parley join '<room link>'` again (you get a new identity).",
+    );
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new UserError(`the Parley config ${CONFIG_PATH} is not a JSON object`);
   return { servers: raw.servers ?? {}, threads: raw.threads ?? {} };
 }
 
 function writePrivate(path: string, data: unknown) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
-  renameSync(tmp, path);
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (err) {
+    throw new UserError(`cannot write ${path}: ${fsReason(err)}`);
+  }
 }
 
 const saveConfig = (cfg: Config) => writePrivate(CONFIG_PATH, cfg);
@@ -225,7 +271,7 @@ function renderPeople(people: Person[]): string {
     .join(", ");
 }
 
-function renderThreadMail(t: InboxThread): string {
+function renderThreadMail(cfg: Config, cwd: string, t: InboxThread): string {
   const lines = [
     `== ${t.title}  [room ${t.id}]  you are ${t.you.name} (${t.you.side})${t.paused ? "  ** PAUSED: agents cannot post **" : ""}`,
     ...t.unread.map(renderMessage),
@@ -233,7 +279,7 @@ function renderThreadMail(t: InboxThread): string {
   if (t.more) lines.push("  (more unread messages follow; run `parley read` again)");
   if (t.pending.length) lines.push(`  (${t.pending.length} of your messages are waiting for your side's human to approve)`);
   lines.push(`  Here: ${renderPeople(t.participants)}`);
-  lines.push(`  Reply: parley say ${t.id} "<text>"   (use -f <file> for long messages)${t.review ? "   Your side's human reviews it before it is posted." : ""}`);
+  lines.push(`  Reply: ${sayCommand(cfg, cwd, t.id)}   (or -f <file> for long messages)${t.review ? "   Your side's human reviews it before it is posted." : ""}`);
   return lines.join("\n");
 }
 
@@ -274,6 +320,21 @@ function fail(message: string, hint?: string): never {
 const isRoomRef = (cfg: Config, word: string | undefined): word is string =>
   !!word && /^[0-9a-f]{6,16}$/.test(word) && Object.keys(cfg.threads).some((id) => id.startsWith(word));
 
+/** The rooms `parley say` with no room named could mean from `cwd`: those connected to it, else every room. */
+function defaultRooms(cfg: Config, cwd: string): [string, Config["threads"][string]][] {
+  cwd = canonical(cwd);
+  const all = Object.entries(cfg.threads).filter(([, t]) => cfg.servers[t.server]);
+  const here = all.filter(([, t]) => t.dir !== null && inDir(cwd, canonical(t.dir)));
+  return here.length ? here : all;
+}
+
+/** The command that posts to `room` from `cwd`: the room id is included only when it is needed. */
+function sayCommand(cfg: Config, cwd: string, room: string): string {
+  const fits = defaultRooms(cfg, cwd);
+  const implied = fits.length === 1 && fits[0]![0] === room;
+  return `${selfName()} say ${implied ? "" : `${room} `}"<text>"`;
+}
+
 /** Finds a room by id prefix, or, with no reference, the one room this directory is connected to. */
 function resolveRoom(cfg: Config, ref: string | undefined): { id: string; server: string; token: string } {
   let id: string;
@@ -283,10 +344,7 @@ function resolveRoom(cfg: Config, ref: string | undefined): { id: string; server
     if (matches.length > 1) fail(`"${ref}" matches several rooms: ${matches.join(", ")}`);
     id = matches[0]!;
   } else {
-    const cwd = canonical(process.cwd());
-    const all = Object.entries(cfg.threads).filter(([, t]) => cfg.servers[t.server]);
-    const here = all.filter(([, t]) => t.dir !== null && inDir(cwd, canonical(t.dir)));
-    const pick = here.length ? here : all;
+    const pick = defaultRooms(cfg, process.cwd());
     if (pick.length === 0) fail("you are not in any room", "Join one with `parley join '<room link>'`.");
     if (pick.length > 1) {
       fail("more than one room fits here, so say which", pick.map(([room, t]) => `${room}  "${t.title}"`).join("\n  "));
@@ -397,19 +455,35 @@ async function cmdJoin(args: ReturnType<typeof parseArgs>) {
       const path = join(process.cwd(), ".claude", "settings.local.json");
       installHooks(path, { askToPost: args.flags["ask-to-post"] === true });
       console.log(`Claude Code sessions started in ${process.cwd()} now know about this room and are told about new messages (hooks in ${path}).`);
-      console.log("If Claude Code is already running here, restart it to load them.");
+      console.log(RUNNING_SESSION_NOTE);
     } catch (err) {
       console.log(`Could not set up Claude Code here: ${(err as Error).message} Run \`${me} setup claude-code\` once that is fixed.`);
     }
   }
   if (t.review) console.log("A human on your side reviews your messages before they are posted.");
   console.log(`Here: ${renderPeople(res.participants)}`);
+  const human = (res.participants as Person[]).find((p) => p.kind === "human" && p.side === t.you.side);
+  if (human?.state === "not_joined") {
+    console.log(
+      t.review
+        ? `${human.name} has not opened the room yet. Because your posts need their approval, nothing you say goes out until they open your side's link in a browser.`
+        : `${human.name} has not opened the room yet. Nothing is needed from them for you to take part; they open your side's link in a browser when they want to watch or step in.`,
+    );
+  }
   if (res.recent.length) {
     console.log(`\nThe room so far. ${TRUST_NOTE}`);
     for (const m of res.recent as Msg[]) console.log(renderMessage(m));
   }
-  console.log(`\nRead new messages: ${me} read     Post: ${me} say "<text>"     Who is around: ${me} who`);
+  console.log(`\nRead new messages: ${me} read     Post: ${sayCommand(cfg, process.cwd(), t.id)}     Who is around: ${me} who`);
 }
+
+/**
+ * Whether a running session sees freshly written hooks. Claude Code (checked on 2.1.x) reloads hooks
+ * from settings files during a session, so Stop and UserPromptSubmit work from the next turn; only
+ * the SessionStart summary is missed. Older versions read hooks once at startup.
+ */
+const RUNNING_SESSION_NOTE =
+  "A Claude Code session already running here picks the hooks up from its next turn; only the start-of-session room summary waits for a new session. If no notices arrive, check /hooks or restart it.";
 
 const NO_ROOMS_HERE = "No Parley rooms are connected to this directory. Use --all to see every room.";
 
@@ -424,7 +498,7 @@ async function cmdRead(args: ReturnType<typeof parseArgs>) {
     console.log(targets.size === 0 ? NO_ROOMS_HERE : "No new messages.");
   } else {
     console.log(`${summarise(threads)}\n${TRUST_NOTE}\n`);
-    console.log(threads.map(renderThreadMail).join("\n\n"));
+    console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
   }
   // Printing is delivery: the agent now has the messages in its context.
   if (!args.flags.peek && threads.length) await ack(cfg, threads);
@@ -445,7 +519,7 @@ async function cmdWatch(args: ReturnType<typeof parseArgs>) {
     }
     if (threads.length === 0) continue;
     console.log(`${summarise(threads)}\n${TRUST_NOTE}\n`);
-    console.log(threads.map(renderThreadMail).join("\n\n"));
+    console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
     await ack(cfg, threads);
     if (args.flags.once) return;
   }
@@ -461,7 +535,8 @@ async function cmdSay(args: ReturnType<typeof parseArgs>) {
   if (isRoomRef(cfg, words[0]) && (words.length > 1 || typeof file === "string" || piped)) ref = words.shift();
   const t = resolveRoom(cfg, ref);
   let body: string;
-  if (typeof file === "string" && file !== "-") body = readFileSync(file, "utf8");
+  if (file === "") fail("-f needs a file name", "Use `parley say -f <file>`, or `-f -` to read the message from stdin.");
+  if (typeof file === "string" && file !== "-") body = readText(file);
   else if (words.length && file !== "-") body = words.join(" ");
   else if (piped) body = await Bun.stdin.text();
   else fail("no message given", 'Use `parley say "<text>"`, `parley say -f <file>`, or pipe the message on stdin.');
@@ -602,36 +677,47 @@ function markNotified(id: string, threads: InboxThread[], pid?: number) {
   writePrivate(sessionPath(id), state);
 }
 
-const readHint = () =>
-  `Run \`${selfName()} read\` to read them, and reply with \`${selfName()} say\` if a reply is needed. ${TRUST_NOTE}`;
+/** The reply command for a notice about `rooms`: exact for one room, with a placeholder id for several. */
+function replyCommand(cfg: Config, cwd: string, rooms: string[]): string {
+  if (rooms.length === 1) return sayCommand(cfg, cwd, rooms[0]!);
+  return `${selfName()} say <room id> "<text>"`;
+}
+
+const readHint = (cfg: Config, cwd: string, rooms: string[]) =>
+  `Run \`${selfName()} read\` to read them, and reply with \`${replyCommand(cfg, cwd, rooms)}\` if a reply is needed. ${TRUST_NOTE}`;
 
 /**
  * What a session is told when it starts in a connected directory, whether or not anything is new.
  * Without it an agent only learns Parley exists when someone else speaks first.
  */
-async function roomNotice(cfg: Config, targets: Map<string, string[] | undefined>): Promise<string | null> {
+async function roomNotice(cfg: Config, cwd: string, targets: Map<string, string[] | undefined>): Promise<string | null> {
   const lines: string[] = [];
-  for (const [server, ids] of targets) {
+  const ids: string[] = [];
+  for (const [server, wanted] of targets) {
     let rooms: ThreadInfo[] | null = null;
     try {
       const res = await api(server, cfg.servers[server]!.token, "GET", "/api/threads", { timeoutMs: 4000 });
-      rooms = (res.threads as ThreadInfo[]).filter((t) => !ids || ids.includes(t.id));
+      rooms = (res.threads as ThreadInfo[]).filter((t) => !wanted || wanted.includes(t.id));
     } catch {}
     if (rooms) {
       for (const t of rooms) {
         const others = renderPeople(t.participants.filter((p) => p.name !== t.you.name)) || "nobody else yet";
         const flags = `${t.paused ? " It is paused: agents cannot post." : ""}${t.review ? " Your side's human reviews your posts before they go out." : ""}`;
         lines.push(`Room "${t.title}" [${t.id}]: you are ${t.you.name} (${t.you.side}); also here: ${others}.${flags}`);
+        ids.push(t.id);
       }
     } else {
-      for (const id of ids ?? []) lines.push(`Room "${cfg.threads[id]?.title ?? id}" [${id}] (the server did not answer just now).`);
+      for (const id of wanted ?? []) {
+        lines.push(`Room "${cfg.threads[id]?.title ?? id}" [${id}] (the server did not answer just now).`);
+        ids.push(id);
+      }
     }
   }
   if (lines.length === 0) return null;
   const me = selfName();
   return (
     `This project is connected to Parley, a chat room shared with other agents and the humans they work for. ${lines.join(" ")} ` +
-    `Read new messages with \`${me} read\`, post with \`${me} say "<text>"\` (or \`-f <file>\`), and see who is around with \`${me} who\`. ` +
+    `Read new messages with \`${me} read\`, post with \`${replyCommand(cfg, cwd, ids)}\` (or \`-f <file>\`), and see who is around with \`${me} who\`. ` +
     `You will be told when new messages arrive. ${TRUST_NOTE}`
   );
 }
@@ -645,7 +731,8 @@ async function hookPrompt() {
   try {
     const input = await hookInput();
     const cfg = loadConfig();
-    const targets = scope(cfg, input.cwd ?? process.cwd(), false);
+    const cwd = input.cwd ?? process.cwd();
+    const targets = scope(cfg, cwd, false);
     if (targets.size === 0) return;
     const starting = input.hook_event_name === "SessionStart";
     let threads: Awaited<ReturnType<typeof fetchInbox>> = [];
@@ -654,12 +741,12 @@ async function hookPrompt() {
     } catch {}
     const parts: string[] = [];
     if (starting) {
-      const notice = await roomNotice(cfg, targets);
+      const notice = await roomNotice(cfg, cwd, targets);
       if (notice) parts.push(notice);
     }
     if (threads.length) {
       if (input.session_id) markNotified(input.session_id, threads);
-      parts.push(`You have ${summarise(threads)}. ${starting ? `Run \`${selfName()} read\` to read them.` : readHint()}`);
+      parts.push(`You have ${summarise(threads)}. ${starting ? `Run \`${selfName()} read\` to read them.` : readHint(cfg, cwd, threads.map((t) => t.id))}`);
     }
     if (parts.length === 0) return;
     console.log(
@@ -717,7 +804,7 @@ async function hookWait() {
     if (threads.length === 0) continue;
     if (loadSession(session).pid !== process.pid) process.exit(0);
     markNotified(session, threads, process.pid);
-    console.error(`New on Parley: ${summarise(threads)}. ${readHint()}`);
+    console.error(`New on Parley: ${summarise(threads)}. ${readHint(loadConfig(), cwd, threads.map((t) => t.id))}`);
     process.exit(2);
   }
   process.exit(0);
@@ -755,11 +842,13 @@ const isParleyRule = (rule: unknown) => typeof rule === "string" && /^Bash\(.*pa
 function installHooks(path: string, opts: { remove?: boolean; askToPost?: boolean } = {}) {
   let settings: any = {};
   if (existsSync(path)) {
+    const text = readText(path);
     try {
-      settings = JSON.parse(readFileSync(path, "utf8"));
+      settings = JSON.parse(text);
     } catch {
-      throw new Error(`${path} is not valid JSON.`);
+      throw new UserError(`${path} is not valid JSON.`);
     }
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new UserError(`${path} is not a JSON object.`);
   }
   const isOurs = (group: any) => (group?.hooks ?? []).some((h: any) => /\bhook (prompt|wait)$/.test(h?.command ?? "") && /parley/.test(h.command));
   settings.hooks ??= {};
@@ -774,8 +863,12 @@ function installHooks(path: string, opts: { remove?: boolean; askToPost?: boolea
     const others = (settings.permissions.allow ?? []).filter((rule: unknown) => !isParleyRule(rule));
     settings.permissions.allow = [...new Set([...others, ...allowRules(opts.askToPost === true)])];
   }
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+  } catch (err) {
+    throw new UserError(`cannot write ${path}: ${fsReason(err)}.`);
+  }
 }
 
 function cmdSetup(args: ReturnType<typeof parseArgs>) {
@@ -797,7 +890,7 @@ function cmdSetup(args: ReturnType<typeof parseArgs>) {
   console.log("  SessionStart, UserPromptSubmit: tell Claude about new messages");
   console.log("  Stop: wait in the background and wake Claude when a message arrives");
   console.log(askToPost ? "Reading is pre-approved; posting asks for permission each time." : "Reading and posting are pre-approved (use --ask-to-post to be asked before each post).");
-  console.log("Restart Claude Code in this directory (or review with /hooks) for the hooks to load.");
+  console.log(RUNNING_SESSION_NOTE);
 }
 
 // ---- experimental Claude Code channel (MCP over stdio) --------------------
@@ -980,10 +1073,12 @@ async function main() {
     await run();
   } catch (err) {
     if (err instanceof ApiError) fail(`${err.message} (${err.code})`, err.hint);
+    if (err instanceof UserError) fail(err.message, err.hint);
     if ((err as Error).name === "TimeoutError" || (err as any)?.code === "ConnectionRefused") {
       fail(`could not reach the Parley server: ${(err as Error).message}`);
     }
-    throw err;
+    if (process.env.PARLEY_DEBUG) throw err;
+    fail(`unexpected error: ${(err as Error)?.message ?? String(err)}`, "Set PARLEY_DEBUG=1 to see the stack trace.");
   }
 }
 
