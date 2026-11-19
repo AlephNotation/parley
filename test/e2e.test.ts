@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -868,16 +868,18 @@ describe("notifying humans when no agent picks up mail", () => {
 });
 
 describe("client distribution", () => {
-  test("without built binaries the installer explains itself", async () => {
-    const res = await s.call(null, "GET", "/install.sh");
+  test("a self-hosted server without built binaries explains itself", async () => {
+    const selfHosted = startServer({ selfHostedClient: true });
+    const res = await selfHosted.call(null, "GET", "/install.sh");
     expect(res.status).toBe(404);
     expect(res.data.error.code).toBe("client_not_built");
+    await selfHosted.stop();
   });
 
   test("the installer pins the checksum of the binary it downloads", async () => {
     const dist = mkdtempSync(join(tmpdir(), "parley-dist-"));
     writeFileSync(join(dist, "parley-linux-x64"), "fake binary");
-    const withDist = startServer({ distDir: dist });
+    const withDist = startServer({ distDir: dist, selfHostedClient: true });
     const script = (await withDist.call(null, "GET", "/install.sh")).data as string;
     const sum = new Bun.CryptoHasher("sha256").update("fake binary").digest("hex");
     expect(script).toContain(`parley-linux-x64) want=${sum}`);
@@ -896,7 +898,7 @@ describe("client distribution", () => {
     const binary = "#!/bin/sh\necho fake parley\n";
     writeFileSync(join(dist, name), binary);
     writeFileSync(join(dist, `${name}.gz`), Bun.gzipSync(Buffer.from(binary)));
-    const withDist = startServer({ distDir: dist });
+    const withDist = startServer({ distDir: dist, selfHostedClient: true });
     const script = (await withDist.call(null, "GET", "/install.sh")).data as string;
     expect(script).toContain(`file=${name}.gz;`);
 
@@ -904,7 +906,9 @@ describe("client distribution", () => {
     const home = join(mkdtempSync(join(tmpdir(), "parley-home-")), ".parley");
     const proc = Bun.spawn(["sh", "-c", script], { env: { ...process.env, PARLEY_BIN_DIR: bin, PARLEY_HOME: home }, stdout: "pipe", stderr: "pipe" });
     const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-    expect({ code, err }).toEqual({ code: 0, err: "" });
+    expect(code).toBe(0);
+    // Self-hosting is opt-in, and the installer says what that means.
+    expect(err).toContain(`warning: this client is built and checksummed by ${withDist.base} itself`);
     expect(out).toContain("Downloading the Parley client");
     expect(out).toContain(`Installed ${bin}/parley`);
     expect(readFileSync(join(bin, "parley"), "utf8")).toBe(binary);
@@ -918,6 +922,111 @@ describe("client distribution", () => {
     expect(await new Response(bad.stderr).text()).toContain("checksum mismatch");
     expect(await bad.exited).toBe(1);
     await withDist.stop();
+  });
+});
+
+describe("client releases", () => {
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  const name = `parley-${process.platform}-${arch}`;
+  const binary = "#!/bin/sh\necho released parley\n";
+  const sha = (data: string) => new Bun.CryptoHasher("sha256").update(data).digest("hex");
+
+  /** A stand-in for a GitHub release: SHA256SUMS plus gzipped binaries. */
+  function fakeRelease(files: Record<string, string | Uint8Array>) {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const file = files[new URL(req.url).pathname.split("/").pop()!];
+        return file === undefined ? new Response("not found", { status: 404 }) : new Response(file as BodyInit);
+      },
+    });
+    return { base: server.url.origin + "/download/v9.9.9", stop: () => server.stop(true) };
+  }
+
+  /** A `gh` stand-in: signed in or not, and whether attestation verification passes. */
+  function ghStub(mode: "signed-out" | "verifies" | "fails") {
+    const dir = mkdtempSync(join(tmpdir(), "parley-gh-"));
+    const status = mode === "signed-out" ? 1 : 0;
+    const verify = mode === "verifies" ? 0 : 1;
+    writeFileSync(join(dir, "gh"), `#!/bin/sh\ncase "$1" in auth) exit ${status} ;; attestation) exit ${verify} ;; esac\nexit 2\n`, { mode: 0o755 });
+    return dir;
+  }
+
+  async function install(script: string, gh: string) {
+    const bin = mkdtempSync(join(tmpdir(), "parley-bin-"));
+    const home = join(mkdtempSync(join(tmpdir(), "parley-home-")), ".parley");
+    const proc = Bun.spawn(["sh", "-c", script], {
+      env: { ...process.env, PATH: `${gh}:${process.env.PATH}`, PARLEY_BIN_DIR: bin, PARLEY_HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    return { out, err, code, bin, home };
+  }
+
+  test("by default /install.sh installs the GitHub release, checked against its SHA256SUMS, and records the server", async () => {
+    const release = fakeRelease({ SHA256SUMS: `${sha(binary)}  ${name}\n${sha("other")}  parley-plan9-x64\n`, [`${name}.gz`]: Bun.gzipSync(Buffer.from(binary)) });
+    const srv = startServer({ clientRelease: { repo: "AlephNotation/parley", version: "v9.9.9", base: release.base } });
+    try {
+      const script = (await srv.call(null, "GET", "/install.sh")).data as string;
+      expect(script).toContain("version='v9.9.9'");
+      expect(script).not.toContain("/dl/");
+      expect((await srv.call(null, "GET", `/dl/${name}`)).data.error.code).toBe("not_self_hosted");
+
+      const res = await install(script, ghStub("signed-out"));
+      expect({ code: res.code, err: res.err }).toEqual({ code: 0, err: "" });
+      expect(res.out).toContain("Downloading the Parley client v9.9.9 from AlephNotation/parley");
+      expect(res.out).toContain("Checksum verified against the v9.9.9 release. To also check build provenance: gh attestation verify");
+      expect(readFileSync(join(res.bin, "parley"), "utf8")).toBe(binary);
+      expect(readFileSync(join(res.home, "server"), "utf8").trim()).toBe(srv.base);
+    } finally {
+      release.stop();
+      await srv.stop();
+    }
+  });
+
+  test("with gh signed in, build provenance must verify", async () => {
+    const release = fakeRelease({ SHA256SUMS: `${sha(binary)}  ${name}\n`, [`${name}.gz`]: Bun.gzipSync(Buffer.from(binary)) });
+    try {
+      const { releaseInstaller } = await import("../src/install");
+      const script = releaseInstaller({ repo: "AlephNotation/parley", version: "v9.9.9", base: release.base });
+      const ok = await install(script, ghStub("verifies"));
+      expect(ok.code).toBe(0);
+      expect(ok.out).toContain("Build provenance verified: built by AlephNotation/parley's release workflow.");
+      // The published installer records no server.
+      expect(existsSync(join(ok.home, "server"))).toBe(false);
+      const bad = await install(script, ghStub("fails"));
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("the build provenance attestation did not verify against AlephNotation/parley, refusing to install");
+      expect(existsSync(join(bad.bin, "parley"))).toBe(false);
+    } finally {
+      release.stop();
+    }
+  });
+
+  test("a binary that does not match the release's SHA256SUMS, or a missing platform, is refused", async () => {
+    const tampered = fakeRelease({ SHA256SUMS: `${sha(binary)}  ${name}\n`, [`${name}.gz`]: Bun.gzipSync(Buffer.from("tampered")) });
+    const missing = fakeRelease({ SHA256SUMS: `${sha(binary)}  parley-plan9-x64\n` });
+    try {
+      const { releaseInstaller } = await import("../src/install");
+      const bad = await install(releaseInstaller({ repo: "o/r", version: "v9.9.9", base: tampered.base }), ghStub("signed-out"));
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("checksum mismatch against the release's SHA256SUMS, refusing to install");
+      expect(existsSync(join(bad.bin, "parley"))).toBe(false);
+      const none = await install(releaseInstaller({ repo: "o/r", version: "v9.9.9", base: missing.base }), ghStub("signed-out"));
+      expect(none.code).toBe(1);
+      expect(none.err).toContain("release v9.9.9 has no client build for");
+    } finally {
+      tampered.stop();
+      missing.stop();
+    }
+  });
+
+  test("the default release is this repository at the client's own version", async () => {
+    const { CLIENT_VERSION } = await import("../src/install");
+    expect(CLIENT_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    const script = (await s.call(null, "GET", "/install.sh")).data as string;
+    expect(script).toContain(`base='https://github.com/AlephNotation/parley/releases/download/v${CLIENT_VERSION}'`);
   });
 });
 

@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import { createApp } from "./app";
+import { CLIENT_VERSION } from "./install";
 
 const dbPath = process.env.PARLEY_DB ?? "data/parley.db";
 if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
@@ -18,6 +19,11 @@ const app = createApp({
   openRooms: !["0", "false"].includes(process.env.PARLEY_OPEN_ROOMS ?? "1"),
   publicUrl: process.env.PARLEY_PUBLIC_URL,
   distDir: process.env.PARLEY_DIST ?? "dist",
+  selfHostedClient: ["1", "true"].includes(process.env.PARLEY_SELF_HOSTED_CLIENT ?? ""),
+  clientRelease:
+    process.env.PARLEY_CLIENT_REPO || process.env.PARLEY_CLIENT_VERSION
+      ? { repo: process.env.PARLEY_CLIENT_REPO ?? "AlephNotation/parley", version: process.env.PARLEY_CLIENT_VERSION ?? `v${CLIENT_VERSION}` }
+      : undefined,
   streakLimit: process.env.PARLEY_STREAK_LIMIT ? Number(process.env.PARLEY_STREAK_LIMIT) : undefined,
   wakeBucket: process.env.PARLEY_WAKE_BUCKET ? Number(process.env.PARLEY_WAKE_BUCKET) : undefined,
   wakeRefillMs: process.env.PARLEY_WAKE_REFILL_MS ? Number(process.env.PARLEY_WAKE_REFILL_MS) : undefined,
