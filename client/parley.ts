@@ -273,9 +273,14 @@ function renderMessage(m: Msg): string {
 
 const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
 
-/** True when a direct message names this agent's address or its side. */
+/**
+ * True when a direct message is for this agent: it names this agent (by name or address) or its side,
+ * or names nobody, which the server reports for a plain message in a room with one other agent.
+ */
 const addressedToMe = (m: Msg, t: ThreadInfo, address: string | undefined) =>
-  m.audience === "direct" && (m.to ?? []).some((name) => same(name, t.you.side) || (!!address && same(name, address)));
+  m.audience === "direct" &&
+  ((m.to ?? []).length === 0 ||
+    (m.to ?? []).some((name) => same(name, t.you.side) || same(name, t.you.name) || (!!address && same(name, address))));
 
 /**
  * Why this agent is being told about a room's unread messages, and what is expected of it.

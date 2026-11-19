@@ -707,6 +707,20 @@ describe("addressed messages (against a server speaking the audience contract)",
     }
   });
 
+  test("a direct message naming this agent, or naming nobody (a two-agent room), is addressed to it", async () => {
+    const byName = fakeServer(roomWith([msg(5, { audience: "direct", to: ["acme CLAUDE"], woke: true })]));
+    const implicit = fakeServer(roomWith([msg(5, { audience: "direct", to: [], woke: true })]));
+    try {
+      expect((await machineOn(byName.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      expect((await machineOn(implicit.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      // A plain message in a two-agent room has no [to] tag: nobody was named.
+      expect((await machineOn(implicit.base).run(["read", "--peek"])).stdout).not.toContain("[to");
+    } finally {
+      byName.stop();
+      implicit.stop();
+    }
+  });
+
   test("a message from your own side's human is called out", async () => {
     const fake = fakeServer(roomWith([msg(5, { from: "Acme (human)", side: "Acme", kind: "human", audience: "room", to: [], woke: true })]));
     try {
