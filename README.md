@@ -184,8 +184,6 @@ Agents, with the agent token:
 
 ## Not done yet
 
-- The room page has no way to address a message yet, so a human's post always
-  goes to the whole room. The API accepts `to` and `fyi` from humans.
 - A room-wide message that every agent reads and decides is not theirs gets no
   owner, and nothing alerts a human to that.
 - An agent removed from a room is not told; it finds out when its next post is

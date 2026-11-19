@@ -9,9 +9,9 @@
 <style>
   /*
    * An instant messenger from about 2005: a chat-room window and a Buddy List side by side on a
-   * blue desktop, with rounded blue title bars, beige window faces and "Name (time): text" lines,
-   * your side in red and everyone else in blue. The log keeps a readable size, measure and spacing,
-   * because agents write long technical messages.
+   * blue desktop, with rounded blue title bars and beige window faces. The conversation is set the
+   * way that client set it: Times, tight lines, a bold "Name (10:32:15 PM):" in red for your side and
+   * blue for everyone else, OnlineHost for room events, and typed smileys drawn as yellow faces.
    */
   :root {
     --desk:#3a6ea5; --face:#ece9d8; --ink:#000; --muted:#55524a; --frame:#0831d9; --bad:#b00000;
@@ -20,8 +20,8 @@
     --tome-bg:#fff8c4; --tome-bar:#e6a800; --mine-bg:#fff1dc; --mine-bar:#e07b00; --code-bg:#f4f3ee;
     --btn1:#fff; --btn2:#ecebe5; --btn3:#d8d0c4; --btn-border:#003c74; --warnbg:#ffffe1; --hover:#fff7d6;
     --title:linear-gradient(180deg,#0997ff 0%,#0053ee 9%,#0050ee 40%,#0066ff 88%,#005bff 94%,#003dd7 100%);
-    --text:Arial, Helvetica, sans-serif;
-    --mono:"Lucida Console", Menlo, Consolas, "Courier New", monospace;
+    --text:"Times New Roman", Times, "Liberation Serif", serif;
+    --mono:"Courier New", Courier, monospace;
     --chrome:Tahoma, "Segoe UI", Geneva, Verdana, sans-serif;
   }
   @media (prefers-color-scheme: dark) {
@@ -69,41 +69,43 @@
   #chatWin { height:calc(100vh - 28px); min-height:540px; }
   .main { display:flex; flex-direction:column; flex:1; min-height:0; padding:8px; }
   .main[hidden], #buddyWin[hidden] { display:none; }
-  #log, #pending { padding:4px 0; overflow-y:auto; font:15px/1.5 var(--text); }
+  #log, #pending { padding:3px 0; overflow-y:auto; font:16px/1.3 var(--text); }
   #log { flex:1 1 auto; min-height:180px; }
   #pending { flex:1 1 auto; min-height:0; }
   #pendingWrap { flex:0 0 auto; max-height:40%; min-height:130px; display:flex; flex-direction:column; margin-top:8px; }
   #pendingWrap[hidden] { display:none; }
   #composer, #error { flex:none; }
   /* The right padding keeps a readable measure in a wide window while a highlight still spans the row. */
-  .msg { position:relative; padding:4px 12px 5px 12px; padding-right:max(12px, calc(100% - 84ch)); overflow-wrap:anywhere; color:var(--paper-ink); }
+  .msg { position:relative; padding:1px 8px 2px 8px; padding-right:max(8px, calc(100% - 92ch)); overflow-wrap:anywhere; color:var(--paper-ink); }
   .msg::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:transparent; }
   .msg.tome { background:var(--tome-bg); }
   .msg.tome::before { background:var(--tome-bar); }
   .msg.pending { background:var(--mine-bg); }
   .msg.pending::before { background:var(--mine-bar); }
-  .who { font-weight:bold; color:var(--them); }
-  .who.mine { color:var(--me); }
-  .time { font-size:12px; color:var(--paper-muted); white-space:nowrap; }
-  .badge { font-size:13px; color:var(--paper-muted); }
+  /* The whole "Name (10:32:15 PM):" is bold in the speaker's colour, with the time set small. */
+  .head { font-weight:bold; color:var(--them); }
+  .head.mine { color:var(--me); }
+  .time { font-size:.72em; white-space:nowrap; }
+  .badge { font-size:.8em; font-weight:normal; color:var(--paper-muted); }
   .badge.tome { color:var(--paper-ink); font-weight:bold; }
   .badge.fyi { font-style:italic; }
+  .smiley { width:1em; height:1em; vertical-align:-.15em; }
   .msg.fyi .text { color:var(--paper-muted); }
   .text, .text > p:first-child { display:inline; }
-  .text p { margin:.5em 0 0; }
-  .text ul, .text ol { margin:.4em 0 0; padding-left:1.6em; }
-  .text li { margin:.1em 0; }
-  .text .label { font-weight:bold; font-size:13px; letter-spacing:.03em; }
-  .text code { font:13px/1.4 var(--mono); background:var(--code-bg); padding:1px 3px; }
-  .text pre { margin:.4em 0 0; padding:6px 8px; background:var(--code-bg); border:1px solid var(--rule); overflow-x:auto; }
-  .text pre code { padding:0; background:none; line-height:1.45; white-space:pre; }
+  .text p { margin:.35em 0 0; }
+  .text ul, .text ol { margin:.25em 0 0; padding-left:1.8em; }
+  .text li { margin:0; }
+  .text .label { font-weight:bold; }
+  .text code { font:14px/1.3 var(--mono); }
+  .text pre { margin:.3em 0 .2em; padding:3px 6px; background:var(--code-bg); overflow-x:auto; }
+  .text pre code { line-height:1.35; white-space:pre; }
   .clip { max-height:21em; overflow:hidden; position:relative; }
   .clip::after { content:""; position:absolute; left:0; right:0; bottom:0; height:4em; background:linear-gradient(to bottom, transparent, var(--paper)); pointer-events:none; }
   .msg.tome .clip::after { background:linear-gradient(to bottom, transparent, var(--tome-bg)); }
   .msg.pending .clip::after { background:linear-gradient(to bottom, transparent, var(--mine-bg)); }
-  .more { display:block; margin-top:5px; font-family:var(--chrome); }
-  .msg.system { padding-top:2px; padding-bottom:2px; color:var(--paper-muted); font-size:13px; font-style:italic; }
-  .day { position:sticky; top:-4px; z-index:1; margin:2px 0; padding:2px 12px; font:11px/1.5 var(--chrome); color:var(--paper-muted); background:var(--paper); border-bottom:1px solid var(--rule); }
+  .more { display:block; margin:3px 0; font-family:var(--chrome); }
+  .msg.system .head { color:var(--them); }
+  .day { position:sticky; top:-3px; z-index:1; margin:0 0 2px; padding:2px 8px; font:11px/1.5 var(--chrome); color:var(--paper-muted); background:var(--paper); border-bottom:1px solid var(--rule); }
   .review { display:flex; gap:6px; margin-top:6px; font:12px/1.4 var(--chrome); }
 
   /* ---- composer: formatting strip, text box, then the big buttons ---- */
@@ -114,7 +116,7 @@
   .fmt .sep { width:1px; height:17px; background:var(--rule); }
   #to { min-width:0; max-width:100%; }
   #toHint { flex:1; min-width:0; font-size:11px; }
-  #body { display:block; width:100%; height:66px; resize:vertical; font:15px/1.45 var(--text); }
+  #body { display:block; width:100%; height:66px; resize:vertical; font:16px/1.3 var(--text); }
   .bigbar { display:flex; gap:4px; align-items:stretch; justify-content:space-between; margin-top:6px; }
   .big { display:flex; flex-direction:column; gap:3px; align-items:center; justify-content:center; min-width:64px; min-height:46px; padding:4px 8px; }
   .big.flat { border-color:transparent; background:none; }
@@ -173,7 +175,7 @@
     #log { flex:none; height:58vh; }
     #pendingWrap { max-height:none; }
     #buddyWin { height:auto; max-height:none; }
-    .msg { padding-right:10px; padding-left:10px; }
+    .msg { padding-right:8px; }
     #to { flex:1 1 0; }
     #people { min-height:120px; }
     #toHint { flex-basis:100%; }
@@ -208,6 +210,7 @@
           <button type="button" id="fmtBold" title="Bold"><b>B</b></button>
           <button type="button" id="fmtCode" title="Code" style="font-family:var(--mono); font-size:11px">&lt;/&gt;</button>
           <button type="button" id="fmtLink" title="Link"><u style="color:var(--link)">link</u></button>
+          <button type="button" id="fmtSmile" title="Smiley" aria-label="Smiley"></button>
           <span id="toHint" class="muted"></span>
         </div>
         <textarea id="body" placeholder="Write a message. Enter sends, Shift+Enter starts a new line."></textarea>
@@ -323,15 +326,42 @@
 
   // ---- light formatting, built from DOM nodes only ----
 
-  /** Inline code, **bold** and http(s) links. Everything else stays text. */
+  const SVG = "http://www.w3.org/2000/svg";
+  const FACES = { ":)": "smile", ":-)": "smile", ":(": "frown", ":-(": "frown", ":D": "grin", ":-D": "grin", ";)": "wink", ";-)": "wink", ":P": "tongue", ":-P": "tongue" };
+
+  function shape(tag, attrs) {
+    const node = document.createElementNS(SVG, tag);
+    for (const key in attrs) node.setAttribute(key, attrs[key]);
+    return node;
+  }
+
+  /** A typed smiley drawn as the round yellow face a 2005 messenger would swap in. */
+  function smiley(typed) {
+    const face = FACES[typed];
+    const ink = "#3b2a00";
+    const svg = shape("svg", { viewBox: "0 0 16 16", class: "smiley", role: "img", "aria-label": typed });
+    svg.append(shape("title", {}));
+    svg.firstChild.textContent = typed;
+    svg.append(shape("circle", { cx: 8, cy: 8, r: 7.2, fill: "#ffd83b", stroke: "#a06a00" }));
+    if (face === "wink") svg.append(shape("path", { d: "M4.2 6.6h2.8", stroke: ink, "stroke-width": 1.2, "stroke-linecap": "round" }));
+    else svg.append(shape("circle", { cx: 5.6, cy: 6.4, r: 1.1, fill: ink }));
+    svg.append(shape("circle", { cx: 10.4, cy: 6.4, r: 1.1, fill: ink }));
+    const mouth = face === "frown" ? "M4.6 11.8Q8 8.6 11.4 11.8" : face === "grin" ? "M4.2 9.2Q8 14.6 11.8 9.2Z" : "M4.6 9.6Q8 13 11.4 9.6";
+    svg.append(shape("path", { d: mouth, fill: face === "grin" ? "#fff" : "none", stroke: ink, "stroke-width": 1.1, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+    if (face === "tongue") svg.append(shape("path", { d: "M7.4 11.2v1.6a1.3 1.3 0 0 0 2.6 0v-1.9Z", fill: "#e2463c", stroke: ink, "stroke-width": 0.6 }));
+    return svg;
+  }
+
+  /** Inline code, **bold**, http(s) links, and smileys standing on their own. Everything else stays text. */
   function inline(text) {
     const out = [];
-    const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()"'`]+[^\s<>()"'`.,;:!?])/g;
+    const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()"'`]+[^\s<>()"'`.,;:!?])|(?<=^|\s)([:;]-?[)(DP])(?=$|\s|[.,!?])/g;
     let last = 0, m;
     while ((m = pattern.exec(text))) {
       if (m.index > last) out.push(document.createTextNode(text.slice(last, m.index)));
       if (m[1]) out.push(el("code", "", m[1].slice(1, -1)));
       else if (m[2]) out.push(el("strong", "", m[2].slice(2, -2)));
+      else if (m[6]) out.push(smiley(m[6]));
       else {
         const href = m[4] || m[5];
         const a = el("a", "", m[3] || m[5]);
@@ -408,7 +438,7 @@
 
   // ---- messages ----
 
-  const timeOf = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const timeOf = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
   const dayOf = (d) => d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
 
   function audienceBadges(m, state, toMe) {
@@ -424,15 +454,17 @@
     if (m.kind === "system") {
       const node = el("div", "msg system");
       node.title = new Date(m.at).toLocaleString();
-      node.append(el("span", "", m.body + " "), el("span", "time", "(" + timeOf(new Date(m.at)) + ")"));
+      const head = el("span", "head");
+      head.append("OnlineHost ", el("span", "time", "(" + timeOf(new Date(m.at)) + ")"), ": ");
+      node.append(head, el("span", "text", m.body));
       return node;
     }
     const toMe = addressedToMySide(m, state);
     const node = el("div", "msg" + (toMe ? " tome" : "") + (pending ? " pending" : "") + (m.audience === "fyi" ? " fyi" : ""));
     // One line the way an instant messenger writes it: "Name (10:32 PM): text".
-    const head = el("span", "head");
     const mine = m.side === state.you.side;
-    const who = el("span", "who" + (mine ? " mine" : ""), m.from);
+    const head = el("span", "head" + (mine ? " mine" : ""));
+    const who = el("span", "who", m.from);
     const when = new Date(m.at);
     const time = el("time", "time", "(" + timeOf(when) + ")");
     time.dateTime = m.at;
@@ -602,6 +634,13 @@
   }
   $("fmtBold").onclick = () => wrapSelection("**", "**", "bold text");
   $("fmtCode").onclick = () => wrapSelection("`", "`", "code");
+  $("fmtSmile").append(smiley(":)"));
+  $("fmtSmile").onclick = () => {
+    const box = $("body");
+    const lead = box.selectionStart > 0 && !/\s/.test(box.value[box.selectionStart - 1]) ? " " : "";
+    box.setRangeText(lead + ":) ", box.selectionStart, box.selectionEnd, "end");
+    box.focus();
+  };
   $("fmtLink").onclick = () => {
     const url = prompt("Link address:", "https://");
     if (url && /^https?:\/\/\S+$/.test(url.trim())) wrapSelection("[", "](" + url.trim() + ")", "link text");
