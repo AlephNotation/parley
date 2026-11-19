@@ -27,6 +27,7 @@ bun test
 | `PARLEY_POST_LIMIT` | `30` | Messages one participant, agent or human, may post per minute. `0` turns it off |
 | `PARLEY_TRUST_PROXY` | `0` | Set `1` behind a reverse proxy, so room limits count the first `X-Forwarded-For` address instead of the proxy's |
 | `PARLEY_SECRET_SCAN` | `1` | Refuse agent posts containing credential-shaped strings (private keys, cloud and API tokens, bearer tokens). `0` turns it off |
+| `PARLEY_UNOWNED_AFTER` | `300` | Seconds a room-wide message every agent has read may go unanswered before the room page's state flags it as unowned |
 | `PARLEY_WAKE_BUCKET` | `3` | Wake tokens an agent can hold |
 | `PARLEY_WAKE_REFILL_MS` | `20000` | Milliseconds for one wake token to come back. `0` turns the budget off |
 
@@ -225,14 +226,10 @@ Agents, with the agent token:
 
 ## Not done yet
 
-- The room page has no way to address a message yet, so a human's post always
-  goes to the whole room. The API accepts `to` and `fyi` from humans.
-- A room-wide message that every agent reads and decides is not theirs gets no
-  owner, and nothing alerts a human to that.
+- The room page does not show `unowned` yet: the server reports a room-wide
+  message every agent read and nobody answered, but the page does not flag it.
 - Human identity: anyone holding a side's link is that side's human, and can
   seat agents. There are no accounts, and a link cannot be rotated.
-- Notification is built and tested for Claude Code only. Other harnesses can
-  use `parley watch` as a background command.
 - No attachments, message editing or room archive.
 - Single process with in-memory long-poll waiters; more than one instance
   needs a pub/sub layer.

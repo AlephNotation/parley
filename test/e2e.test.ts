@@ -13,10 +13,10 @@ beforeAll(() => {
 afterAll(() => s.stop());
 
 /** Marks everything currently unread as read, so a test can look at what arrives next. */
-async function drain(token: string) {
-  const data = await s.inbox(token);
+async function drain(token: string, srv: ReturnType<typeof startServer> = s) {
+  const data = await srv.inbox(token);
   const acks = data.threads.map((t: any) => ({ thread: t.id, seq: t.ack_seq }));
-  if (acks.length) await s.call(token, "POST", "/api/inbox/ack", { acks });
+  if (acks.length) await srv.call(token, "POST", "/api/inbox/ack", { acks });
 }
 
 describe("thread creation", () => {
@@ -370,6 +370,78 @@ describe("rate limits", () => {
       for (let i = 0; i < 12; i++) expect((await create(open)).status).toBe(201);
     } finally {
       await open.stop();
+    }
+  });
+});
+
+describe("unowned room-wide messages", () => {
+  const state = (srv: ReturnType<typeof startServer>, human: string) => srv.call(human, "GET", "/api/state").then((r) => r.data);
+
+  /** Two agents on Acme's side as well as one on Vers's, so a plain message is room-wide rather than direct. */
+  async function threeAgents(srv: ReturnType<typeof startServer>) {
+    const t = await srv.setup(false);
+    const acme2 = await srv.seat(t.acmeHuman);
+    for (const token of [t.vers.token, t.acme.token, acme2.token]) await drain(token, srv);
+    return { ...t, acme2 };
+  }
+
+  test("a room-wide message every other agent read and nobody answered is flagged on the page", async () => {
+    const srv = startServer({ unownedAfterMs: 0 });
+    try {
+      const t = await threeAgents(srv);
+      const posted = await srv.send(t.vers.token, t.id, "Does anyone own the 502s?");
+      const seq = posted.data.message.seq;
+      expect(posted.data.message.audience).toBe("room");
+      await drain(t.acme.token, srv);
+      // Not yet: one agent has not read it.
+      expect((await state(srv, t.versHuman)).unowned).toBeNull();
+      await drain(t.acme2.token, srv);
+      const flagged = (await state(srv, t.acmeHuman)).unowned;
+      expect(flagged).toMatchObject({ seqs: [seq], from: "Vers Claude", read_by: ["Acme Claude", "Acme Claude 2"] });
+      expect(Date.parse(flagged.since)).toBeGreaterThan(0);
+      // Anyone else speaking gives it a response.
+      await srv.send(t.acme.token, t.id, "Mine, looking now.");
+      expect((await state(srv, t.versHuman)).unowned).toBeNull();
+    } finally {
+      await srv.stop();
+    }
+  });
+
+  test("addressed and fyi messages are never flagged, and a human's unanswered question is", async () => {
+    const srv = startServer({ unownedAfterMs: 0 });
+    try {
+      const t = await threeAgents(srv);
+      const readAll = async () => {
+        for (const token of [t.vers.token, t.acme.token, t.acme2.token]) await drain(token, srv);
+      };
+      await srv.call(t.vers.token, "POST", `/api/threads/${t.id}/messages`, { body: "for one agent", to: ["Acme Claude"] });
+      await readAll();
+      expect((await state(srv, t.versHuman)).unowned).toBeNull();
+      await srv.call(t.vers.token, "POST", `/api/threads/${t.id}/messages`, { body: "status note", fyi: true });
+      await readAll();
+      expect((await state(srv, t.versHuman)).unowned).toBeNull();
+
+      await srv.call(t.versHuman, "POST", "/api/messages", { body: "What is the status?" });
+      await readAll();
+      expect((await state(srv, t.versHuman)).unowned).toMatchObject({
+        from: "Vers (human)",
+        read_by: ["Vers Claude", "Acme Claude", "Acme Claude 2"],
+      });
+    } finally {
+      await srv.stop();
+    }
+  });
+
+  test("nothing is flagged until the message has gone unanswered for the set time", async () => {
+    const srv = startServer({ unownedAfterMs: 60_000 });
+    try {
+      const t = await threeAgents(srv);
+      await srv.send(t.vers.token, t.id, "anyone?");
+      await drain(t.acme.token, srv);
+      await drain(t.acme2.token, srv);
+      expect((await state(srv, t.versHuman)).unowned).toBeNull();
+    } finally {
+      await srv.stop();
     }
   });
 });

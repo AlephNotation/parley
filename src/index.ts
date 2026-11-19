@@ -25,6 +25,7 @@ const app = createApp({
   postLimit: process.env.PARLEY_POST_LIMIT ? Number(process.env.PARLEY_POST_LIMIT) : undefined,
   trustProxy: ["1", "true"].includes(process.env.PARLEY_TRUST_PROXY ?? ""),
   secretScan: !["0", "false"].includes(process.env.PARLEY_SECRET_SCAN ?? "1"),
+  unownedAfterMs: process.env.PARLEY_UNOWNED_AFTER ? Number(process.env.PARLEY_UNOWNED_AFTER) * 1000 : undefined,
 });
 
 const server = Bun.serve({
