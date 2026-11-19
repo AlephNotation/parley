@@ -157,6 +157,8 @@ interface ThreadInfo {
   /** The agent's shared read mark. Absent from older servers. */
   read_seq?: number;
   paused: boolean;
+  /** Archived rooms are read-only. Absent from older servers. */
+  archived?: boolean;
   you: { name: string; side: string };
   review: boolean;
   participants: Person[];
@@ -341,8 +343,9 @@ function addressedTo(m: Msg, t: ThreadInfo, address: string | undefined): "me" |
  */
 function expectation(t: InboxThread, address: string | undefined): string {
   const mail = t.unread.filter((m) => m.kind !== "system" && m.from !== t.you.name);
-  if (!mail.some((m) => m.audience) && !t.your_human && !t.paused) return "";
+  if (!mail.some((m) => m.audience) && !t.your_human && !t.paused && !t.archived) return "";
   const parts: string[] = [];
+  if (t.archived) return "The room is archived: it is read-only, so nothing can be posted and no reply is possible.";
   const ownHuman = mail.filter((m) => m.kind === "human" && m.side === t.you.side);
   const others = mail.filter((m) => !ownHuman.includes(m));
   const toMe = others.filter((m) => addressedTo(m, t, address) === "me");
@@ -394,7 +397,7 @@ function renderPeople(people: Person[]): string {
 
 function renderThreadMail(cfg: Config, cwd: string, t: InboxThread & { server?: string }): string {
   const lines = [
-    `== ${t.title}  [room ${t.id}]  you are ${t.you.name} (${t.you.side})${t.paused ? "  ** PAUSED: agents cannot post **" : ""}`,
+    `== ${t.title}  [room ${t.id}]  you are ${t.you.name} (${t.you.side})${t.archived ? "  ** ARCHIVED: read-only **" : t.paused ? "  ** PAUSED: agents cannot post **" : ""}`,
     ...t.unread.map(renderMessage),
   ];
   if (t.more) lines.push("  (more unread messages follow; run `parley read` again)");
@@ -403,7 +406,9 @@ function renderThreadMail(cfg: Config, cwd: string, t: InboxThread & { server?: 
   if (expected) lines.push(`  Expected: ${expected}`);
   lines.push(`  Here: ${renderPeople(t.participants)}`);
   lines.push(
-    t.paused
+    t.archived
+      ? "  Reply: not possible; the room is archived and read-only."
+      : t.paused
       ? "  Reply: not possible while the room is paused; a human must resume it first."
       : `  Reply: ${sayCommand(cfg, cwd, t.id)}   (or -f <file> for long messages)${t.review ? "   Your side's human reviews it before it is posted." : ""}`,
   );
@@ -736,6 +741,21 @@ async function cmdSay(args: ReturnType<typeof parseArgs>) {
   console.log(res.note);
 }
 
+/** `parley transcript [room] [--json]`: the whole room as Markdown, or as JSON, on stdout. */
+async function cmdTranscript(args: ReturnType<typeof parseArgs>) {
+  const cfg = loadConfig();
+  const t = resolveRoom(cfg, args.positional[0]);
+  const res = await fetch(`${t.server}/api/threads/${t.id}/transcript${args.flags.json ? "?format=json" : ""}`, {
+    headers: { authorization: `Bearer ${t.token}`, "user-agent": `parley-client/${VERSION}` },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as any;
+    throw new ApiError(res.status, data?.error?.code ?? "http_error", data?.error?.message ?? `HTTP ${res.status}`, data?.error?.hint);
+  }
+  process.stdout.write(await res.text());
+}
+
 async function cmdHistory(args: ReturnType<typeof parseArgs>) {
   const cfg = loadConfig();
   const t = resolveRoom(cfg, args.positional[0]);
@@ -743,7 +763,7 @@ async function cmdHistory(args: ReturnType<typeof parseArgs>) {
   const res = await api(t.server, t.token, "GET", `/api/threads/${t.id}/messages?after=${after}`);
   if (args.flags.json) return console.log(JSON.stringify(res, null, 2));
   const info = res.thread as ThreadInfo;
-  console.log(`== ${info.title}  [room ${info.id}]  you are ${info.you.name} (${info.you.side})${info.paused ? "  ** PAUSED **" : ""}`);
+  console.log(`== ${info.title}  [room ${info.id}]  you are ${info.you.name} (${info.you.side})${info.archived ? "  ** ARCHIVED **" : info.paused ? "  ** PAUSED **" : ""}`);
   console.log(TRUST_NOTE);
   const mine = commandSession() ? loadSession(commandSession()!).read?.[t.id] : undefined;
   const readTo = mine ?? res.read_seq;
@@ -777,7 +797,7 @@ async function cmdRooms(args: ReturnType<typeof parseArgs>) {
   if (args.flags.json) return console.log(JSON.stringify({ threads: rows }, null, 2));
   if (rows.length === 0) return console.log("Not in any rooms.");
   for (const t of rows) {
-    console.log(`${t.id}  "${t.title}"  ${t.unread_count} new${t.paused ? "  PAUSED" : ""}`);
+    console.log(`${t.id}  "${t.title}"  ${t.unread_count} new${t.archived ? "  ARCHIVED" : t.paused ? "  PAUSED" : ""}`);
     console.log(`    you: ${t.you.name} (${t.you.side}) on ${t.server}`);
     console.log(`    connected to: ${t.dir ?? "every directory"}`);
     console.log(`    here: ${renderPeople(t.participants)}`);
@@ -793,7 +813,7 @@ async function cmdWho(args: ReturnType<typeof parseArgs>) {
   const rows = (await fetchRooms(cfg)).filter((t) => (only ? only.includes(t.id) : args.flags.all === true || (targets.get(t.server) ?? []).includes(t.id)));
   if (rows.length === 0) return console.log(NO_ROOMS_HERE);
   for (const t of rows) {
-    console.log(`"${t.title}" [room ${t.id}]${t.paused ? "  PAUSED" : ""}`);
+    console.log(`"${t.title}" [room ${t.id}]${t.archived ? "  ARCHIVED" : t.paused ? "  PAUSED" : ""}`);
     for (const person of t.participants) {
       const state = person.state === "listening" ? "here now" : person.state === "not_joined" ? "has not joined" : `last active ${person.last_seen_seconds_ago}s ago`;
       console.log(`  ${person.name} (${person.side}, ${person.kind})${person.name === t.you.name ? " <- you" : ""}: ${state}`);
@@ -925,8 +945,8 @@ function markRead(session: string | null, threads: { id: string; ack_seq: number
   writePrivate(sessionPath(session), state);
 }
 
-function readHint(cfg: Config, cwd: string, threads: { id: string; paused?: boolean }[]): string {
-  const open = threads.filter((t) => !t.paused).map((t) => t.id);
+function readHint(cfg: Config, cwd: string, threads: { id: string; paused?: boolean; archived?: boolean }[]): string {
+  const open = threads.filter((t) => !t.paused && !t.archived).map((t) => t.id);
   const reply = open.length
     ? `, and reply with \`${replyCommand(cfg, cwd, open)}\` if a reply is needed`
     : "; you cannot reply until a human resumes the room";
@@ -1347,6 +1367,7 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
                                    --to <agent-or-side>[,...] wakes those now; --fyi wakes nobody
   parley who                       Who is in the room and whether they are around
   parley history [room]            Print a room's full history
+  parley transcript [room] [--json]  The whole room as Markdown (or JSON), to keep
   parley rooms                     List every room you are in
   parley watch [--once] [--all]    Block and print messages as they arrive (for other harnesses)
                [--exec '<cmd>']    ...or run <cmd> per batch with the messages on stdin
@@ -1375,6 +1396,7 @@ async function main() {
     say: () => cmdSay(args),
     who: () => cmdWho(args),
     history: () => cmdHistory(args),
+    transcript: () => cmdTranscript(args),
     rooms: () => cmdRooms(args),
     watch: () => cmdWatch(args),
     // Names from 0.2, kept so existing settings and habits keep working.

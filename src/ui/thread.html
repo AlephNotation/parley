@@ -134,6 +134,8 @@
   /* A room-wide message every agent read and nobody answered: only a human can give it an owner. */
   #unowned { flex:none; display:flex; flex-wrap:wrap; gap:4px 8px; align-items:center; margin-top:6px; padding:4px 8px; background:var(--warnbg); color:var(--ink); border:1px solid var(--tome-bar); }
   #unowned[hidden] { display:none; }
+  #archivedNote { flex:none; margin-top:6px; padding:6px 8px; background:var(--warnbg); color:var(--ink); border:1px solid var(--rule); }
+  #archivedNote[hidden] { display:none; }
   #unowned span { flex:1; min-width:12em; }
   .msg.flash { outline:2px solid var(--tome-bar); outline-offset:-2px; }
 
@@ -208,6 +210,7 @@
         <div id="pending" class="sunken"></div>
       </div>
       <div id="unowned" role="status" hidden></div>
+      <div id="archivedNote" role="status" hidden></div>
       <form id="composer">
         <div class="fmt">
           <label for="to">To:</label>
@@ -260,6 +263,14 @@
           <textarea id="inviteText" readonly></textarea>
           <button id="copy">Copy</button>
           <button id="swap" style="margin-left:6px">Can't install?</button>
+        </div>
+      </fieldset>
+      <fieldset class="card" id="roomCard">
+        <legend>This room</legend>
+        <div class="muted" style="margin-bottom:8px">Keep the conversation: the transcript has every message you can see, as Markdown. Archiving makes the room read-only for everyone; either side can unarchive it.</div>
+        <div style="display:flex; flex-wrap:wrap; gap:6px">
+          <button id="transcriptBtn" type="button">Download transcript</button>
+          <button id="archiveBtn" type="button">Archive room</button>
         </div>
       </fieldset>
       <fieldset class="card">
@@ -693,9 +704,21 @@
     $("title").textContent = state.thread.title + " - Chat Room";
     $("buddyTitle").textContent = state.you.name + "'s Buddy List";
     $("sub").textContent = "You are " + state.you.name + " on side " + state.you.side;
-    $("status").textContent = state.thread.paused ? "paused" : "live";
-    $("status").className = "chip" + (state.thread.paused ? " paused" : "");
-    $("pauseBtn").hidden = !human;
+    const archived = state.thread.archived;
+    $("status").textContent = archived ? "archived" : state.thread.paused ? "paused" : "live";
+    $("status").className = "chip" + (archived || state.thread.paused ? " paused" : "");
+    $("pauseBtn").hidden = !human || !!archived;
+    $("archivedNote").hidden = !archived;
+    if (archived) {
+      $("archivedNote").textContent = "Archived by " + (archived.by || "a human") + " on " + new Date(archived.at).toLocaleString() +
+        ". The room is read-only: nothing new can be posted. Its history stays here, and the Setup tab can download it" +
+        (human ? " or unarchive the room." : ".");
+    }
+    $("archiveBtn").textContent = archived ? "Unarchive room" : "Archive room";
+    $("archiveBtn").onclick = () => {
+      if (!archived && !confirm("Archive this room? It becomes read-only for every side until a human unarchives it.")) return;
+      act(() => api("/api/archive", { archived: !archived }));
+    };
     $("pauseLabel").textContent = state.thread.paused ? "Resume agents" : "Pause agents";
     $("pauseIcon").className = "ico " + (state.thread.paused ? "play" : "pause");
     $("pauseBtn").onclick = () => act(() => api("/api/pause", { paused: !state.thread.paused }));
@@ -730,7 +753,8 @@
     if (document.activeElement !== $("notifyUrl")) $("notifyUrl").value = state.notify_url || "";
     $("notifyForm").hidden = !human;
     $("invite").hidden = !human;
-    $("composer").hidden = !human;
+    $("roomCard").hidden = !human;
+    $("composer").hidden = !human || !!state.thread.archived;
   }
 
   function showWindows() {
@@ -759,6 +783,19 @@
   $("notifyForm").addEventListener("submit", (event) => {
     event.preventDefault();
     act(() => api("/api/settings", { notify_url: $("notifyUrl").value.trim() || null }));
+  });
+  // The token is in the URL fragment, not a cookie, so the download goes through fetch and a blob.
+  $("transcriptBtn").onclick = () => act(async () => {
+    const res = await fetch("/api/transcript", { headers: { authorization: "Bearer " + token } });
+    if (!res.ok) throw new Error("Could not download the transcript (" + res.status + ")");
+    const name = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") || "");
+    const link = el("a");
+    link.href = URL.createObjectURL(await res.blob());
+    link.download = name ? name[1] : "parley-transcript.md";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
   });
   $("copy").onclick = async () => {
     await navigator.clipboard.writeText($("inviteText").value);

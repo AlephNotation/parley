@@ -446,6 +446,70 @@ describe("unowned room-wide messages", () => {
   });
 });
 
+describe("archiving and transcripts", () => {
+  test("an archived room is read-only for everyone until a human unarchives it", async () => {
+    const t = await s.setup(true);
+    // Something is waiting for review when the room is archived.
+    const held = await s.send(t.vers.token, t.id, "held for review");
+    const heldId = held.data.message.id;
+    expect((await s.call(t.acmeHuman, "POST", "/api/archive", { archived: true })).data).toEqual({ archived: true });
+
+    const state = (await s.call(t.versHuman, "GET", "/api/state")).data;
+    expect(state.thread.archived.by).toBe("Acme (human)");
+    expect(Date.parse(state.thread.archived.at)).toBeGreaterThan(0);
+    expect(state.messages.at(-1).body).toBe("Acme (human) archived the room. It is read-only now; either side's human can unarchive it.");
+
+    const agentPost = await s.send(t.acme.token, t.id, "anyone?");
+    expect(agentPost.status).toBe(423);
+    expect(agentPost.data.error.code).toBe("archived");
+    expect(agentPost.data.error.message).toBe("This room was archived by Acme (human) and is read-only.");
+    expect(agentPost.data.error.hint).toContain("unarchive");
+    expect((await s.call(t.versHuman, "POST", "/api/messages", { body: "me too" })).status).toBe(423);
+    expect((await s.call(t.versHuman, "POST", `/api/messages/${heldId}/approve`, {})).status).toBe(423);
+    expect((await s.call(null, "POST", "/api/join", { code: (await s.invite(t.acmeHuman)).code })).status).toBe(423);
+    // Reading still works, and agents see that it is archived.
+    expect((await s.call(t.acme.token, "GET", `/api/threads/${t.id}/messages`)).status).toBe(200);
+    expect((await s.call(t.acme.token, "GET", "/api/threads")).data.threads[0].archived).toBe(true);
+
+    expect((await s.call(t.versHuman, "POST", "/api/archive", { archived: false })).data).toEqual({ archived: false });
+    expect((await s.call(t.versHuman, "GET", "/api/state")).data.thread.archived).toBeNull();
+    expect((await s.send(t.acme.token, t.id, "back again")).status).toBe(201);
+    expect((await s.call(t.acme.token, "POST", "/api/archive", { archived: true })).status).toBe(403);
+  });
+
+  test("the transcript has every message the reader can see, as Markdown or JSON, for humans and agents", async () => {
+    const t = await s.setup(true);
+    // A rejection notice is for the rejecting side only.
+    const draft = await s.send(t.vers.token, t.id, "not this one");
+    await s.call(t.versHuman, "POST", `/api/messages/${draft.data.message.id}/reject`, { note: "too early" });
+    await s.call(t.versHuman, "POST", "/api/settings", { approval: false });
+    await s.call(t.acmeHuman, "POST", "/api/settings", { approval: false });
+    await s.call(t.vers.token, "POST", `/api/threads/${t.id}/messages`, { body: "For Acme:\n- one\n- two", to: ["Acme"] });
+    await s.call(t.acme.token, "POST", `/api/threads/${t.id}/messages`, { body: "noted", fyi: true });
+    await s.call(t.versHuman, "POST", "/api/archive", { archived: true });
+
+    const md = await fetch(`${s.base}/api/transcript`, { headers: { authorization: `Bearer ${t.versHuman}` } });
+    expect(md.headers.get("content-type")).toContain("text/markdown");
+    expect(md.headers.get("content-disposition")).toMatch(/^attachment; filename="parley-integration-debugging-\d{4}-\d{2}-\d{2}\.md"$/);
+    const text = await md.text();
+    expect(text).toStartWith("# Integration debugging\n");
+    expect(text).toContain(`Parley room \`${t.id}\` between Vers, Acme. Exported `);
+    expect(text).toContain(" by Vers (human). Archived ");
+    expect(text).toMatch(/### #\d+ · Vers Claude \(Vers, agent\) · \S+ \S+ · to Acme\n\nFor Acme:\n- one\n- two\n/);
+    expect(text).toMatch(/### #\d+ · Acme Claude \(Acme, agent\) · \S+ \S+ · fyi\n\nnoted\n/);
+    expect(text).toMatch(/\*#\d+ · \S+ \S+ · Vers \(human\) rejected message #\d+/);
+    expect(text).not.toContain("not this one");
+
+    // The other side's agent gets its own view, without Vers's rejection notice.
+    const asAcme = await (await fetch(`${s.base}/api/threads/${t.id}/transcript?format=json`, { headers: { authorization: `Bearer ${t.acme.token}` } })).json();
+    expect(asAcme.thread).toMatchObject({ id: t.id, title: "Integration debugging", sides: ["Vers", "Acme"], archived: { by: "Vers (human)" } });
+    expect(asAcme.exported_by).toBe("Acme Claude");
+    const bodies = asAcme.messages.map((m: any) => m.body);
+    expect(bodies).toContain("noted");
+    expect(bodies.some((b: string) => b.includes("rejected message"))).toBe(false);
+  });
+});
+
 describe("human controls", () => {
   test("held messages reach no inbox until approved", async () => {
     const t = await s.setup(true);
@@ -746,7 +810,9 @@ describe("upgrading an older database", () => {
       await upgraded.stop();
     }
     const after = new Database(path);
-    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(3);
+    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(4);
+    // Version 4 adds archiving; an old room starts open.
+    expect(after.query("SELECT archived_at, archived_by FROM threads WHERE id = 'aa'").get()).toEqual({ archived_at: null, archived_by: null });
     after.close();
   });
 

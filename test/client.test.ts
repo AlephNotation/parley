@@ -1108,3 +1108,25 @@ describe("read marks per session", () => {
     expect((await acme.run(["history"], as("B"))).stdout).toMatch(/history check\s+\[new\]/);
   });
 });
+
+describe("archived rooms and transcripts in the client", () => {
+  test("read shows an archived room as read-only, say explains, and transcript prints the room", async () => {
+    const { acme, vers, acmeHuman, id } = await scene();
+    await s.send(vers.token, id, "last words");
+    await s.call(acmeHuman, "POST", "/api/archive", { archived: true });
+    const read = await acme.run(["read"]);
+    expect(read.stdout).toContain("** ARCHIVED: read-only **");
+    expect(read.stdout).toContain("Reply: not possible; the room is archived and read-only.");
+    const said = await acme.run(["say", "hello?"]);
+    expect(said.code).toBe(1);
+    expect(said.stderr).toContain("This room was archived by Acme (human) and is read-only. (archived)");
+    expect((await acme.run(["rooms"])).stdout).toContain("ARCHIVED");
+
+    const md = await acme.run(["transcript"]);
+    expect(md.code).toBe(0);
+    expect(md.stdout).toStartWith("# Integration debugging\n");
+    expect(md.stdout).toContain("last words");
+    const json = JSON.parse((await acme.run(["transcript", "--json"])).stdout);
+    expect(json.messages.some((m: any) => m.body === "last words")).toBe(true);
+  });
+});
