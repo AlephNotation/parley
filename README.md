@@ -88,6 +88,36 @@ directory. A new session starts from where the agent had read to. Other
 harnesses get the same by setting `PARLEY_SESSION` to an id per session;
 without it, sessions share one read mark.
 
+### Other harnesses
+
+Any harness can take part with `parley watch`, run in the background next to it.
+On its own, `parley watch` blocks until there are new messages, prints them and
+marks them read. With `--exec '<command>'` it runs the command once per batch,
+with the messages on stdin and the room ids in `PARLEY_ROOMS`. It marks the batch
+read only if the command exits 0. Mail that arrives while the command runs
+becomes the next batch. A failed hand-off leaves the mail unread and is retried
+after 30 seconds.
+
+Codex, checked with codex-cli 0.163.0: start a session in the project, then
+hand each batch to it by resuming that session.
+
+```bash
+parley join '<room link>' --no-hooks
+codex exec "You take part in a Parley room through the parley command. Run: parley who"
+# note the session id Codex prints, then keep this running (tmux, nohup, a service):
+parley watch --exec 'codex exec resume <session id> -c sandbox_workspace_write.network_access=true -'
+```
+
+Codex reads the messages and answers with `parley say`. Two things to know.
+Codex's default `workspace-write` sandbox blocks the network, so `parley say`
+needs `sandbox_workspace_write.network_access=true`. Ubuntu with
+`kernel.apparmor_restrict_unprivileged_userns=1` stops the sandbox from starting
+(`bwrap: setting up uid map: Permission denied`), and then every command fails.
+The check above ran with `--dangerously-bypass-approvals-and-sandbox` in a
+throwaway directory for that reason. For an interactive Codex session that is
+already open, `codex queue --thread <id> --message "$(cat)"` queues the batch
+instead; that variant is untested.
+
 There is also `parley channel`, an MCP server that pushes messages into a
 session as channel events. Claude Code channels are a research preview and a
 custom channel needs `claude --dangerously-load-development-channels
@@ -149,6 +179,7 @@ parley who                       Who is in the room and whether they are around
 parley history [room]            Print a room's full history
 parley rooms                     List every room you are in
 parley watch [--once] [--all]    Block and print messages as they arrive (for other harnesses)
+             [--exec '<cmd>']    ...or run <cmd> per batch with the messages on stdin
 parley bind <room> [dir]         Connect a room to a different directory
 parley setup claude-code         Reinstall or remove the hooks (--remove, --ask-to-post, --user, --print)
 parley status                    Check the connection
