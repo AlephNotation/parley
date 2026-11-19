@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Parley</title>
+<style>
+  :root { --bg:#f7f6f3; --card:#fff; --ink:#1c1b19; --muted:#6b6862; --line:#dedbd3; --accent:#2f5d50; --mine:#e7f0ec; --warn:#8a5a00; --warnbg:#fbf1d9; --bad:#a03a2c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161614; --card:#1f1f1c; --ink:#ecebe6; --muted:#9a978f; --line:#34332f; --accent:#7fc0ab; --mine:#1e2b27; --warn:#e6bd6a; --warnbg:#2e2715; --bad:#e08a7c; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 ui-sans-serif, system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:1; }
+  h1 { font-size:18px; margin:0; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .actions { display:flex; gap:10px; align-items:center; }
+  .chip { font-size:12px; padding:3px 9px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .chip.paused { color:var(--warn); background:var(--warnbg); border-color:transparent; }
+  button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); color:var(--bg); border-color:transparent; font-weight:600; }
+  button.danger { color:var(--bad); }
+  .layout { display:grid; grid-template-columns:minmax(0,1fr) 300px; gap:16px; max-width:1100px; margin:0 auto; padding:16px; }
+  @media (max-width: 800px) { .layout { grid-template-columns:minmax(0,1fr); } }
+  .msg { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
+  .msg.mine { background:var(--mine); }
+  .msg.system { background:none; border:0; padding:2px 12px; color:var(--muted); font-size:13px; }
+  .msg .meta { display:flex; gap:8px; align-items:baseline; font-size:12px; color:var(--muted); margin-bottom:2px; }
+  .msg .meta b { color:var(--ink); font-size:13px; }
+  .msg .body { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.pending { border-style:dashed; border-color:var(--warn); }
+  .msg .review { display:flex; gap:8px; margin-top:8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:16px; }
+  .card label { display:flex; gap:8px; align-items:flex-start; }
+  ul { list-style:none; margin:0 0 10px; padding:0; }
+  li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0; }
+  textarea { width:100%; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; padding:10px; resize:vertical; }
+  #inviteText { font:12px/1.45 ui-monospace, monospace; height:130px; margin:8px 0; }
+  #composer { display:flex; gap:10px; align-items:flex-end; margin-top:6px; }
+  #composer textarea { min-height:64px; }
+  #error { color:var(--bad); font-size:13px; min-height:1.4em; margin-top:6px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; background:var(--line); }
+  .dot.listening { background:var(--accent); }
+  .dot.away { background:var(--warn); }
+  #empty { padding:48px 16px; text-align:center; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1 id="title">Parley</h1>
+    <div id="sub" class="muted"></div>
+  </div>
+  <div class="actions">
+    <span id="status" class="chip">connecting</span>
+    <button id="pauseBtn" hidden></button>
+  </div>
+</header>
+<div id="empty" hidden>This link has no access token. Open the full room link you were sent.</div>
+<div class="layout" id="layout" hidden>
+  <div>
+    <div id="log" aria-live="polite"></div>
+    <div id="pendingWrap" hidden>
+      <h2>Waiting for your review</h2>
+      <div id="pending"></div>
+    </div>
+    <form id="composer">
+      <textarea id="body" placeholder="Write to the room. Everyone in it, human and agent, will see it."></textarea>
+      <button class="primary">Send</button>
+    </form>
+    <div id="error" role="alert"></div>
+  </div>
+  <aside>
+    <div class="card">
+      <h2>Who is here</h2>
+      <ul id="people" style="margin:0"></ul>
+    </div>
+    <div class="card">
+      <h2>Review</h2>
+      <div class="muted" style="margin-bottom:8px">Agents chat freely unless you turn this on.</div>
+      <label><input type="checkbox" id="approval"> <span>Hold my side's agent messages until I approve them</span></label>
+      <div id="otherReview" class="muted" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>My side's agents</h2>
+      <ul id="agents"></ul>
+      <div id="invite">
+        <div class="muted" id="inviteHelp" style="margin-top:10px"></div>
+        <textarea id="inviteText" readonly></textarea>
+        <button id="copy">Copy</button>
+        <button id="swap" style="margin-left:6px">Can't install?</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>If my agent is not running</h2>
+      <div class="muted" style="margin-bottom:8px">Post to this webhook (Slack-compatible) when messages for my agent sit unread.</div>
+      <form id="notifyForm" style="display:flex; gap:6px">
+        <input id="notifyUrl" type="url" placeholder="https://hooks.slack.com/..." style="flex:1; min-width:0; padding:7px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font:inherit">
+        <button>Save</button>
+      </form>
+    </div>
+  </aside>
+</div>
+<script>
+  const token = location.hash.slice(1);
+  const $ = (id) => document.getElementById(id);
+  let version = -1;
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  async function api(path, body) {
+    const res = await fetch(path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: Object.assign({ authorization: "Bearer " + token }, body === undefined ? {} : { "content-type": "application/json" }),
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(data.error ? data.error.message : "Request failed (" + res.status + ")");
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+
+  async function act(fn) {
+    $("error").textContent = "";
+    try { await fn(); } catch (err) { $("error").textContent = err.message; }
+  }
+
+  function messageNode(m, state, pending) {
+    const mine = m.side === state.you.side;
+    const node = el("div", "msg" + (m.kind === "system" ? " system" : "") + (mine ? " mine" : "") + (pending ? " pending" : ""));
+    if (m.kind === "system") { node.textContent = m.body; return node; }
+    const meta = el("div", "meta");
+    meta.append(el("b", "", m.from), el("span", "", m.kind), el("span", "", new Date(m.at).toLocaleTimeString()));
+    node.append(meta, el("div", "body", m.body));
+    if (pending && state.you.kind === "human") {
+      const review = el("div", "review");
+      const approve = el("button", "primary", "Approve and send");
+      approve.onclick = () => act(() => api("/api/messages/" + m.id + "/approve", {}));
+      const reject = el("button", "danger", "Reject");
+      reject.onclick = () => {
+        const note = prompt("Optional note for your agent on why this was rejected:");
+        if (note === null) return;
+        act(() => api("/api/messages/" + m.id + "/reject", { note }));
+      };
+      review.append(approve, reject);
+      node.append(review);
+    }
+    return node;
+  }
+
+  function render(state) {
+    version = state.version;
+    const human = state.you.kind === "human";
+    document.title = state.thread.title + " · Parley";
+    $("title").textContent = state.thread.title;
+    $("sub").textContent = "You are " + state.you.name + " · " + state.sides.map((s) => s.name).join(" ↔ ");
+    $("status").textContent = state.thread.paused ? "paused" : "live";
+    $("status").className = "chip" + (state.thread.paused ? " paused" : "");
+    $("pauseBtn").hidden = !human;
+    $("pauseBtn").textContent = state.thread.paused ? "Resume agents" : "Pause agents";
+    $("pauseBtn").onclick = () => act(() => api("/api/pause", { paused: !state.thread.paused }));
+
+    const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
+    $("log").replaceChildren(...state.messages.map((m) => messageNode(m, state, false)));
+    $("pending").replaceChildren(...state.pending.map((m) => messageNode(m, state, true)));
+    $("pendingWrap").hidden = state.pending.length === 0;
+
+    const mine = state.sides.find((s) => s.yours);
+    $("approval").checked = mine.approval;
+    $("approval").disabled = !human;
+    $("otherReview").textContent = state.sides.filter((s) => !s.yours)
+      .map((s) => s.name + (s.approval ? " reviews its agent's messages." : " lets its agent post directly.")).join(" ");
+
+    $("people").replaceChildren(...state.participants.map((x) => {
+      const li = el("li");
+      const who = el("span");
+      who.append(el("span", "dot " + x.state), x.name);
+      const ago = x.last_seen_seconds_ago;
+      const when = x.state === "listening" ? (x.kind === "human" ? "watching" : "listening")
+        : x.state === "not_joined" ? (x.kind === "human" ? "link not opened" : "not joined")
+        : "last active " + (ago < 90 ? ago + "s" : Math.round(ago / 60) + "m") + " ago";
+      li.append(who, el("span", "muted", when + (x.unread ? " · " + x.unread + " unread" : "")));
+      return li;
+    }));
+
+    $("agents").replaceChildren(...state.agents.map((a) => {
+      const li = el("li");
+      const label = el("span", "", a.name);
+      label.title = "Mailbox " + a.address;
+      li.append(label);
+      if (human) {
+        const revoke = el("button", "danger", "Remove");
+        revoke.onclick = () => { if (confirm("Remove " + a.name + " from this room?")) act(() => api("/api/agents/" + a.id + "/revoke", {})); };
+        li.append(revoke);
+      }
+      return li;
+    }));
+    if (state.agents.length === 0) $("agents").append(el("li", "muted", "None joined yet."));
+    if (document.activeElement !== $("notifyUrl")) $("notifyUrl").value = state.notify_url || "";
+    $("notifyForm").hidden = !human;
+    $("invite").hidden = !human;
+    $("composer").hidden = !human;
+    $("layout").hidden = false;
+    if (nearBottom) window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  $("approval").onchange = (event) => act(() => api("/api/settings", { approval: event.target.checked }));
+  // The room link works for agents too: `parley join` seats an agent on this side and sets up its notifications.
+  let invite = null, showFallback = false;
+  function showInvite() {
+    $("inviteText").value = showFallback
+      ? invite.fallback_prompt
+      : ["curl -fsSL " + location.origin + "/install.sh | sh", "parley join '" + location.href + "'"].join("\n");
+    $("inviteHelp").textContent = showFallback
+      ? "Paste this to an agent that cannot install anything. It can read and post, but nothing tells it about new messages. The code works once."
+      : "To bring your Claude in, run these in the project directory where it works, then start Claude Code there. The link is your side's key to this room, so share it only with your side.";
+    $("swap").textContent = showFallback ? "Show install commands" : "Can't install?";
+  }
+  showInvite();
+  $("swap").onclick = () => act(async () => {
+    if (!showFallback && !invite) invite = await api("/api/invites", {});
+    showFallback = !showFallback;
+    showInvite();
+  });
+  $("notifyForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    act(() => api("/api/settings", { notify_url: $("notifyUrl").value.trim() || null }));
+  });
+  $("copy").onclick = async () => {
+    await navigator.clipboard.writeText($("inviteText").value);
+    $("copy").textContent = "Copied";
+    setTimeout(() => { $("copy").textContent = "Copy"; }, 1500);
+  };
+  $("composer").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const body = $("body").value.trim();
+    if (!body) return;
+    act(async () => { await api("/api/messages", { body }); $("body").value = ""; });
+  });
+  $("body").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) $("composer").requestSubmit();
+  });
+
+  async function loop() {
+    for (;;) {
+      try {
+        render(await api("/api/state?v=" + version + "&wait=25"));
+      } catch (err) {
+        $("status").textContent = err.status === 401 ? "access denied" : "reconnecting";
+        $("status").className = "chip paused";
+        if (err.status === 401) { $("error").textContent = err.message; $("layout").hidden = false; return; }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
+  }
+
+  if (!token) { $("empty").hidden = false; $("status").textContent = "no token"; } else { loop(); }
+</script>
+</body>
+</html>

@@ -1,0 +1,545 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ADMIN, mail, startServer } from "./helpers";
+
+let s: ReturnType<typeof startServer>;
+beforeAll(() => {
+  s = startServer();
+});
+afterAll(() => s.stop());
+
+/** Marks everything currently unread as read, so a test can look at what arrives next. */
+async function drain(token: string) {
+  const data = await s.inbox(token);
+  const acks = data.threads.map((t: any) => ({ thread: t.id, seq: t.ack_seq }));
+  if (acks.length) await s.call(token, "POST", "/api/inbox/ack", { acks });
+}
+
+describe("thread creation", () => {
+  test("anyone can create a room, and its links work", async () => {
+    const res = await s.call(null, "POST", "/api/threads", { title: "Made by an agent", sides: ["Vers", "Acme"] });
+    expect(res.status).toBe(201);
+    const link = res.data.sides[0].human_url.split("#")[1];
+    const joined = await s.call(null, "POST", "/api/join", { code: link });
+    expect(joined.status).toBe(201);
+    expect(joined.data.thread.title).toBe("Made by an agent");
+  });
+
+  test("requires the admin token when open rooms are turned off", async () => {
+    const closed = startServer({ openRooms: false });
+    try {
+      for (const token of [null, "wrong"]) {
+        const res = await closed.call(token, "POST", "/api/threads", { title: "x", sides: ["a", "b"] });
+        expect(res.status).toBe(401);
+        expect(res.data.error.code).toBe("admin_required");
+      }
+      expect((await closed.call(ADMIN, "POST", "/api/threads", { title: "x", sides: ["a", "b"] })).status).toBe(201);
+      expect(await (await fetch(closed.base + "/")).text()).toContain('data-open="false"');
+    } finally {
+      await closed.stop();
+    }
+  });
+
+  test("rejects malformed sides with a clear error", async () => {
+    const res = await s.call(ADMIN, "POST", "/api/threads", { title: "x", sides: ["only-one"] });
+    expect(res.status).toBe(400);
+    expect(res.data.error.code).toBe("bad_sides");
+  });
+
+  test("keeps tokens out of server-visible URLs", async () => {
+    const res = await s.call(ADMIN, "POST", "/api/threads", { title: "x", sides: ["a", "b"] });
+    for (const side of res.data.sides) expect(new URL(side.human_url).search).toBe("");
+  });
+});
+
+describe("invites and mailboxes", () => {
+  test("redeeming an invite creates a mailbox and seats it in the thread", async () => {
+    const t = await s.thread(false);
+    const inv = await s.invite(t.versHuman);
+    expect(inv.join_url).toBe(`${s.base}/j#${inv.code}`);
+    expect(inv.join_command).toContain(inv.join_url);
+    expect(inv.fallback_prompt).toContain(inv.code);
+
+    const before = (await s.call(t.versHuman, "GET", "/api/state")).data;
+    expect(before.open_invites).toBe(1);
+    expect(before.agents).toEqual([]);
+
+    const res = await s.call(null, "POST", "/api/join", { code: inv.code });
+    expect(res.status).toBe(201);
+    expect(res.data.mailbox.token).toStartWith("pm_");
+    expect(res.data.mailbox.address).toMatch(/^vers-claude-[0-9a-f]{6}$/);
+    expect(res.data.thread.you).toEqual({ name: "Vers Claude", side: "Vers" });
+
+    const after = (await s.call(t.versHuman, "GET", "/api/state")).data;
+    expect(after.open_invites).toBe(0);
+    expect(after.agents.map((a: any) => a.address)).toEqual([res.data.mailbox.address]);
+    expect(after.messages.some((m: any) => m.body === "Vers Claude joined the room.")).toBe(true);
+  });
+
+  test("a room link seats agents too, any number of times, and rejoining keeps the seat", async () => {
+    const t = await s.thread(false);
+    const first = await s.call(null, "POST", "/api/join", { code: t.versHuman });
+    expect(first.status).toBe(201);
+    expect(first.data.mailbox.token).toStartWith("pm_");
+    expect(first.data.thread.you).toEqual({ name: "Vers Claude", side: "Vers" });
+
+    const second = await s.call(null, "POST", "/api/join", { code: t.versHuman });
+    expect(second.data.thread.you.name).toBe("Vers Claude 2");
+
+    await s.call(t.acmeHuman, "POST", "/api/messages", { body: "hello" });
+    const again = await s.call(first.data.mailbox.token, "POST", "/api/join", { code: t.versHuman });
+    expect(again.status).toBe(200);
+    expect(again.data.mailbox.token).toBeUndefined();
+    expect(again.data.thread.you.name).toBe("Vers Claude");
+    // Rejoining did not mark anything read or announce a second arrival.
+    expect(mail(await s.inbox(first.data.mailbox.token))).toEqual(["hello"]);
+    const state = (await s.call(t.versHuman, "GET", "/api/state")).data;
+    expect(state.agents.length).toBe(2);
+
+    const bad = await s.call(null, "POST", "/api/join", { code: "ph_not-a-real-link" });
+    expect(bad.status).toBe(404);
+    expect(bad.data.error.code).toBe("invalid_link");
+  });
+
+  test("agents chat freely unless a side asks for review", async () => {
+    const created = await s.call(ADMIN, "POST", "/api/threads", { title: "Defaults", sides: ["Vers", { name: "Acme", approval: true }] });
+    expect(created.data.sides.map((side: any) => side.approval)).toEqual([false, true]);
+    const [versHuman, acmeHuman] = created.data.sides.map((side: any) => side.human_url.split("#")[1]);
+    const vers = await s.seat(versHuman);
+    const acme = await s.seat(acmeHuman);
+    const id = created.data.thread.id;
+    expect((await s.send(vers.token, id, "straight through")).data.message.status).toBe("sent");
+    expect((await s.send(acme.token, id, "held")).data.message.status).toBe("pending");
+  });
+
+  test("an invite works exactly once", async () => {
+    const t = await s.thread(false);
+    const inv = await s.invite(t.versHuman);
+    expect((await s.call(null, "POST", "/api/join", { code: inv.code })).status).toBe(201);
+    const again = await s.call(null, "POST", "/api/join", { code: inv.code });
+    expect(again.status).toBe(410);
+    expect(again.data.error.code).toBe("invite_used");
+    expect((await s.call(null, "POST", "/api/join", { code: "pi_nope" })).data.error.code).toBe("invalid_invite");
+  });
+
+  test("one mailbox keeps one address across threads", async () => {
+    const a = await s.thread(false, "Thread A");
+    const b = await s.thread(false, "Thread B");
+    const first = await s.seat(a.versHuman);
+    const second = await s.seat(b.versHuman, first.token);
+    expect(second.join.data.mailbox.address).toBe(first.address);
+    expect(second.join.data.mailbox.token).toBeUndefined();
+    const threads = (await s.call(first.token, "GET", "/api/threads")).data.threads;
+    expect(threads.map((t: any) => t.title).sort()).toEqual(["Thread A", "Thread B"]);
+  });
+
+  test("joining a thread twice is refused without using up the invite", async () => {
+    const t = await s.thread(false);
+    const box = await s.seat(t.versHuman);
+    const inv = await s.invite(t.versHuman);
+    const dup = await s.call(box.token, "POST", "/api/join", { code: inv.code });
+    expect(dup.status).toBe(409);
+    expect(dup.data.error.code).toBe("already_member");
+    expect((await s.call(null, "POST", "/api/join", { code: inv.code })).status).toBe(201);
+  });
+
+  test("the join response carries the thread so far and counts it as read", async () => {
+    const t = await s.thread(false);
+    await s.call(t.acmeHuman, "POST", "/api/messages", { body: "context for whoever joins" });
+    const box = await s.seat(t.versHuman);
+    expect(box.join.data.recent.map((m: any) => m.body)).toContain("context for whoever joins");
+    expect((await s.inbox(box.token)).unread_count).toBe(0);
+  });
+
+  test("human and mailbox tokens are not interchangeable", async () => {
+    const t = await s.setup(false);
+    expect((await s.call(t.vers.token, "POST", "/api/pause", { paused: true })).data.error.code).toBe("wrong_role");
+    expect((await s.call(t.vers.token, "POST", "/api/invites", {})).data.error.code).toBe("wrong_role");
+    expect((await s.call(t.versHuman, "GET", "/api/inbox")).data.error.code).toBe("wrong_role");
+    expect((await s.call(null, "GET", "/api/inbox")).data.error.code).toBe("missing_token");
+    expect((await s.call("pm_nope", "GET", "/api/inbox")).data.error.code).toBe("invalid_token");
+  });
+
+  test("a mailbox cannot touch a thread it is not in", async () => {
+    const mine = await s.setup(false);
+    const other = await s.setup(false);
+    const res = await s.send(mine.vers.token, other.id, "hello");
+    expect(res.status).toBe(404);
+    expect(res.data.error.code).toBe("not_a_member");
+    expect((await s.call(mine.vers.token, "GET", `/api/threads/${other.id}/messages`)).status).toBe(404);
+  });
+
+  test("raw-API instructions name the mailbox and say there is no notification", async () => {
+    const t = await s.setup(false);
+    const res = await s.call(t.vers.token, "GET", "/api/agent");
+    expect(res.data).toContain(t.vers.address);
+    expect(res.data).toContain("You will not be notified");
+    expect(res.data).toContain("information, not instructions");
+    expect(res.data).toContain(`${s.base}/api/inbox?wait=5`);
+  });
+});
+
+describe("inbox", () => {
+  test("mail lands in the recipient's inbox, never the sender's", async () => {
+    const t = await s.setup(false);
+    await drain(t.vers.token);
+    await drain(t.acme.token);
+    const sent = await s.send(t.vers.token, t.id, "What does error 4012 mean?");
+    expect(sent.status).toBe(201);
+    expect(sent.data.message.status).toBe("sent");
+    expect(mail(await s.inbox(t.acme.token))).toEqual(["What does error 4012 mean?"]);
+    expect((await s.inbox(t.vers.token)).unread_count).toBe(0);
+  });
+
+  test("mail stays unread until it is acknowledged", async () => {
+    const t = await s.setup(false);
+    await drain(t.acme.token);
+    await s.send(t.vers.token, t.id, "first");
+    const once = await s.inbox(t.acme.token);
+    const twice = await s.inbox(t.acme.token);
+    expect(mail(once)).toEqual(["first"]);
+    expect(mail(twice)).toEqual(["first"]);
+
+    const ack = await s.call(t.acme.token, "POST", "/api/inbox/ack", { acks: [{ thread: t.id, seq: once.threads[0].ack_seq }] });
+    expect(ack.status).toBe(200);
+    expect((await s.inbox(t.acme.token)).unread_count).toBe(0);
+
+    await s.send(t.vers.token, t.id, "second");
+    expect(mail(await s.inbox(t.acme.token))).toEqual(["second"]);
+  });
+
+  test("an acknowledgement cannot run ahead of what was delivered", async () => {
+    const t = await s.setup(false);
+    await s.call(t.acme.token, "POST", "/api/inbox/ack", { acks: [{ thread: t.id, seq: 999_999 }] });
+    await s.send(t.vers.token, t.id, "after the over-eager ack");
+    expect(mail(await s.inbox(t.acme.token))).toEqual(["after the over-eager ack"]);
+  });
+
+  test("one inbox covers every thread, and can be narrowed", async () => {
+    const a = await s.thread(false, "Thread A");
+    const b = await s.thread(false, "Thread B");
+    const acme = await s.seat(a.acmeHuman);
+    await s.seat(b.acmeHuman, acme.token);
+    const versA = await s.seat(a.versHuman);
+    const versB = await s.seat(b.versHuman);
+    await drain(acme.token);
+    await s.send(versA.token, a.id, "from A");
+    await s.send(versB.token, b.id, "from B");
+
+    const all = await s.inbox(acme.token);
+    expect(all.unread_count).toBe(2);
+    expect(mail(all).sort()).toEqual(["from A", "from B"]);
+    expect(mail(await s.inbox(acme.token, `?threads=${b.id}`))).toEqual(["from B"]);
+  });
+
+  test("a waiting inbox is woken by new mail, not by the mailbox's own post", async () => {
+    const t = await s.setup(false);
+    await drain(t.vers.token);
+    await s.send(t.vers.token, t.id, "ping");
+    const waiting = s.inbox(t.vers.token, "?wait=5");
+    await Bun.sleep(150);
+    const began = Date.now();
+    await s.send(t.acme.token, t.id, "pong");
+    const res = await waiting;
+    expect(Date.now() - began).toBeLessThan(1500);
+    expect(res.timed_out).toBe(false);
+    expect(mail(res)).toEqual(["pong"]);
+  });
+
+  test("an empty wait reports a timeout", async () => {
+    const t = await s.setup(false);
+    await drain(t.vers.token);
+    const res = await s.inbox(t.vers.token, "?wait=1");
+    expect(res.timed_out).toBe(true);
+    expect(res.threads).toEqual([]);
+  });
+
+  test("seen marks hide announced mail without acknowledging it", async () => {
+    const t = await s.setup(false);
+    await drain(t.acme.token);
+    await s.send(t.vers.token, t.id, "announced");
+    const first = await s.inbox(t.acme.token);
+    const seen = `${t.id}:${first.threads[0].ack_seq}`;
+
+    const quiet = await s.inbox(t.acme.token, `?seen=${seen}&wait=1`);
+    expect(quiet.timed_out).toBe(true);
+
+    await s.send(t.vers.token, t.id, "newer");
+    expect(mail(await s.inbox(t.acme.token, `?seen=${seen}`))).toEqual(["newer"]);
+    expect(mail(await s.inbox(t.acme.token))).toEqual(["announced", "newer"]);
+  });
+
+  test("reading history does not acknowledge mail", async () => {
+    const t = await s.setup(false);
+    await drain(t.acme.token);
+    await s.send(t.vers.token, t.id, "still unread");
+    const history = (await s.call(t.acme.token, "GET", `/api/threads/${t.id}/messages`)).data;
+    expect(history.messages.map((m: any) => m.body)).toContain("still unread");
+    expect(mail(await s.inbox(t.acme.token))).toEqual(["still unread"]);
+  });
+
+  test("empty and oversized messages are refused", async () => {
+    const t = await s.setup(false);
+    expect((await s.send(t.vers.token, t.id, "   ")).data.error.code).toBe("empty_message");
+    expect((await s.send(t.vers.token, t.id, "x".repeat(70_000))).status).toBe(413);
+  });
+});
+
+describe("human controls", () => {
+  test("held messages reach no inbox until approved", async () => {
+    const t = await s.setup(true);
+    await drain(t.acme.token);
+    const held = await s.send(t.vers.token, t.id, "Draft answer");
+    expect(held.data.message.status).toBe("pending");
+    expect(held.data.note).toContain("Held for review");
+    expect(held.data.note).not.toContain("Delivered");
+
+    expect((await s.inbox(t.acme.token)).unread_count).toBe(0);
+    const acmeState = (await s.call(t.acmeHuman, "GET", "/api/state")).data;
+    expect(acmeState.pending).toEqual([]);
+    expect(JSON.stringify(acmeState.messages)).not.toContain("Draft answer");
+    expect((await s.call(t.versHuman, "GET", "/api/state")).data.pending.map((m: any) => m.body)).toEqual(["Draft answer"]);
+
+    const id = held.data.message.id;
+    expect((await s.call(t.acmeHuman, "POST", `/api/messages/${id}/approve`, {})).status).toBe(404);
+    expect((await s.call(t.vers.token, "POST", `/api/messages/${id}/approve`, {})).status).toBe(403);
+    expect((await s.call(t.versHuman, "POST", `/api/messages/${id}/approve`, {})).status).toBe(200);
+    expect(mail(await s.inbox(t.acme.token))).toEqual(["Draft answer"]);
+  });
+
+  test("a message approved late is still delivered after newer traffic was read", async () => {
+    const t = await s.setup(true);
+    const held = await s.send(t.vers.token, t.id, "held first");
+    await s.call(t.acmeHuman, "POST", "/api/messages", { body: "human note sent later" });
+    await drain(t.acme.token);
+    await s.call(t.versHuman, "POST", `/api/messages/${held.data.message.id}/approve`, {});
+    expect(mail(await s.inbox(t.acme.token))).toEqual(["held first"]);
+  });
+
+  test("a rejection is mailed to the rejecting side only", async () => {
+    const t = await s.setup(true);
+    await drain(t.vers.token);
+    await drain(t.acme.token);
+    const held = await s.send(t.vers.token, t.id, "contains internal detail");
+    const id = held.data.message.id;
+    expect((await s.call(t.versHuman, "POST", `/api/messages/${id}/reject`, { note: "leaks internals" })).status).toBe(200);
+
+    const mine = await s.inbox(t.vers.token);
+    expect(JSON.stringify(mine)).toContain("leaks internals");
+    expect(mine.threads[0].pending).toEqual([]);
+    const theirs = JSON.stringify(await s.inbox(t.acme.token));
+    expect(theirs).not.toContain("internal detail");
+    expect(theirs).not.toContain("leaks internals");
+    expect((await s.call(t.versHuman, "POST", `/api/messages/${id}/approve`, {})).status).toBe(409);
+  });
+
+  test("pausing blocks agents, mails them the news, and leaves humans free to talk", async () => {
+    const t = await s.setup(false);
+    await drain(t.vers.token);
+    const waiting = s.inbox(t.vers.token, "?wait=5");
+    await Bun.sleep(100);
+    await s.call(t.acmeHuman, "POST", "/api/pause", { paused: true });
+    const woke = await waiting;
+    expect(woke.threads[0].paused).toBe(true);
+    expect(JSON.stringify(woke)).toContain("paused the room");
+
+    const blocked = await s.send(t.vers.token, t.id, "hello?");
+    expect(blocked.status).toBe(423);
+    expect(blocked.data.error.code).toBe("thread_paused");
+    expect((await s.call(t.versHuman, "POST", "/api/messages", { body: "humans can still talk" })).status).toBe(201);
+  });
+
+  test("the thread pauses itself after a run of unreviewed agent messages", async () => {
+    const t = await s.setup(false);
+    for (let i = 0; i < 4; i++) {
+      expect((await s.send(i % 2 ? t.acme.token : t.vers.token, t.id, `turn ${i}`)).status).toBe(201);
+    }
+    expect((await s.send(t.vers.token, t.id, "turn 4")).status).toBe(423);
+    await s.call(t.versHuman, "POST", "/api/pause", { paused: false });
+    expect((await s.send(t.vers.token, t.id, "turn 4")).status).toBe(201);
+  });
+
+  test("a removed agent loses the thread but keeps its mailbox", async () => {
+    const t = await s.setup(false);
+    const agentId = (await s.call(t.versHuman, "GET", "/api/state")).data.agents[0].id;
+    expect((await s.call(t.acmeHuman, "POST", `/api/agents/${agentId}/revoke`, {})).status).toBe(404);
+    expect((await s.call(t.versHuman, "POST", `/api/agents/${agentId}/revoke`, {})).status).toBe(200);
+
+    const res = await s.send(t.vers.token, t.id, "am I still here?");
+    expect(res.status).toBe(403);
+    expect(res.data.error.code).toBe("removed");
+    await s.send(t.acme.token, t.id, "to nobody");
+    expect((await s.inbox(t.vers.token)).unread_count).toBe(0);
+    expect((await s.call(t.vers.token, "GET", "/api/me")).status).toBe(200);
+  });
+
+  test("the page long-poll returns when the thread changes", async () => {
+    const t = await s.setup(true);
+    const version = (await s.call(t.versHuman, "GET", "/api/state")).data.version;
+    const waiting = s.call(t.versHuman, "GET", `/api/state?v=${version}&wait=5`);
+    await Bun.sleep(100);
+    await s.call(t.acmeHuman, "POST", "/api/messages", { body: "hi" });
+    const res = await waiting;
+    expect(res.data.version).toBeGreaterThan(version);
+  });
+});
+
+describe("presence", () => {
+  const find = (people: any[], name: string) => people.find((x) => x.name === name);
+
+  test("a sender is told whether the other side's agent will be notified now", async () => {
+    const t = await s.thread(false);
+    const vers = await s.seat(t.versHuman);
+    const alone = await s.send(vers.token, t.id, "anyone there?");
+    expect(alone.data.note).toContain("No agent has joined on Acme yet");
+
+    const acme = await s.seat(t.acmeHuman);
+    const away = await s.send(vers.token, t.id, "still there?");
+    expect(away.data.note).toContain("Acme Claude is not listening right now");
+    expect(find(away.data.participants, "Acme Claude").unread).toBe(1);
+
+    await drain(acme.token);
+    const waiting = s.inbox(acme.token, "?wait=5");
+    await Bun.sleep(150);
+    const heard = await s.send(vers.token, t.id, "now?");
+    expect(heard.data.note).toContain("Acme Claude is listening and will be notified now");
+    expect(mail(await waiting)).toEqual(["now?"]);
+  });
+
+  test("the page shows who is listening and how much each agent has unread", async () => {
+    const t = await s.setup(false);
+    await drain(t.acme.token);
+    await s.send(t.vers.token, t.id, "one");
+    const people = (await s.call(t.versHuman, "GET", "/api/state")).data.participants;
+    expect(find(people, "Acme Claude").unread).toBe(1);
+    expect(find(people, "Acme (human)").state).toBe("away");
+    expect(Object.keys(people[0]).sort()).toEqual(["kind", "last_seen_seconds_ago", "name", "side", "state", "unread"]);
+  });
+});
+
+describe("notifying humans when no agent picks up mail", () => {
+  function receiver() {
+    const hits: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        hits.push(await req.json());
+        return new Response("ok");
+      },
+    });
+    return { hits, url: server.url.origin + "/hook", stop: () => server.stop(true) };
+  }
+
+  test("unread mail triggers the side's webhook once", async () => {
+    const hook = receiver();
+    const t = await s.setup(false);
+    expect((await s.call(t.acmeHuman, "POST", "/api/settings", { notify_url: hook.url })).data.notify_url).toBe(hook.url);
+    await s.send(t.vers.token, t.id, "nobody home?");
+    await s.app.sweep();
+    await s.app.sweep();
+    expect(hook.hits.length).toBe(1);
+    expect(hook.hits[0].text).toContain("your agent has not picked up 1 message from Vers Claude");
+    expect(hook.hits[0].thread.id).toBe(t.id);
+    hook.stop();
+  });
+
+  test("mail the agent already read does not notify anyone", async () => {
+    const hook = receiver();
+    const t = await s.setup(false);
+    await s.call(t.acmeHuman, "POST", "/api/settings", { notify_url: hook.url });
+    await s.send(t.vers.token, t.id, "read promptly");
+    await drain(t.acme.token);
+    await s.app.sweep();
+    expect(hook.hits.length).toBe(0);
+    hook.stop();
+  });
+
+  test("a side with no agent at all is told so", async () => {
+    const hook = receiver();
+    const t = await s.thread(false);
+    const vers = await s.seat(t.versHuman);
+    await s.call(t.acmeHuman, "POST", "/api/settings", { notify_url: hook.url });
+    await s.send(vers.token, t.id, "hello?");
+    await s.app.sweep();
+    expect(hook.hits[0].text).toContain("no agent is connected on your side");
+    hook.stop();
+  });
+
+  test("private and plain-http webhook targets are refused by default", async () => {
+    const strict = startServer({ allowPrivateWebhooks: false });
+    const t = await strict.thread(false);
+    for (const url of ["http://example.com/x", "https://localhost/x", "https://10.0.0.5/x", "not a url"]) {
+      const res = await strict.call(t.versHuman, "POST", "/api/settings", { notify_url: url });
+      expect(res.status).toBe(400);
+      expect(res.data.error.code).toBe("bad_notify_url");
+    }
+    expect((await strict.call(t.versHuman, "POST", "/api/settings", { notify_url: "https://hooks.example.com/x" })).status).toBe(200);
+    await strict.stop();
+  });
+});
+
+describe("client distribution", () => {
+  test("without built binaries the installer explains itself", async () => {
+    const res = await s.call(null, "GET", "/install.sh");
+    expect(res.status).toBe(404);
+    expect(res.data.error.code).toBe("client_not_built");
+  });
+
+  test("the installer pins the checksum of the binary it downloads", async () => {
+    const dist = mkdtempSync(join(tmpdir(), "parley-dist-"));
+    writeFileSync(join(dist, "parley-linux-x64"), "fake binary");
+    const withDist = startServer({ distDir: dist });
+    const script = (await withDist.call(null, "GET", "/install.sh")).data as string;
+    const sum = new Bun.CryptoHasher("sha256").update("fake binary").digest("hex");
+    expect(script).toContain(`parley-linux-x64) want=${sum}`);
+    expect(script).toContain(`${withDist.base}/dl/$file`);
+    expect(script).toContain("file=parley-linux-x64;");
+    expect((await withDist.call(null, "GET", "/dl/parley-linux-x64")).data).toBe("fake binary");
+    expect((await withDist.call(null, "GET", "/dl/parley-linux-x64.gz")).status).toBe(404);
+    expect((await withDist.call(null, "GET", "/dl/parley-plan9-x64")).status).toBe(404);
+    await withDist.stop();
+  });
+
+  test("the installer fetches the gzipped copy when there is one and installs the real binary", async () => {
+    const arch = process.arch === "arm64" ? "arm64" : "x64";
+    const name = `parley-${process.platform}-${arch}`;
+    const dist = mkdtempSync(join(tmpdir(), "parley-dist-"));
+    const binary = "#!/bin/sh\necho fake parley\n";
+    writeFileSync(join(dist, name), binary);
+    writeFileSync(join(dist, `${name}.gz`), Bun.gzipSync(Buffer.from(binary)));
+    const withDist = startServer({ distDir: dist });
+    const script = (await withDist.call(null, "GET", "/install.sh")).data as string;
+    expect(script).toContain(`file=${name}.gz;`);
+
+    const bin = mkdtempSync(join(tmpdir(), "parley-bin-"));
+    const home = join(mkdtempSync(join(tmpdir(), "parley-home-")), ".parley");
+    const proc = Bun.spawn(["sh", "-c", script], { env: { ...process.env, PARLEY_BIN_DIR: bin, PARLEY_HOME: home }, stdout: "pipe", stderr: "pipe" });
+    const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    expect({ code, err }).toEqual({ code: 0, err: "" });
+    expect(out).toContain("Downloading the Parley client");
+    expect(out).toContain(`Installed ${bin}/parley`);
+    expect(readFileSync(join(bin, "parley"), "utf8")).toBe(binary);
+    // The installer records where it came from, so `parley new` works before any room is joined.
+    expect(readFileSync(join(home, "server"), "utf8").trim()).toBe(withDist.base);
+    expect(Bun.spawnSync([join(bin, "parley")]).stdout.toString()).toBe("fake parley\n");
+
+    // A corrupted download is refused.
+    writeFileSync(join(dist, `${name}.gz`), Bun.gzipSync(Buffer.from("tampered")));
+    const bad = Bun.spawn(["sh", "-c", script], { env: { ...process.env, PARLEY_BIN_DIR: mkdtempSync(join(tmpdir(), "parley-bin-")), PARLEY_HOME: home }, stdout: "pipe", stderr: "pipe" });
+    expect(await new Response(bad.stderr).text()).toContain("checksum mismatch");
+    expect(await bad.exited).toBe(1);
+    await withDist.stop();
+  });
+});
+
+describe("pages", () => {
+  test("home, thread and invite pages are served", async () => {
+    for (const path of ["/", "/t", "/j"]) {
+      const res = await fetch(s.base + path);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    }
+  });
+});

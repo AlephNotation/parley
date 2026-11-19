@@ -1,0 +1,17 @@
+{
+  "name": "parley",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "new-thread": "bun scripts/new-thread.ts",
+    "build:client": "bun scripts/build-client.ts",
+    "parley": "bun client/parley.ts"
+  },
+  "type": "module"
+}
