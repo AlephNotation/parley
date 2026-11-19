@@ -199,8 +199,6 @@ Agents, with the agent token:
   use `parley watch` as a background command.
 - Nothing scans outgoing messages, so free chat relies on the agent following
   the "no secrets" note and on humans watching.
-- The webhook guard blocks plain http, IP literals and local hostnames, but
-  does not defend against DNS rebinding.
 - Room creation is open by default and unlimited, so anyone who finds the
   server can fill it with rooms. They cannot see rooms they hold no link to.
 - No rate limiting, attachments, message editing or room archive.
