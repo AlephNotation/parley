@@ -584,3 +584,159 @@ describe("join output", () => {
     expect((await machine().run(["join", `${s.base}/t#${seen.acmeHuman}`])).stdout).not.toContain("has not opened the room");
   });
 });
+
+describe("addressed messages (against a server speaking the audience contract)", () => {
+  /** A stand-in for a server with addressed messages: serves a fixed inbox and records posts. */
+  function fakeServer(thread: Record<string, unknown>) {
+    const posts: { contentType: string; body: string }[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (req.method === "GET" && url.pathname === "/api/inbox") return Response.json({ unread_count: 1, threads: [thread], timed_out: false });
+        if (req.method === "GET" && url.pathname === "/api/threads") return Response.json({ threads: [thread] });
+        if (req.method === "POST" && url.pathname === "/api/inbox/ack") return Response.json({ ok: true });
+        if (req.method === "POST" && url.pathname.endsWith("/messages")) {
+          posts.push({ contentType: req.headers.get("content-type") ?? "", body: await req.text() });
+          return Response.json({ message: { status: "sent", seq: 9 }, note: "Room-wide: Vers Claude woken now." });
+        }
+        return Response.json({ error: { code: "not_found", message: "no" } }, { status: 404 });
+      },
+    });
+    return { base: server.url.origin, posts, stop: () => server.stop(true) };
+  }
+
+  const msg = (seq: number, extra: Record<string, unknown>) => ({
+    id: seq,
+    seq,
+    from: "Vers Claude",
+    side: "Vers",
+    kind: "agent",
+    body: `message ${seq}`,
+    at: "2026-11-19T04:50:00Z",
+    ...extra,
+  });
+
+  function roomWith(unread: unknown[], yourHuman = "watching") {
+    return {
+      id: "abcdef0123456789",
+      title: "Addressed",
+      paused: false,
+      review: false,
+      you: { name: "Acme Claude", side: "Acme" },
+      participants: [],
+      unread,
+      ack_seq: 9,
+      more: false,
+      pending: [],
+      your_human: yourHuman,
+    };
+  }
+
+  function machineOn(base: string) {
+    const m = machine();
+    mkdirSync(m.home, { recursive: true });
+    writeFileSync(
+      join(m.home, "config.json"),
+      JSON.stringify({
+        servers: { [base]: { token: "pm_x", address: "acme-claude-1" } },
+        threads: { abcdef0123456789: { server: base, title: "Addressed", dir: m.project } },
+      }),
+    );
+    return m;
+  }
+
+  test("say sends --to and --fyi as JSON, plain text otherwise, and rejects bad combinations", async () => {
+    const fake = fakeServer(roomWith([]));
+    try {
+      const m = machineOn(fake.base);
+      expect((await m.run(["say", "plain"])).code).toBe(0);
+      expect((await m.run(["say", "--to", "Vers, vers-claude-9", "direct one"])).stdout).toContain("Room-wide: Vers Claude woken now.");
+      expect((await m.run(["say", "--fyi", "just so you know"])).code).toBe(0);
+      expect(fake.posts[0]).toEqual({ contentType: "text/plain", body: "plain" });
+      expect(fake.posts[1]!.contentType).toBe("application/json");
+      expect(JSON.parse(fake.posts[1]!.body)).toEqual({ body: "direct one", to: ["Vers", "vers-claude-9"] });
+      expect(JSON.parse(fake.posts[2]!.body)).toEqual({ body: "just so you know", fyi: true });
+
+      const both = await m.run(["say", "--to", "Vers", "--fyi", "x"]);
+      expect(both.code).toBe(1);
+      expect(both.stderr).toContain("use --to or --fyi, not both");
+      expect((await m.run(["say", "--to", "", "x"])).stderr).toContain("--to needs a name");
+      expect(fake.posts.length).toBe(3);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("read labels each message and says what is expected", async () => {
+    const fake = fakeServer(
+      roomWith([
+        msg(5, { audience: "direct", to: ["acme-claude-1"], woke: true }),
+        msg(6, { audience: "room", to: [], woke: false }),
+        msg(7, { audience: "fyi", to: [], woke: false }),
+        msg(8, { audience: "direct", to: ["Globex"], woke: false }),
+      ]),
+    );
+    try {
+      const out = (await machineOn(fake.base).run(["read"])).stdout;
+      expect(out).toContain("  [to acme-claude-1]\n    message 5");
+      expect(out).toContain("  [fyi]\n    message 7");
+      expect(out).toContain("  [to Globex]\n    message 8");
+      expect(out).toMatch(/Z\n    message 6/);
+      expect(out).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      // A message addressed to someone else is room context, not something this agent owes a reply to.
+      expect(out).toContain("Room-wide (#6): act only if relevant. If it needs an owner and that is you, say so; if it is nobody, tell your human.");
+      expect(out).not.toContain("#8)");
+      expect(out).toContain("Your side's human is watching the room.");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("addressing a side reaches every agent on it, and fyi alone owes nothing", async () => {
+    const side = fakeServer(roomWith([msg(5, { audience: "direct", to: ["acme"], woke: true })], "away"));
+    const fyi = fakeServer(roomWith([msg(5, { audience: "fyi", to: [], woke: false })], "not_joined"));
+    try {
+      const sideOut = (await machineOn(side.base).run(["read"])).stdout;
+      expect(sideOut).toContain("Addressed to you (#5): a reply is expected. Your side's human is not watching right now.");
+      const fyiOut = (await machineOn(fyi.base).run(["read"])).stdout;
+      expect(fyiOut).toContain("Expected: For your information only: no reply is owed. Your side's human has not opened the room.");
+    } finally {
+      side.stop();
+      fyi.stop();
+    }
+  });
+
+  test("a message from your own side's human is called out", async () => {
+    const fake = fakeServer(roomWith([msg(5, { from: "Acme (human)", side: "Acme", kind: "human", audience: "room", to: [], woke: true })]));
+    try {
+      const out = (await machineOn(fake.base).run(["read"])).stdout;
+      expect(out).toContain("Expected: Your side's human wrote: they expect a response.");
+      expect(out).not.toContain("Room-wide");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("the wake and prompt notices carry the same expectation", async () => {
+    const fake = fakeServer(roomWith([msg(5, { audience: "direct", to: ["Acme"], woke: true })]));
+    try {
+      const m = machineOn(fake.base);
+      const wait = await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop"), env: { PARLEY_HOOK_WAIT: "1" } });
+      expect(wait.code).toBe(2);
+      expect(wait.stderr).toContain('New on Parley: 1 unread Parley message: 1 in "Addressed" from Vers Claude. Addressed to you (#5): a reply is expected.');
+      const prompt = JSON.parse((await m.run(["hook", "prompt"], { stdin: hookJson(m, "UserPromptSubmit") })).stdout).hookSpecificOutput.additionalContext;
+      expect(prompt).toContain("Addressed to you (#5): a reply is expected. Your side's human is watching the room.");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a server without audience labels reads exactly as before", async () => {
+    const { acme, vers, id } = await scene();
+    await s.send(vers.token, id, "old style");
+    const out = (await acme.run(["read"])).stdout;
+    expect(out).not.toContain("Expected:");
+    expect(out).not.toContain("[to ");
+  });
+});

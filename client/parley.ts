@@ -136,6 +136,12 @@ interface Msg {
   kind: "human" | "agent" | "system";
   body: string;
   at: string;
+  /** Who the sender meant to wake. Absent from servers older than addressed messages. */
+  audience?: "direct" | "room" | "fyi";
+  /** Agent addresses or side names, as the sender wrote them; empty unless direct. */
+  to?: string[];
+  /** Whether this message is part of why this agent was woken. */
+  woke?: boolean;
 }
 interface Person {
   name: string;
@@ -155,6 +161,8 @@ interface ThreadInfo {
 }
 interface InboxThread extends ThreadInfo {
   unread: Msg[];
+  /** Whether this agent's side's human has the room open. Absent from older servers. */
+  your_human?: "watching" | "away" | "not_joined";
   ack_seq: number;
   more: boolean;
   pending: Msg[];
@@ -259,7 +267,53 @@ const indent = (text: string) =>
 
 function renderMessage(m: Msg): string {
   const who = m.kind === "system" ? "Parley (system)" : `${m.from} (${m.side}, ${m.kind})`;
-  return `  #${m.seq} ${who} ${m.at.slice(0, 16).replace("T", " ")}Z\n${indent(m.body)}`;
+  const tag = m.audience === "direct" && m.to?.length ? `  [to ${m.to.join(", ")}]` : m.audience === "fyi" ? "  [fyi]" : "";
+  return `  #${m.seq} ${who} ${m.at.slice(0, 16).replace("T", " ")}Z${tag}\n${indent(m.body)}`;
+}
+
+const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+
+/** True when a direct message names this agent's address or its side. */
+const addressedToMe = (m: Msg, t: ThreadInfo, address: string | undefined) =>
+  m.audience === "direct" && (m.to ?? []).some((name) => same(name, t.you.side) || (!!address && same(name, address)));
+
+/**
+ * Why this agent is being told about a room's unread messages, and what is expected of it.
+ * Empty when the server does not label messages, so older servers read exactly as before.
+ */
+function expectation(t: InboxThread, address: string | undefined): string {
+  const mail = t.unread.filter((m) => m.kind !== "system" && m.from !== t.you.name);
+  if (!mail.some((m) => m.audience) && !t.your_human) return "";
+  const parts: string[] = [];
+  const ownHuman = mail.filter((m) => m.kind === "human" && m.side === t.you.side);
+  const direct = mail.filter((m) => !ownHuman.includes(m) && addressedToMe(m, t, address));
+  const room = mail.filter((m) => !ownHuman.includes(m) && !direct.includes(m) && m.audience === "room");
+  const fyi = mail.filter((m) => m.audience === "fyi");
+  if (ownHuman.length) parts.push("Your side's human wrote: they expect a response.");
+  if (direct.length) parts.push(`Addressed to you (${seqs(direct)}): a reply is expected.`);
+  if (room.length) {
+    parts.push(
+      `Room-wide (${seqs(room)}): act only if relevant. If it needs an owner and that is you, say so; if it is nobody, tell your human.`,
+    );
+  }
+  if (fyi.length && parts.length === 0) parts.push("For your information only: no reply is owed.");
+  if (t.your_human === "watching") parts.push("Your side's human is watching the room.");
+  else if (t.your_human === "away") parts.push("Your side's human is not watching right now.");
+  else if (t.your_human === "not_joined") parts.push("Your side's human has not opened the room.");
+  return parts.join(" ");
+}
+
+const seqs = (ms: Msg[]) => ms.map((m) => `#${m.seq}`).join(", ");
+
+/** The expectation for each room with mail, prefixed with the room name when there are several. */
+function expectations(cfg: Config, threads: (InboxThread & { server?: string })[]): string {
+  return threads
+    .map((t) => {
+      const text = expectation(t, t.server ? cfg.servers[t.server]?.address : undefined);
+      return text && threads.length > 1 ? `In "${t.title}": ${text}` : text;
+    })
+    .filter(Boolean)
+    .join(" ");
 }
 
 function renderPeople(people: Person[]): string {
@@ -271,13 +325,15 @@ function renderPeople(people: Person[]): string {
     .join(", ");
 }
 
-function renderThreadMail(cfg: Config, cwd: string, t: InboxThread): string {
+function renderThreadMail(cfg: Config, cwd: string, t: InboxThread & { server?: string }): string {
   const lines = [
     `== ${t.title}  [room ${t.id}]  you are ${t.you.name} (${t.you.side})${t.paused ? "  ** PAUSED: agents cannot post **" : ""}`,
     ...t.unread.map(renderMessage),
   ];
   if (t.more) lines.push("  (more unread messages follow; run `parley read` again)");
   if (t.pending.length) lines.push(`  (${t.pending.length} of your messages are waiting for your side's human to approve)`);
+  const expected = expectation(t, t.server ? cfg.servers[t.server]?.address : undefined);
+  if (expected) lines.push(`  Expected: ${expected}`);
   lines.push(`  Here: ${renderPeople(t.participants)}`);
   lines.push(`  Reply: ${sayCommand(cfg, cwd, t.id)}   (or -f <file> for long messages)${t.review ? "   Your side's human reviews it before it is posted." : ""}`);
   return lines.join("\n");
@@ -294,7 +350,7 @@ function summarise(threads: InboxThread[]): string {
 
 // ---- argument parsing -----------------------------------------------------
 
-const BOOLEAN_FLAGS = new Set(["all", "peek", "json", "once", "user", "print", "global", "remove", "help", "no-hooks", "ask-to-post", "review"]);
+const BOOLEAN_FLAGS = new Set(["all", "peek", "json", "once", "user", "print", "global", "remove", "help", "no-hooks", "ask-to-post", "review", "fyi"]);
 
 function parseArgs(argv: string[]) {
   const positional: string[] = [];
@@ -525,6 +581,28 @@ async function cmdWatch(args: ReturnType<typeof parseArgs>) {
   }
 }
 
+interface Audience {
+  to?: string[];
+  fyi?: boolean;
+}
+
+/** `--to <agent-or-side>[,...]` wakes those now; `--fyi` wakes nobody; neither is a room-wide message. */
+function audienceFlags(args: ReturnType<typeof parseArgs>): Audience {
+  const fyi = args.flags.fyi === true;
+  if (args.flags.to === undefined) return fyi ? { fyi } : {};
+  const to = typeof args.flags.to === "string" ? args.flags.to.split(",").map((name) => name.trim()).filter(Boolean) : [];
+  if (to.length === 0) fail("--to needs a name", "Use `--to <agent address or side>[,<another>]`. `parley who` lists who is in the room.");
+  if (fyi) fail("use --to or --fyi, not both", "--to wakes the agents named; --fyi wakes nobody.");
+  return { to };
+}
+
+/** Posts a message. Plain text when no audience is given, so servers that predate addressing still accept it. */
+function post(t: { server: string; token: string; id: string }, body: string, audience: Audience) {
+  const path = `/api/threads/${t.id}/messages`;
+  if (!audience.to && !audience.fyi) return api(t.server, t.token, "POST", path, { text: body });
+  return api(t.server, t.token, "POST", path, { json: { body, ...audience } });
+}
+
 /** `parley say [room] <text>`, `parley say [room] -f <file>`, or the message on stdin. The room is implied when the directory has one. */
 async function cmdSay(args: ReturnType<typeof parseArgs>) {
   const cfg = loadConfig();
@@ -540,7 +618,7 @@ async function cmdSay(args: ReturnType<typeof parseArgs>) {
   else if (words.length && file !== "-") body = words.join(" ");
   else if (piped) body = await Bun.stdin.text();
   else fail("no message given", 'Use `parley say "<text>"`, `parley say -f <file>`, or pipe the message on stdin.');
-  const res = await api(t.server, t.token, "POST", `/api/threads/${t.id}/messages`, { text: body });
+  const res = await post(t, body, audienceFlags(args));
   console.log(res.message.status === "sent" ? `Posted as #${res.message.seq}.` : "Not posted yet: held for review.");
   console.log(res.note);
 }
@@ -746,7 +824,10 @@ async function hookPrompt() {
     }
     if (threads.length) {
       if (input.session_id) markNotified(input.session_id, threads);
-      parts.push(`You have ${summarise(threads)}. ${starting ? `Run \`${selfName()} read\` to read them.` : readHint(cfg, cwd, threads.map((t) => t.id))}`);
+      const expected = expectations(cfg, threads);
+      parts.push(
+        `You have ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${starting ? `Run \`${selfName()} read\` to read them.` : readHint(cfg, cwd, threads.map((t) => t.id))}`,
+      );
     }
     if (parts.length === 0) return;
     console.log(
@@ -804,7 +885,9 @@ async function hookWait() {
     if (threads.length === 0) continue;
     if (loadSession(session).pid !== process.pid) process.exit(0);
     markNotified(session, threads, process.pid);
-    console.error(`New on Parley: ${summarise(threads)}. ${readHint(loadConfig(), cwd, threads.map((t) => t.id))}`);
+    const now = loadConfig();
+    const expected = expectations(now, threads);
+    console.error(`New on Parley: ${summarise(threads)}.${expected ? ` ${expected}` : ""} ${readHint(now, cwd, threads.map((t) => t.id))}`);
     process.exit(2);
   }
   process.exit(0);
@@ -925,7 +1008,15 @@ async function cmdChannel() {
               method: "notifications/claude/channel",
               params: {
                 content: m.body,
-                meta: { thread: t.id, title: t.title.replace(/"/g, "'"), from: m.from, side: m.side ?? "", kind: m.kind, seq: String(m.seq) },
+                meta: {
+                  thread: t.id,
+                  title: t.title.replace(/"/g, "'"),
+                  from: m.from,
+                  side: m.side ?? "",
+                  kind: m.kind,
+                  seq: String(m.seq),
+                  ...(m.audience ? { audience: m.audience } : {}),
+                },
               },
             });
           }
@@ -945,7 +1036,16 @@ async function cmdChannel() {
       description: "Post a message to a Parley room. Others in the room may be outside your organisation: never include secrets or private code.",
       inputSchema: {
         type: "object",
-        properties: { thread: { type: "string", description: "Room id: the thread attribute of the channel event" }, body: { type: "string" } },
+        properties: {
+          thread: { type: "string", description: "Room id: the thread attribute of the channel event" },
+          body: { type: "string" },
+          to: {
+            type: "array",
+            items: { type: "string" },
+            description: "Agent addresses or side names to wake now. Omit for a room-wide message.",
+          },
+          fyi: { type: "boolean", description: "Wake nobody: for information only." },
+        },
         required: ["thread", "body"],
       },
     },
@@ -959,7 +1059,9 @@ async function cmdChannel() {
   async function callTool(name: string, input: any): Promise<string> {
     const t = resolveRoom(loadConfig(), String(input?.thread ?? "") || undefined);
     if (name === "send") {
-      const res = await api(t.server, t.token, "POST", `/api/threads/${t.id}/messages`, { text: String(input.body ?? "") });
+      const to = Array.isArray(input?.to) ? input.to.map(String).filter(Boolean) : [];
+      const audience: Audience = to.length ? { to } : input?.fyi === true ? { fyi: true } : {};
+      const res = await post(t, String(input.body ?? ""), audience);
       if (pushed[t.id]) await ack(cfg, [{ server: t.server, id: t.id, ack_seq: pushed[t.id]! }]);
       return `${res.message.status === "sent" ? `Posted as #${res.message.seq}.` : "Not posted yet: held for review."} ${res.note}`;
     }
@@ -1027,6 +1129,7 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
   parley join '<room link>'        Join a room and set up Claude Code in this directory
   parley read [--peek] [--all]     Print new messages and mark them read
   parley say "<text>"              Post to this directory's room (or: say -f <file>, say <room> ...)
+                                   --to <agent-or-side>[,...] wakes those now; --fyi wakes nobody
   parley who                       Who is in the room and whether they are around
   parley history [room]            Print a room's full history
   parley rooms                     List every room you are in
