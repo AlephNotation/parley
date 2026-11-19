@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ADMIN, mail, startServer } from "./helpers";
+import { createApp } from "../src/app";
 
 const CLIENT = join(import.meta.dir, "..", "client", "parley.ts");
 
@@ -684,7 +685,7 @@ describe("addressed messages (against a server speaking the audience contract)",
       expect(out).toContain("  [fyi]\n    message 7");
       expect(out).toContain("  [to Globex]\n    message 8");
       expect(out).toMatch(/Z\n    message 6/);
-      expect(out).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      expect(out).toContain("Expected: Addressed to you (#5): reply if it asks something of you.");
       // A message addressed to someone else is room context, not something this agent owes a reply to.
       expect(out).toContain("Room-wide (#6): act only if relevant. If it needs an owner and that is you, say so; if it is nobody, tell your human.");
       expect(out).not.toContain("#8)");
@@ -694,12 +695,12 @@ describe("addressed messages (against a server speaking the audience contract)",
     }
   });
 
-  test("addressing a side reaches every agent on it, and fyi alone owes nothing", async () => {
+  test("addressing a side tells its agents it may be for their human, and fyi alone owes nothing", async () => {
     const side = fakeServer(roomWith([msg(5, { audience: "direct", to: ["acme"], woke: true })], "away"));
     const fyi = fakeServer(roomWith([msg(5, { audience: "fyi", to: [], woke: false })], "not_joined"));
     try {
       const sideOut = (await machineOn(side.base).run(["read"])).stdout;
-      expect(sideOut).toContain("Addressed to you (#5): a reply is expected. Your side's human is not watching right now.");
+      expect(sideOut).toContain("Addressed to your side (#5): reply if it is yours to answer rather than your human's. Your side's human is not watching right now.");
       const fyiOut = (await machineOn(fyi.base).run(["read"])).stdout;
       expect(fyiOut).toContain("Expected: For your information only: no reply is owed. Your side's human has not opened the room.");
     } finally {
@@ -712,8 +713,8 @@ describe("addressed messages (against a server speaking the audience contract)",
     const byName = fakeServer(roomWith([msg(5, { audience: "direct", to: ["acme CLAUDE"], woke: true })]));
     const implicit = fakeServer(roomWith([msg(5, { audience: "direct", to: [], woke: true })]));
     try {
-      expect((await machineOn(byName.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): a reply is expected.");
-      expect((await machineOn(implicit.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): a reply is expected.");
+      expect((await machineOn(byName.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): reply if it asks something of you.");
+      expect((await machineOn(implicit.base).run(["read"])).stdout).toContain("Expected: Addressed to you (#5): reply if it asks something of you.");
       // A plain message in a two-agent room has no [to] tag: nobody was named.
       expect((await machineOn(implicit.base).run(["read", "--peek"])).stdout).not.toContain("[to");
     } finally {
@@ -726,7 +727,7 @@ describe("addressed messages (against a server speaking the audience contract)",
     const fake = fakeServer(roomWith([msg(5, { from: "Acme (human)", side: "Acme", kind: "human", audience: "room", to: [], woke: true })]));
     try {
       const out = (await machineOn(fake.base).run(["read"])).stdout;
-      expect(out).toContain("Expected: Your side's human wrote: they expect a response.");
+      expect(out).toContain("Expected: Your side's human wrote (#5): they expect a response.");
       expect(out).not.toContain("Room-wide");
     } finally {
       fake.stop();
@@ -739,9 +740,9 @@ describe("addressed messages (against a server speaking the audience contract)",
       const m = machineOn(fake.base);
       const wait = await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop"), env: { PARLEY_HOOK_WAIT: "1" } });
       expect(wait.code).toBe(2);
-      expect(wait.stderr).toContain('New on Parley: 1 unread Parley message: 1 in "Addressed" from Vers Claude. Addressed to you (#5): a reply is expected.');
+      expect(wait.stderr).toContain(`New on Parley: 1 unread Parley message: 1 in "Addressed" from Vers Claude. Addressed to your side (#5): reply if it is yours to answer rather than your human's.`);
       const prompt = JSON.parse((await m.run(["hook", "prompt"], { stdin: hookJson(m, "UserPromptSubmit") })).stdout).hookSpecificOutput.additionalContext;
-      expect(prompt).toContain("Addressed to you (#5): a reply is expected. Your side's human is watching the room.");
+      expect(prompt).toContain("Addressed to your side (#5): reply if it is yours to answer rather than your human's. Your side's human is watching the room.");
     } finally {
       fake.stop();
     }
@@ -780,7 +781,7 @@ describe("addressed messages end to end (real server, three agents)", () => {
     return { id, vers: versAgent, acme: a, globex: g };
   }
 
-  test("the addressed agent is told a reply is expected; the other sees it as context and is not woken", async () => {
+  test("the addressed side's agent is told it may be its to answer; the other sees it as context and is not woken", async () => {
     const { id, vers, acme, globex } = await threeSides();
     const globexWait = globex.spawn(["hook", "wait"], { stdin: hookJson(globex, "Stop"), env: { PARLEY_HOOK_WAIT: "1" } });
     await Bun.sleep(300);
@@ -789,7 +790,7 @@ describe("addressed messages end to end (real server, three agents)", () => {
 
     const toAcme = await acme.run(["read"]);
     expect(toAcme.stdout).toContain("[to Acme]");
-    expect(toAcme.stdout).toMatch(/Expected: Addressed to you \(#\d+\): a reply is expected\./);
+    expect(toAcme.stdout).toMatch(/Expected: Addressed to your side \(#\d+\): reply if it is yours to answer rather than your human's\./);
 
     // Globex is not woken by mail addressed to Acme.
     const early = await Promise.race([globexWait.exited, Bun.sleep(1500).then(() => "still waiting")]);
@@ -825,5 +826,155 @@ describe("addressed messages end to end (real server, three agents)", () => {
     expect(unknown.stderr).toContain('No agent or side here is called "Initech"');
     expect(unknown.stderr).toContain("You can address:");
     expect(unknown.stderr).toContain("Globex");
+  });
+});
+
+describe("wake wording and waiter recovery", () => {
+  /** A client config pointing at `base`, with one room bound to the project directory. */
+  function machineAt(base: string, thread = "abcdef0123456789") {
+    const m = machine();
+    mkdirSync(m.home, { recursive: true });
+    writeFileSync(
+      join(m.home, "config.json"),
+      JSON.stringify({ servers: { [base]: { token: "pm_x", address: "acme-claude-1" } }, threads: { [thread]: { server: base, title: "Room", dir: m.project } } }),
+    );
+    return m;
+  }
+
+  const room = (unread: unknown[], extra: Record<string, unknown> = {}) => ({
+    id: "abcdef0123456789",
+    title: "Room",
+    paused: false,
+    review: false,
+    you: { name: "Acme Claude", side: "Acme" },
+    participants: [],
+    unread,
+    ack_seq: 5,
+    more: false,
+    pending: [],
+    your_human: "watching",
+    ...extra,
+  });
+  const message = (extra: Record<string, unknown>) => ({ id: 5, seq: 5, from: "Vers Claude", side: "Vers", kind: "agent", body: "hello", at: "2026-11-19T05:00:00Z", ...extra });
+
+  /** Serves the inbox from `inbox(n)`, where n counts inbox calls; anything else is a plain ok. */
+  function serve(inbox: (n: number) => Response) {
+    let n = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname === "/api/inbox") return inbox(++n);
+        return Response.json({ ok: true, threads: [] });
+      },
+    });
+    return { base: server.url.origin, calls: () => n, stop: () => server.stop(true) };
+  }
+  const refuse = () => Response.json({ error: { code: "unauthorized", message: "Unknown or revoked token." } }, { status: 401 });
+  const inboxWith = (t: unknown) => Response.json({ unread_count: 1, threads: [t], timed_out: false });
+
+  test("a side addressed by its own agent is for that side's human, not work for its other agents", async () => {
+    const fake = serve(() => inboxWith(room([message({ from: "Acme Claude 2", side: "Acme", audience: "direct", to: ["Acme"], woke: true })])));
+    try {
+      const out = (await machineAt(fake.base).run(["read"])).stdout;
+      expect(out).toContain("Sent by your own side to your side (#5): it is for your human; no reply is needed from you.");
+      expect(out).not.toContain("Addressed to");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a paused room says agents cannot post, in read and in the wake notice", async () => {
+    const fake = serve(() => inboxWith(room([message({ audience: "direct", to: ["Acme Claude"], woke: true })], { paused: true })));
+    try {
+      const m = machineAt(fake.base);
+      const out = (await m.run(["read"])).stdout;
+      expect(out).toContain("The room is paused: agents cannot post until a human resumes it");
+      expect(out).toContain("Reply: not possible while the room is paused; a human must resume it first.");
+      expect(out).not.toContain('say "<text>"');
+      const wait = await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop"), env: { PARLEY_HOOK_WAIT: "1" } });
+      expect(wait.code).toBe(2);
+      expect(wait.stderr).toContain("you cannot reply until a human resumes the room");
+      expect(wait.stderr).not.toContain("reply with");
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a waiter keeps going through a server restart and wakes for mail sent after it", async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "parley-restart-")), "parley.db");
+    const opts = { adminToken: ADMIN, dbPath, maxWaitSeconds: 5, sweepIntervalMs: 0, notifyDelayMs: 0, wakeRefillMs: 0 };
+    let app = createApp(opts);
+    let server = Bun.serve({ port: 0, idleTimeout: 30, fetch: app.fetch });
+    const port = server.port;
+    const base = server.url.origin;
+    const call = async (token: string | null, method: string, path: string, body?: unknown) => {
+      const res = await fetch(base + path, {
+        method,
+        headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return (await res.json()) as any;
+    };
+    const made = await call(ADMIN, "POST", "/api/threads", { title: "Restart", sides: [{ name: "Vers" }, { name: "Acme" }] });
+    const [versHuman, acmeHuman] = made.sides.map((x: { human_url: string }) => x.human_url.split("#")[1]);
+    const vers = (await call(null, "POST", "/api/join", { code: (await call(versHuman, "POST", "/api/invites", {})).code })).mailbox.token;
+    const acme = machine();
+    expect((await acme.run(["join", `${base}/t#${acmeHuman}`, "--no-hooks"])).code).toBe(0);
+
+    const waiter = acme.spawn(["hook", "wait"], { stdin: hookJson(acme, "Stop"), env: { PARLEY_HOOK_WAIT: "2", PARLEY_HOOK_RETRY_MS: "200" } });
+    try {
+      await Bun.sleep(600);
+      // The server dies with the long-poll open, stays down for a moment, and comes back on the same port and data.
+      await server.stop(true);
+      app.close();
+      await Bun.sleep(1200);
+      app = createApp(opts);
+      server = Bun.serve({ port, idleTimeout: 30, fetch: app.fetch });
+      await call(vers, "POST", `/api/threads/${made.thread.id}/messages`, { body: "after the restart" });
+      const outcome = await Promise.race([
+        Promise.all([new Response(waiter.stderr).text(), waiter.exited]),
+        Bun.sleep(15_000).then(() => null),
+      ]);
+      expect(outcome).not.toBeNull();
+      const [notice, code] = outcome!;
+      expect(code).toBe(2);
+      expect(notice).toContain("New on Parley: 1 unread Parley message");
+    } finally {
+      waiter.kill();
+      await server.stop(true);
+      app.close();
+    }
+  }, 30_000);
+
+  test("a brief credential refusal, as during a deploy, does not stop the waiter", async () => {
+    const fake = serve((n) => (n <= 3 ? refuse() : inboxWith(room([message({ audience: "room", woke: true })]))));
+    try {
+      const m = machineAt(fake.base);
+      const wait = await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop"), env: { PARLEY_HOOK_WAIT: "1", PARLEY_HOOK_RETRY_MS: "50" } });
+      expect(wait.code).toBe(2);
+      expect(wait.stderr).toContain("New on Parley: 1 unread Parley message");
+      expect(fake.calls()).toBe(4);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a lasting refusal wakes the session once with what to do, and later waiters keep quiet about it", async () => {
+    const fake = serve(refuse);
+    try {
+      const m = machineAt(fake.base);
+      const env = { PARLEY_HOOK_WAIT: "1", PARLEY_HOOK_RETRY_MS: "30", PARLEY_HOOK_AUTH_LIMIT: "3" };
+      const first = await m.run(["hook", "wait"], { stdin: hookJson(m, "Stop"), env });
+      expect(first.code).toBe(2);
+      expect(first.stderr).toContain(`Parley: ${fake.base} keeps refusing this agent's credentials (Unknown or revoked token.)`);
+      expect(first.stderr).toContain("status");
+
+      const second = m.spawn(["hook", "wait"], { stdin: hookJson(m, "Stop"), env });
+      const early = await Promise.race([second.exited, Bun.sleep(1500).then(() => "still waiting")]);
+      expect(early).toBe("still waiting");
+      second.kill();
+    } finally {
+      fake.stop();
+    }
   });
 });
