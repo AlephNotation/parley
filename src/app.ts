@@ -681,7 +681,12 @@ export function createApp(opts: AppOptions) {
     ).n;
     return json({
       version: thread.version,
-      thread: { id: thread.id, title: thread.title, paused: thread.paused === 1 },
+      thread: {
+        id: thread.id,
+        title: thread.title,
+        paused: thread.paused === 1,
+        archived: thread.archived_at !== null ? { at: new Date(thread.archived_at).toISOString(), by: thread.archived_by } : null,
+      },
       you: { id: p.id, name: p.name, kind: p.kind, side: mine.name },
       sides: getSides(p.thread_id).map((s) => ({ name: s.name, approval: s.approval === 1, yours: s.id === p.side_id })),
       notify_url: mine.notify_url,
@@ -746,6 +751,7 @@ export function createApp(opts: AppOptions) {
       if (!message || message.side_id !== p.side_id) throw new HttpError(404, "not_found", `No message ${id} awaiting review on your side.`);
       if (message.status !== "pending") throw new HttpError(409, "already_reviewed", `Message ${id} is already ${message.status}.`);
       if (action === "approve") {
+        requireOpen(p.thread_id);
         const sent = db
           .query("UPDATE messages SET status = 'sent', seq = ?, delivered_at = ? WHERE id = ? RETURNING *")
           .get(maxSeq(p.thread_id) + 1, Date.now(), id) as MessageRow;
@@ -762,6 +768,90 @@ export function createApp(opts: AppOptions) {
     })();
     bump(p.thread_id);
     return json({ ok: true });
+  }
+
+  /** Archived rooms are read-only: nothing new is posted, approved or seated. */
+  function requireOpen(threadId: string) {
+    const thread = getThread(threadId);
+    if (thread.archived_at !== null) {
+      throw new HttpError(
+        423,
+        "archived",
+        `This room was archived by ${thread.archived_by ?? "a human"} and is read-only.`,
+        "Its history can still be read and exported. Either side's human can unarchive it from the room page.",
+      );
+    }
+  }
+
+  /** Archives or unarchives the room. Either side's human may do either. */
+  async function setArchived(req: Request): Promise<Response> {
+    const p = authHuman(req);
+    const input = await readJson(req);
+    if (typeof input.archived !== "boolean") throw new HttpError(400, "bad_request", 'Body must be {"archived": true|false}.');
+    const archived = input.archived;
+    const thread = getThread(p.thread_id);
+    if ((thread.archived_at !== null) !== archived) {
+      db.transaction(() => {
+        db.query("UPDATE threads SET archived_at = ?, archived_by = ?, agent_streak = 0 WHERE id = ?").run(
+          archived ? Date.now() : null,
+          archived ? p.name : null,
+          p.thread_id,
+        );
+        systemMessage(
+          p.thread_id,
+          archived
+            ? `${p.name} archived the room. It is read-only now; either side's human can unarchive it.`
+            : `${p.name} unarchived the room.`,
+        );
+      })();
+      bump(p.thread_id);
+    }
+    return json({ archived });
+  }
+
+  /**
+   * The whole room as one document, for keeping after the work is done: Markdown by default, or the
+   * raw messages with `format=json`. Each reader gets what they can see, so a side's own notices stay
+   * with that side.
+   */
+  function transcript(p: ParticipantRow, url: URL): Response {
+    const thread = getThread(p.thread_id);
+    const sides = getSides(p.thread_id).map((s) => s.name);
+    const messages = db
+      .query(
+        `SELECT * FROM messages WHERE thread_id = ? AND status = 'sent' AND (visible_to IS NULL OR visible_to = ?) ORDER BY seq`,
+      )
+      .all(p.thread_id, p.side_id) as MessageRow[];
+    const exported = new Date();
+    const stamp = exported.toISOString().slice(0, 10);
+    const file = `parley-${slug(thread.title) || "room"}-${stamp}`;
+    const archived = thread.archived_at !== null ? { at: new Date(thread.archived_at).toISOString(), by: thread.archived_by } : null;
+    if (url.searchParams.get("format") === "json") {
+      return new Response(
+        JSON.stringify({ thread: { id: thread.id, title: thread.title, sides, archived }, exported_at: exported.toISOString(), exported_by: p.name, messages: messages.map(view) }, null, 2),
+        { headers: { ...noStore, "content-type": "application/json; charset=utf-8", "content-disposition": `attachment; filename="${file}.json"` } },
+      );
+    }
+    const when = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace("T", " ") + "Z";
+    const lines = [
+      `# ${thread.title}`,
+      "",
+      `Parley room \`${thread.id}\` between ${sides.join(", ")}. Exported ${when(exported.getTime())} by ${p.name}.` +
+        (archived ? ` Archived ${when(thread.archived_at!)} by ${archived.by ?? "a human"}.` : ""),
+      "",
+    ];
+    for (const m of messages) {
+      const at = when(m.delivered_at ?? m.created_at);
+      if (m.kind === "system") {
+        lines.push(`*#${m.seq} · ${at} · ${m.body}*`, "");
+        continue;
+      }
+      const to = m.audience === "fyi" ? " · fyi" : m.addressed ? ` · to ${(JSON.parse(m.addressed) as string[]).join(", ")}` : "";
+      lines.push(`### #${m.seq} · ${m.author} (${m.side_name}, ${m.kind}) · ${at}${to}`, "", m.body, "");
+    }
+    return new Response(lines.join("\n"), {
+      headers: { ...noStore, "content-type": "text/markdown; charset=utf-8", "content-disposition": `attachment; filename="${file}.md"` },
+    });
   }
 
   async function setPaused(req: Request): Promise<Response> {
@@ -932,6 +1022,7 @@ export function createApp(opts: AppOptions) {
 
   function post(p: ParticipantRow, draft: Draft): Response {
     const { body, to, fyi } = draft;
+    requireOpen(p.thread_id);
     const wait = postLimit.take(p.id);
     if (wait !== null) {
       throw new HttpError(
@@ -1019,6 +1110,8 @@ export function createApp(opts: AppOptions) {
       id: thread.id,
       title: thread.title,
       paused: thread.paused === 1,
+      /** Archived rooms are read-only; the history stays readable and exportable. */
+      archived: thread.archived_at !== null,
       you: { name: p.name, side: side.name },
       /** The highest seq this agent marked read, from any session. A new session starts its own mark here. */
       read_seq: p.read_seq,
@@ -1052,6 +1145,7 @@ export function createApp(opts: AppOptions) {
       target = { threadId: invite.thread_id, sideId: invite.side_id, name: invite.name };
     }
 
+    requireOpen(target.threadId);
     const existing = bearer(req) ? authMailbox(req) : null;
     const label = (typeof input.label === "string" && input.label.trim().slice(0, 60)) || target.name;
 
@@ -1354,6 +1448,8 @@ export function createApp(opts: AppOptions) {
       return reviewMessage(req, Number(match[1]), match[2] as "approve" | "reject");
     }
     if (method === "POST" && path === "/api/pause") return setPaused(req);
+    if (method === "POST" && path === "/api/archive") return setArchived(req);
+    if (method === "GET" && path === "/api/transcript") return transcript(authHuman(req), url);
     if (method === "POST" && path === "/api/settings") return setSettings(req);
     if (method === "POST" && path === "/api/invites") return createInvite(req);
     if (method === "POST" && path === "/api/link/rotate") return rotateLink(req);
@@ -1366,6 +1462,9 @@ export function createApp(opts: AppOptions) {
     if (method === "GET" && path === "/api/inbox") return getInbox(req, url);
     if (method === "POST" && path === "/api/inbox/ack") return ackInbox(req);
     if (method === "GET" && path === "/api/threads") return listThreads(req);
+    if (method === "GET" && (match = /^\/api\/threads\/([0-9a-f]+)\/transcript$/.exec(path))) {
+      return transcript(seat(authMailbox(req), match[1]!), url);
+    }
     if ((match = /^\/api\/threads\/([0-9a-f]+)\/messages$/.exec(path))) {
       if (method === "GET") return threadHistory(req, url, match[1]!);
       if (method === "POST") {

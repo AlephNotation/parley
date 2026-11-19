@@ -7,7 +7,7 @@ export type MessageStatus = "sent" | "pending" | "rejected";
 export type Audience = "direct" | "room" | "fyi";
 
 /** Bump when the schema changes, and add the step from the previous version to MIGRATIONS. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /** MIGRATIONS[n] upgrades a database from schema version n to n + 1. */
 const MIGRATIONS: Record<number, string> = {
@@ -29,6 +29,10 @@ const MIGRATIONS: Record<number, string> = {
       WHERE p.kind = 'agent' AND m.status = 'sent' AND m.seq > p.read_seq
         AND m.participant_id IS NOT p.id AND (m.visible_to IS NULL OR m.visible_to = p.side_id);
   `,
+  3: `
+    ALTER TABLE threads ADD COLUMN archived_at INTEGER;
+    ALTER TABLE threads ADD COLUMN archived_by TEXT;
+  `,
 };
 
 export interface ThreadRow {
@@ -38,6 +42,10 @@ export interface ThreadRow {
   version: number;
   agent_streak: number;
   created_at: number;
+  /** When a human archived the room, making it read-only. Null while it is open. */
+  archived_at: number | null;
+  /** Who archived it. */
+  archived_by: string | null;
 }
 
 export interface SideRow {
@@ -148,7 +156,9 @@ export function openDb(path: string): Database {
       paused INTEGER NOT NULL DEFAULT 0,
       version INTEGER NOT NULL DEFAULT 0,
       agent_streak INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      archived_at INTEGER,
+      archived_by TEXT
     );
     CREATE TABLE IF NOT EXISTS sides (
       id TEXT PRIMARY KEY,
