@@ -29,6 +29,12 @@ describe("page source", () => {
     expect(threadPage).toContain("state.participants.filter((x) => x.side === name)");
   });
 
+  test("the room page flags a room-wide message nobody picked up, from the state's unowned field", () => {
+    expect(threadPage).toContain('<div id="unowned" role="status" hidden></div>');
+    expect(threadPage).toContain("const u = state.unowned;");
+    expect(threadPage).toContain("renderUnowned(state);");
+  });
+
   test("the room page has the audience picker and sends it with a message", () => {
     expect(threadPage).toContain('<select id="to">');
     expect(threadPage).toContain('{ fyi: true }');
