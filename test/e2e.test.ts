@@ -446,6 +446,46 @@ describe("unowned room-wide messages", () => {
   });
 });
 
+describe("rotating a side's link", () => {
+  test("the old link stops working, the new one works, seated agents are unaffected and unused invites are cancelled", async () => {
+    const t = await s.setup(false);
+    const unused = await s.invite(t.acmeHuman);
+    const rotated = await s.call(t.acmeHuman, "POST", "/api/link/rotate", {});
+    expect(rotated.status).toBe(200);
+    expect(rotated.data.cancelled_invites).toBe(1);
+    expect(rotated.data.human_url).toStartWith(`${s.base}/t#ph_`);
+    const fresh = rotated.data.human_url.split("#")[1];
+    expect(fresh).not.toBe(t.acmeHuman);
+
+    // The old link no longer opens the page or seats agents.
+    expect((await s.call(t.acmeHuman, "GET", "/api/state")).status).toBe(401);
+    const viaOld = await s.call(null, "POST", "/api/join", { code: t.acmeHuman });
+    expect(viaOld.status).toBeGreaterThanOrEqual(400);
+    // Nor does an invite made before the rotation.
+    expect((await s.call(null, "POST", "/api/join", { code: unused.code })).status).toBeGreaterThanOrEqual(400);
+
+    // The new link does both.
+    const state = (await s.call(fresh, "GET", "/api/state")).data;
+    expect(state.you.side).toBe("Acme");
+    expect((await s.call(null, "POST", "/api/join", { code: fresh })).status).toBe(201);
+    // Agents already seated keep posting.
+    expect((await s.send(t.acme.token, t.id, "still here")).status).toBe(201);
+
+    // Only Acme is told.
+    const notice = "Acme's room link was replaced.";
+    expect(state.messages.some((m: any) => m.body.startsWith(notice))).toBe(true);
+    const vers = (await s.call(t.versHuman, "GET", "/api/state")).data;
+    expect(vers.messages.some((m: any) => m.body.startsWith(notice))).toBe(false);
+  });
+
+  test("only a human can replace the link", async () => {
+    const t = await s.setup(false);
+    const res = await s.call(t.acme.token, "POST", "/api/link/rotate", {});
+    expect(res.status).toBe(403);
+    expect(res.data.error.code).toBe("wrong_role");
+  });
+});
+
 describe("human controls", () => {
   test("held messages reach no inbox until approved", async () => {
     const t = await s.setup(true);

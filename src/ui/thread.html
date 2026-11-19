@@ -262,6 +262,12 @@
           <button id="swap" style="margin-left:6px">Can't install?</button>
         </div>
       </fieldset>
+      <fieldset class="card" id="linkCard">
+        <legend>My side's link</legend>
+        <div class="muted" style="margin-bottom:8px">Anyone holding this page's link acts for your side. If it leaked, replace it: the old link stops working, agents already here keep working, and open invites are cancelled.</div>
+        <button id="rotate" type="button">Replace link</button>
+        <div id="rotated" class="muted" style="margin-top:8px; overflow-wrap:anywhere" hidden></div>
+      </fieldset>
       <fieldset class="card">
         <legend>If my agent is not running</legend>
         <div class="muted" style="margin-bottom:8px">Post to this webhook (Slack-compatible) when messages for my agent sit unread.</div>
@@ -276,7 +282,8 @@
 </aside>
 </div>
 <script>
-  const token = location.hash.slice(1);
+  // The side's link token. Replacing the link swaps it here, so this page keeps working.
+  let token = location.hash.slice(1);
   const $ = (id) => document.getElementById(id);
   let version = -1;
   let current = null;
@@ -730,6 +737,7 @@
     if (document.activeElement !== $("notifyUrl")) $("notifyUrl").value = state.notify_url || "";
     $("notifyForm").hidden = !human;
     $("invite").hidden = !human;
+    $("linkCard").hidden = !human;
     $("composer").hidden = !human;
   }
 
@@ -760,6 +768,24 @@
     event.preventDefault();
     act(() => api("/api/settings", { notify_url: $("notifyUrl").value.trim() || null }));
   });
+  $("rotate").onclick = () => {
+    if (!confirm("Replace this side's link? The old link stops working for everyone who has it, and invites not yet used are cancelled. Agents already in the room are not affected.")) return;
+    act(async () => {
+      const res = await api("/api/link/rotate", {});
+      token = res.human_url.slice(res.human_url.indexOf("#") + 1);
+      history.replaceState(null, "", "#" + token);
+      showFallback = false;
+      invite = null;
+      showInvite();
+      const note = $("rotated");
+      note.replaceChildren(
+        "Replaced. This page now uses the new link; send it to your side and bookmark it: ",
+        el("code", "", res.human_url),
+        res.cancelled_invites ? " (" + res.cancelled_invites + " unused invite" + (res.cancelled_invites === 1 ? "" : "s") + " cancelled)" : "",
+      );
+      note.hidden = false;
+    });
+  };
   $("copy").onclick = async () => {
     await navigator.clipboard.writeText($("inviteText").value);
     $("copy").textContent = "Copied";
@@ -782,9 +808,13 @@
 
   async function loop() {
     for (;;) {
+      const sent = token;
       try {
         render(await api("/api/state?v=" + version + "&wait=25"));
       } catch (err) {
+        // Replacing the link wakes this poll, which can go out with the old token just before the page
+        // switches to the new one. That refusal is expected; poll again with the new token.
+        if (err.status === 401 && sent !== token) continue;
         $("status").textContent = err.status === 401 ? "access denied" : "reconnecting";
         $("status").className = "chip paused";
         if (err.status === 401) { $("error").textContent = err.message; $("layout").hidden = false; return; }
