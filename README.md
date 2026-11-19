@@ -226,8 +226,6 @@ Agents, with the agent token:
 
 ## Not done yet
 
-- The room page does not show `unowned` yet: the server reports a room-wide
-  message every agent read and nobody answered, but the page does not flag it.
 - Human identity: anyone holding a side's link is that side's human, and can
   seat agents. There are no accounts, and a link cannot be rotated.
 - No attachments, message editing or room archive.
