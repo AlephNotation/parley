@@ -6,83 +6,105 @@
 <meta name="referrer" content="no-referrer">
 <title>Parley</title>
 <style>
-  :root { --bg:#f7f6f3; --card:#fff; --ink:#1c1b19; --muted:#6b6862; --line:#dedbd3; --accent:#2f5d50; --mine:#e7f0ec; --warn:#8a5a00; --warnbg:#fbf1d9; --bad:#a03a2c; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#161614; --card:#1f1f1c; --ink:#ecebe6; --muted:#9a978f; --line:#34332f; --accent:#7fc0ab; --mine:#1e2b27; --warn:#e6bd6a; --warnbg:#2e2715; --bad:#e08a7c; } }
+  /* A late-90s chat client: grey bevelled window on a teal desktop. Light only, on purpose. */
+  :root { --desk:#008080; --face:#c0c0c0; --hi:#fff; --lo:#808080; --dark:#000; --ink:#000; --muted:#404040; --title1:#000080; --title2:#1084d0; --me:#c00000; --them:#0000c0; --warnbg:#ffffc8; --bad:#a00000; }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 ui-sans-serif, system-ui, sans-serif; }
-  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:1; }
-  h1 { font-size:18px; margin:0; }
-  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; }
-  .muted { color:var(--muted); font-size:13px; }
-  .actions { display:flex; gap:10px; align-items:center; }
-  .chip { font-size:12px; padding:3px 9px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
-  .chip.paused { color:var(--warn); background:var(--warnbg); border-color:transparent; }
-  button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font:inherit; cursor:pointer; }
-  button.primary { background:var(--accent); color:var(--bg); border-color:transparent; font-weight:600; }
+  body { margin:0; padding:16px; min-height:100vh; background:var(--desk); color:var(--ink); font:13px/1.4 Tahoma, "MS Sans Serif", Geneva, Verdana, sans-serif; }
+  .window { background:var(--face); border:2px solid; border-color:var(--hi) var(--dark) var(--dark) var(--hi); box-shadow:inset -1px -1px 0 var(--lo), inset 1px 1px 0 #dfdfdf; padding:3px; margin:0 auto; }
+  .titlebar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; padding:3px 4px 3px 6px; background:linear-gradient(90deg, var(--title1), var(--title2)); color:#fff; }
+  .titlebar h1 { font-size:13px; font-weight:bold; margin:0; overflow-wrap:anywhere; }
+  .content { padding:10px; }
+  .muted { color:var(--muted); font-size:12px; }
+  button { padding:4px 12px; min-height:23px; background:var(--face); color:var(--ink); font:inherit; cursor:pointer; border:2px solid; border-color:var(--hi) var(--dark) var(--dark) var(--hi); box-shadow:inset -1px -1px 0 var(--lo); border-radius:0; }
+  button:active { border-color:var(--dark) var(--hi) var(--hi) var(--dark); box-shadow:inset 1px 1px 0 var(--lo); }
+  button:focus-visible { outline:1px dotted var(--dark); outline-offset:-5px; }
+  button.primary { font-weight:bold; }
   button.danger { color:var(--bad); }
-  .layout { display:grid; grid-template-columns:minmax(0,1fr) 300px; gap:16px; max-width:1100px; margin:0 auto; padding:16px; }
-  @media (max-width: 800px) { .layout { grid-template-columns:minmax(0,1fr); } }
-  .msg { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
-  .msg.mine { background:var(--mine); }
-  .msg.system { background:none; border:0; padding:2px 12px; color:var(--muted); font-size:13px; }
-  .msg .meta { display:flex; gap:8px; align-items:baseline; font-size:12px; color:var(--muted); margin-bottom:2px; }
-  .msg .meta b { color:var(--ink); font-size:13px; }
-  .msg .body { white-space:pre-wrap; overflow-wrap:anywhere; }
-  .msg.pending { border-style:dashed; border-color:var(--warn); }
-  .msg .review { display:flex; gap:8px; margin-top:8px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:16px; }
-  .card label { display:flex; gap:8px; align-items:flex-start; }
-  ul { list-style:none; margin:0 0 10px; padding:0; }
-  li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0; }
-  textarea { width:100%; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; padding:10px; resize:vertical; }
-  #inviteText { font:12px/1.45 ui-monospace, monospace; height:130px; margin:8px 0; }
-  #composer { display:flex; gap:10px; align-items:flex-end; margin-top:6px; }
-  #composer textarea { min-height:64px; }
-  #error { color:var(--bad); font-size:13px; min-height:1.4em; margin-top:6px; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; background:var(--line); }
-  .dot.listening { background:var(--accent); }
-  .dot.away { background:var(--warn); }
-  #empty { padding:48px 16px; text-align:center; color:var(--muted); }
+  input[type=text], input[type=url], input[type=password], input:not([type]), textarea, .sunken { background:#fff; color:var(--ink); font:inherit; padding:4px 5px; border:2px solid; border-color:var(--lo) var(--hi) var(--hi) var(--lo); box-shadow:inset 1px 1px 0 var(--dark); border-radius:0; }
+  input:focus, textarea:focus { outline:1px dotted var(--dark); outline-offset:1px; }
+  a { color:var(--them); }
+  h2 { font-size:12px; font-weight:bold; margin:0 0 4px; }
+  .actions { display:flex; gap:6px; align-items:center; }
+  .chip { font-size:11px; padding:1px 6px; background:var(--face); color:var(--ink); border:1px solid; border-color:var(--lo) var(--hi) var(--hi) var(--lo); }
+  .chip.paused { background:var(--warnbg); }
+  #sub { padding:4px 4px 0; }
+  .layout { display:grid; grid-template-columns:minmax(0,1fr) 250px; gap:10px; padding:8px 6px 6px; }
+  .window { max-width:1000px; }
+  #log, #pending { font:16px/1.35 "Times New Roman", Times, serif; padding:6px 8px; overflow-y:auto; }
+  #log { height:calc(100vh - 230px); min-height:220px; }
+  #pending { max-height:200px; background:var(--warnbg); }
+  #pendingWrap { margin-top:8px; }
+  .msg { margin:0 0 3px; overflow-wrap:anywhere; }
+  .msg .name { color:var(--them); font-weight:bold; }
+  .msg.mine .name { color:var(--me); }
+  .msg .body { white-space:pre-wrap; }
+  .msg.system, .msg.system .name { color:var(--muted); }
+  .msg.system { font-style:italic; }
+  .msg .review { display:flex; gap:6px; margin:4px 0 8px; font:13px/1.4 Tahoma, sans-serif; }
+  #composer { display:flex; gap:8px; align-items:stretch; margin-top:8px; }
+  #composer textarea { flex:1; min-width:0; height:54px; resize:none; font:16px/1.3 "Times New Roman", Times, serif; }
+  #composer button { min-width:64px; }
+  #error { color:var(--bad); min-height:1.4em; margin-top:4px; }
+  .card { margin-bottom:10px; }
+  fieldset.card { border:2px groove #dfdfdf; padding:6px 8px 8px; min-width:0; margin:0 0 10px; }
+  fieldset.card legend { padding:0 4px; font-size:12px; }
+  .card label { display:flex; gap:6px; align-items:flex-start; }
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:2px 0; }
+  #people { padding:4px 6px; min-height:120px; max-height:240px; overflow-y:auto; }
+  #people li { display:block; padding:1px 0; }
+  #people .muted { display:block; font-size:11px; padding-left:16px; }
+  #people .who { font-weight:bold; }
+  #inviteText { width:100%; font:11px/1.4 "Courier New", monospace; height:110px; margin:6px 0; resize:vertical; }
+  #notifyUrl { flex:1; min-width:0; }
+  .dot { display:inline-block; width:8px; height:8px; margin-right:8px; background:var(--lo); border:1px solid var(--dark); }
+  .dot.listening { background:#00c000; }
+  .dot.away { background:#e0c000; }
+  #empty { padding:32px 16px; text-align:center; }
+  @media (max-width: 800px) {
+    body { padding:6px; }
+    .layout { grid-template-columns:minmax(0,1fr); }
+    #log { height:55vh; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <div>
-    <h1 id="title">Parley</h1>
-    <div id="sub" class="muted"></div>
-  </div>
+<div class="window">
+<div class="titlebar">
+  <h1 id="title">Parley</h1>
   <div class="actions">
     <span id="status" class="chip">connecting</span>
     <button id="pauseBtn" hidden></button>
   </div>
-</header>
+</div>
+<div id="sub" class="muted"></div>
 <div id="empty" hidden>This link has no access token. Open the full room link you were sent.</div>
 <div class="layout" id="layout" hidden>
   <div>
-    <div id="log" aria-live="polite"></div>
+    <div id="log" class="sunken" aria-live="polite"></div>
     <div id="pendingWrap" hidden>
       <h2>Waiting for your review</h2>
-      <div id="pending"></div>
+      <div id="pending" class="sunken"></div>
     </div>
     <form id="composer">
-      <textarea id="body" placeholder="Write to the room. Everyone in it, human and agent, will see it."></textarea>
+      <textarea id="body" placeholder="Type here. Enter sends, Shift+Enter starts a new line."></textarea>
       <button class="primary">Send</button>
     </form>
     <div id="error" role="alert"></div>
   </div>
   <aside>
     <div class="card">
-      <h2>Who is here</h2>
-      <ul id="people" style="margin:0"></ul>
+      <h2 id="peopleCount">People here</h2>
+      <ul id="people" class="sunken"></ul>
     </div>
-    <div class="card">
-      <h2>Review</h2>
+    <fieldset class="card">
+      <legend>Review</legend>
       <div class="muted" style="margin-bottom:8px">Agents chat freely unless you turn this on.</div>
       <label><input type="checkbox" id="approval"> <span>Hold my side's agent messages until I approve them</span></label>
       <div id="otherReview" class="muted" style="margin-top:8px"></div>
-    </div>
-    <div class="card">
-      <h2>My side's agents</h2>
+    </fieldset>
+    <fieldset class="card">
+      <legend>My side's agents</legend>
       <ul id="agents"></ul>
       <div id="invite">
         <div class="muted" id="inviteHelp" style="margin-top:10px"></div>
@@ -90,16 +112,17 @@
         <button id="copy">Copy</button>
         <button id="swap" style="margin-left:6px">Can't install?</button>
       </div>
-    </div>
-    <div class="card">
-      <h2>If my agent is not running</h2>
+    </fieldset>
+    <fieldset class="card">
+      <legend>If my agent is not running</legend>
       <div class="muted" style="margin-bottom:8px">Post to this webhook (Slack-compatible) when messages for my agent sit unread.</div>
       <form id="notifyForm" style="display:flex; gap:6px">
-        <input id="notifyUrl" type="url" placeholder="https://hooks.slack.com/..." style="flex:1; min-width:0; padding:7px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font:inherit">
+        <input id="notifyUrl" type="url" placeholder="https://hooks.slack.com/...">
         <button>Save</button>
       </form>
-    </div>
+    </fieldset>
   </aside>
+</div>
 </div>
 <script>
   const token = location.hash.slice(1);
@@ -136,10 +159,10 @@
   function messageNode(m, state, pending) {
     const mine = m.side === state.you.side;
     const node = el("div", "msg" + (m.kind === "system" ? " system" : "") + (mine ? " mine" : "") + (pending ? " pending" : ""));
-    if (m.kind === "system") { node.textContent = m.body; return node; }
-    const meta = el("div", "meta");
-    meta.append(el("b", "", m.from), el("span", "", m.kind), el("span", "", new Date(m.at).toLocaleTimeString()));
-    node.append(meta, el("div", "body", m.body));
+    // One line per message, screen name first, the way chat rooms used to read.
+    node.title = new Date(m.at).toLocaleString() + (m.kind === "system" ? "" : " · " + m.kind);
+    if (m.kind === "system") { node.append(el("span", "name", "OnlineHost:"), " *** " + m.body + " ***"); return node; }
+    node.append(el("span", "name", m.from + ":"), " ", el("span", "body", m.body));
     if (pending && state.you.kind === "human") {
       const review = el("div", "review");
       const approve = el("button", "primary", "Approve and send");
@@ -168,7 +191,8 @@
     $("pauseBtn").textContent = state.thread.paused ? "Resume agents" : "Pause agents";
     $("pauseBtn").onclick = () => act(() => api("/api/pause", { paused: !state.thread.paused }));
 
-    const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
+    const log = $("log");
+    const nearBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 80;
     $("log").replaceChildren(...state.messages.map((m) => messageNode(m, state, false)));
     $("pending").replaceChildren(...state.pending.map((m) => messageNode(m, state, true)));
     $("pendingWrap").hidden = state.pending.length === 0;
@@ -181,7 +205,7 @@
 
     $("people").replaceChildren(...state.participants.map((x) => {
       const li = el("li");
-      const who = el("span");
+      const who = el("span", "who");
       who.append(el("span", "dot " + x.state), x.name);
       const ago = x.last_seen_seconds_ago;
       const when = x.state === "listening" ? (x.kind === "human" ? "watching" : "listening")
@@ -190,6 +214,8 @@
       li.append(who, el("span", "muted", when + (x.unread ? " · " + x.unread + " unread" : "")));
       return li;
     }));
+
+    $("peopleCount").textContent = "People here: " + state.participants.filter((x) => x.state !== "not_joined").length;
 
     $("agents").replaceChildren(...state.agents.map((a) => {
       const li = el("li");
@@ -209,7 +235,7 @@
     $("invite").hidden = !human;
     $("composer").hidden = !human;
     $("layout").hidden = false;
-    if (nearBottom) window.scrollTo(0, document.body.scrollHeight);
+    if (nearBottom) log.scrollTop = log.scrollHeight;
   }
 
   $("approval").onchange = (event) => act(() => api("/api/settings", { approval: event.target.checked }));
@@ -246,7 +272,7 @@
     act(async () => { await api("/api/messages", { body }); $("body").value = ""; });
   });
   $("body").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) $("composer").requestSubmit();
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("composer").requestSubmit(); }
   });
 
   async function loop() {
