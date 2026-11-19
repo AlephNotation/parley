@@ -42,6 +42,12 @@ export interface AppOptions {
   sweepIntervalMs?: number;
   /** Allow notification webhooks to plain-http and private hosts. For local development and tests only. */
   allowPrivateWebhooks?: boolean;
+  /** Rooms one client address may create per hour without the admin token. 0 turns the limit off. */
+  roomLimit?: number;
+  /** Messages one participant may post per minute. 0 turns the limit off. */
+  postLimit?: number;
+  /** Use the first X-Forwarded-For address as the client's, for a server behind a proxy. */
+  trustProxy?: boolean;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -56,8 +62,38 @@ class HttpError extends Error {
     public code: string,
     message: string,
     public hint?: string,
+    /** Seconds until the request may succeed, sent as Retry-After. */
+    public retryAfter?: number,
   ) {
     super(message);
+  }
+}
+
+/**
+ * Counts events per key in a sliding window, in memory. Limits reset when the server restarts,
+ * which is acceptable for a single process; see "Not done yet" on running several.
+ */
+class RateLimit {
+  private hits = new Map<string, number[]>();
+  constructor(
+    private limit: number,
+    private windowMs: number,
+  ) {}
+  /** Records one event for `key`, or returns the seconds until one is allowed. */
+  take(key: string, now = Date.now()): number | null {
+    if (this.limit <= 0) return null;
+    const recent = (this.hits.get(key) ?? []).filter((t) => t > now - this.windowMs);
+    if (recent.length >= this.limit) {
+      this.hits.set(key, recent);
+      return Math.max(1, Math.ceil((recent[0]! + this.windowMs - now) / 1000));
+    }
+    recent.push(now);
+    this.hits.set(key, recent);
+    if (this.hits.size > 10_000) this.prune(now);
+    return null;
+  }
+  private prune(now: number) {
+    for (const [key, times] of this.hits) if (!times.some((t) => t > now - this.windowMs)) this.hits.delete(key);
   }
 }
 
@@ -117,6 +153,8 @@ function slug(value: string): string {
 export function createApp(opts: AppOptions) {
   const db = openDb(opts.dbPath ?? ":memory:");
   const streakLimit = opts.streakLimit ?? 30;
+  const roomLimit = new RateLimit(opts.roomLimit ?? 10, 60 * 60 * 1000);
+  const postLimit = new RateLimit(opts.postLimit ?? 30, 60 * 1000);
   const maxWait = opts.maxWaitSeconds ?? 240;
   const notifyDelayMs = opts.notifyDelayMs ?? 120_000;
   const pageMessages = opts.pageMessages ?? 1000;
@@ -554,8 +592,22 @@ export function createApp(opts: AppOptions) {
 
   // ---- threads and humans -------------------------------------------------
 
-  async function createThread(req: Request): Promise<Response> {
+  async function createThread(req: Request, address: string): Promise<Response> {
     if (opts.openRooms === false) requireAdmin(req);
+    // The admin token is never limited; anyone else is limited per client address.
+    const admin = bearer(req);
+    if (!admin || !safeEqual(admin, opts.adminToken)) {
+      const wait = roomLimit.take(address);
+      if (wait !== null) {
+        throw new HttpError(
+          429,
+          "room_limit",
+          `Too many rooms created from this address; try again in ${wait}s.`,
+          "Reuse a room you already have, or ask whoever runs the server for the admin token or a higher PARLEY_ROOM_LIMIT.",
+          wait,
+        );
+      }
+    }
     const input = await readJson(req);
     const title = typeof input.title === "string" ? input.title.trim() : "";
     if (!title || title.length > 200) throw new HttpError(400, "bad_title", '"title" must be a string of 1-200 characters.');
@@ -798,6 +850,16 @@ export function createApp(opts: AppOptions) {
 
   function post(p: ParticipantRow, draft: Draft): Response {
     const { body, to, fyi } = draft;
+    const wait = postLimit.take(p.id);
+    if (wait !== null) {
+      throw new HttpError(
+        429,
+        "rate_limited",
+        `You are posting too fast; try again in ${wait}s.`,
+        "Put several points in one message instead of many short ones.",
+        wait,
+      );
+    }
     if (to) {
       const found = resolveRecipients(p.thread_id, to);
       if (found.unknown.length) {
@@ -1124,7 +1186,7 @@ export function createApp(opts: AppOptions) {
 
   // ---- routing ------------------------------------------------------------
 
-  async function route(req: Request): Promise<Response> {
+  async function route(req: Request, address: string): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const method = req.method;
@@ -1139,7 +1201,7 @@ export function createApp(opts: AppOptions) {
     if (method === "GET" && (match = /^\/dl\/(parley-[a-z0-9]+-[a-z0-9]+(?:\.gz)?)$/.exec(path))) return clientDownload(match[1]!, opts.distDir);
 
     // Humans, authenticated by a thread link token.
-    if (method === "POST" && path === "/api/threads") return createThread(req);
+    if (method === "POST" && path === "/api/threads") return createThread(req, address);
     if (method === "GET" && path === "/api/state") return getState(req, url);
     if (method === "POST" && path === "/api/messages") {
       const p = authHuman(req);
@@ -1171,12 +1233,17 @@ export function createApp(opts: AppOptions) {
     throw new HttpError(404, "not_found", `No route for ${method} ${path}.`, "Agents: GET /api/agent returns the full API instructions.");
   }
 
-  async function fetchHandler(req: Request): Promise<Response> {
+  /** Bun passes the server as the second argument; it knows the connection's address. */
+  async function fetchHandler(req: Request, server?: { requestIP(req: Request): { address: string } | null }): Promise<Response> {
+    const forwarded = opts.trustProxy ? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() : undefined;
+    const address = forwarded || server?.requestIP(req)?.address || "unknown";
     try {
-      return await route(req);
+      return await route(req, address);
     } catch (err) {
       if (err instanceof HttpError) {
-        return json({ error: { code: err.code, message: err.message, hint: err.hint } }, err.status);
+        const res = json({ error: { code: err.code, message: err.message, hint: err.hint } }, err.status);
+        if (err.retryAfter !== undefined) res.headers.set("retry-after", String(err.retryAfter));
+        return res;
       }
       console.error(err);
       return json({ error: { code: "internal", message: "Internal server error." } }, 500);

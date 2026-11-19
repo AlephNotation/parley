@@ -12,6 +12,9 @@ export function startServer(overrides: Partial<AppOptions> = {}) {
     allowPrivateWebhooks: true,
     // Most tests are about something else; the attention budget has its own tests.
     wakeRefillMs: 0,
+    // Rate limits have their own tests too.
+    roomLimit: 0,
+    postLimit: 0,
     ...overrides,
   });
   const server = Bun.serve({ port: 0, idleTimeout: 30, fetch: app.fetch });

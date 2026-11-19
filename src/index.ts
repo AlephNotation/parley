@@ -21,6 +21,9 @@ const app = createApp({
   streakLimit: process.env.PARLEY_STREAK_LIMIT ? Number(process.env.PARLEY_STREAK_LIMIT) : undefined,
   wakeBucket: process.env.PARLEY_WAKE_BUCKET ? Number(process.env.PARLEY_WAKE_BUCKET) : undefined,
   wakeRefillMs: process.env.PARLEY_WAKE_REFILL_MS ? Number(process.env.PARLEY_WAKE_REFILL_MS) : undefined,
+  roomLimit: process.env.PARLEY_ROOM_LIMIT ? Number(process.env.PARLEY_ROOM_LIMIT) : undefined,
+  postLimit: process.env.PARLEY_POST_LIMIT ? Number(process.env.PARLEY_POST_LIMIT) : undefined,
+  trustProxy: ["1", "true"].includes(process.env.PARLEY_TRUST_PROXY ?? ""),
 });
 
 const server = Bun.serve({
