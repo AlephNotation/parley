@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mail, startServer } from "./helpers";
+import { ADMIN, mail, startServer } from "./helpers";
 
 const CLIENT = join(import.meta.dir, "..", "client", "parley.ts");
 
@@ -760,5 +760,70 @@ describe("addressed messages (against a server speaking the audience contract)",
     } finally {
       fake.stop();
     }
+  });
+});
+
+describe("addressed messages end to end (real server, three agents)", () => {
+  /** Vers posts through the raw API; Acme and Globex are real client installs. */
+  async function threeSides() {
+    const created = await s.call(ADMIN, "POST", "/api/threads", {
+      title: "Three sides",
+      sides: [{ name: "Vers" }, { name: "Acme" }, { name: "Globex" }],
+    });
+    const [vers, acme, globex] = created.data.sides.map((side: { human_url: string }) => side.human_url.split("#")[1]) as string[];
+    const id = created.data.thread.id as string;
+    const versAgent = await s.seat(vers!);
+    const a = machine();
+    const g = machine();
+    expect((await a.run(["join", `${s.base}/t#${acme}`])).code).toBe(0);
+    expect((await g.run(["join", `${s.base}/t#${globex}`])).code).toBe(0);
+    return { id, vers: versAgent, acme: a, globex: g };
+  }
+
+  test("the addressed agent is told a reply is expected; the other sees it as context and is not woken", async () => {
+    const { id, vers, acme, globex } = await threeSides();
+    const globexWait = globex.spawn(["hook", "wait"], { stdin: hookJson(globex, "Stop"), env: { PARLEY_HOOK_WAIT: "1" } });
+    await Bun.sleep(300);
+    const posted = await s.call(vers.token, "POST", `/api/threads/${id}/messages`, { body: "Acme, can you check the 502s?", to: ["Acme"] });
+    expect(posted.status).toBe(201);
+
+    const toAcme = await acme.run(["read"]);
+    expect(toAcme.stdout).toContain("[to Acme]");
+    expect(toAcme.stdout).toMatch(/Expected: Addressed to you \(#\d+\): a reply is expected\./);
+
+    // Globex is not woken by mail addressed to Acme.
+    const early = await Promise.race([globexWait.exited, Bun.sleep(1500).then(() => "still waiting")]);
+    expect(early).toBe("still waiting");
+    globexWait.kill();
+    const toGlobex = await globex.run(["read"]);
+    expect(toGlobex.stdout).toContain("Acme, can you check the 502s?");
+    expect(toGlobex.stdout).toContain("[to Acme]");
+    expect(toGlobex.stdout).not.toContain("Addressed to you");
+  });
+
+  test("say --to by display name wakes that agent, --fyi wakes nobody, and an unknown name lists who can be addressed", async () => {
+    const { acme, globex } = await threeSides();
+    const globexWait = globex.spawn(["hook", "wait"], { stdin: hookJson(globex, "Stop"), env: { PARLEY_HOOK_WAIT: "2" } });
+    await Bun.sleep(300);
+    const direct = await acme.run(["say", "--to", "Globex Claude", "over to you"]);
+    expect(direct.code).toBe(0);
+    expect(direct.stdout).toContain("Globex Claude is listening and will be notified now.");
+    const [notice, code] = await Promise.all([new Response(globexWait.stderr).text(), globexWait.exited]);
+    expect(code).toBe(2);
+    expect(notice).toContain("Addressed to you");
+    await globex.run(["read"]);
+
+    const fyi = await acme.run(["say", "--fyi", "logs are in the usual place"]);
+    expect(fyi.code).toBe(0);
+    expect(fyi.stdout).toContain("is not woken by this");
+    const read = await globex.run(["read"]);
+    expect(read.stdout).toContain("[fyi]");
+    expect(read.stdout).toContain("For your information only: no reply is owed.");
+
+    const unknown = await acme.run(["say", "--to", "Initech", "hello?"]);
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain('No agent or side here is called "Initech"');
+    expect(unknown.stderr).toContain("You can address:");
+    expect(unknown.stderr).toContain("Globex");
   });
 });
