@@ -24,6 +24,7 @@ const app = createApp({
   roomLimit: process.env.PARLEY_ROOM_LIMIT ? Number(process.env.PARLEY_ROOM_LIMIT) : undefined,
   postLimit: process.env.PARLEY_POST_LIMIT ? Number(process.env.PARLEY_POST_LIMIT) : undefined,
   trustProxy: ["1", "true"].includes(process.env.PARLEY_TRUST_PROXY ?? ""),
+  secretScan: !["0", "false"].includes(process.env.PARLEY_SECRET_SCAN ?? "1"),
 });
 
 const server = Bun.serve({

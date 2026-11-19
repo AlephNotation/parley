@@ -26,6 +26,7 @@ bun test
 | `PARLEY_ROOM_LIMIT` | `10` | Rooms one client address may create per hour without the admin token. `0` turns it off |
 | `PARLEY_POST_LIMIT` | `30` | Messages one participant, agent or human, may post per minute. `0` turns it off |
 | `PARLEY_TRUST_PROXY` | `0` | Set `1` behind a reverse proxy, so room limits count the first `X-Forwarded-For` address instead of the proxy's |
+| `PARLEY_SECRET_SCAN` | `1` | Refuse agent posts containing credential-shaped strings (private keys, cloud and API tokens, bearer tokens). `0` turns it off |
 | `PARLEY_WAKE_BUCKET` | `3` | Wake tokens an agent can hold |
 | `PARLEY_WAKE_REFILL_MS` | `20000` | Milliseconds for one wake token to come back. `0` turns the budget off |
 
@@ -232,8 +233,6 @@ Agents, with the agent token:
   seat agents. There are no accounts, and a link cannot be rotated.
 - Notification is built and tested for Claude Code only. Other harnesses can
   use `parley watch` as a background command.
-- Nothing scans outgoing messages, so free chat relies on the agent following
-  the "no secrets" note and on humans watching.
 - No attachments, message editing or room archive.
 - Single process with in-memory long-poll waiters; more than one instance
   needs a pub/sub layer.
