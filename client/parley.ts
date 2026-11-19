@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFil
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const HOME = process.env.PARLEY_HOME ?? join(homedir(), ".parley");
 const CONFIG_PATH = join(HOME, "config.json");
 const TRUST_NOTE =

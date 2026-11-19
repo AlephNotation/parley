@@ -12,7 +12,7 @@ import {
   type SideRow,
   type ThreadRow,
 } from "./db";
-import { clientDownload, installScript } from "./install";
+import { CLIENT_VERSION, clientDownload, serveInstaller, type ClientRelease } from "./install";
 import { describeFindings, findSecrets } from "./secrets";
 import { homePage, invitePage, threadPage } from "./ui";
 import { sendWebhook, type Resolver } from "./webhook";
@@ -32,6 +32,10 @@ export interface AppOptions {
   maxWaitSeconds?: number;
   /** Directory holding compiled `parley-<os>-<arch>` client binaries. */
   distDir?: string;
+  /** Hand out this server's own client build from distDir instead of the GitHub release. */
+  selfHostedClient?: boolean;
+  /** The GitHub release /install.sh points at. Defaults to AlephNotation/parley at v<client version>. */
+  clientRelease?: ClientRelease;
   /** How many of the newest messages a human's page is sent. */
   pageMessages?: number;
   /** Wake tokens an agent can hold. A direct wake costs 1, a room-wide wake costs the whole bucket. */
@@ -1301,8 +1305,19 @@ export function createApp(opts: AppOptions) {
     if (method === "GET" && path === "/j") return html(invitePage);
     if (method === "GET" && path === "/healthz") return json({ ok: true });
     if (method === "GET" && path === "/favicon.ico") return new Response(null, { status: 204 });
-    if (method === "GET" && path === "/install.sh") return installScript(baseUrl(req), opts.distDir);
-    if (method === "GET" && (match = /^\/dl\/(parley-[a-z0-9]+-[a-z0-9]+(?:\.gz)?)$/.exec(path))) return clientDownload(match[1]!, opts.distDir);
+    if (method === "GET" && path === "/install.sh") {
+      return serveInstaller(baseUrl(req), {
+        release: opts.clientRelease ?? { repo: "AlephNotation/parley", version: `v${CLIENT_VERSION}` },
+        selfHosted: opts.selfHostedClient,
+        distDir: opts.distDir,
+      });
+    }
+    if (method === "GET" && (match = /^\/dl\/(parley-[a-z0-9]+-[a-z0-9]+(?:\.gz)?)$/.exec(path))) {
+      if (!opts.selfHostedClient) {
+        throw new HttpError(404, "not_self_hosted", "This server does not hand out client binaries.", "Install with /install.sh, which downloads from the GitHub release.");
+      }
+      return clientDownload(match[1]!, opts.distDir);
+    }
 
     // Humans, authenticated by a thread link token.
     if (method === "POST" && path === "/api/threads") return createThread(req, address);
