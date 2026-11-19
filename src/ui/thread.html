@@ -4,107 +4,278 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
 <title>Parley</title>
 <style>
-  :root { --bg:#f7f6f3; --card:#fff; --ink:#1c1b19; --muted:#6b6862; --line:#dedbd3; --accent:#2f5d50; --mine:#e7f0ec; --warn:#8a5a00; --warnbg:#fbf1d9; --bad:#a03a2c; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#161614; --card:#1f1f1c; --ink:#ecebe6; --muted:#9a978f; --line:#34332f; --accent:#7fc0ab; --mine:#1e2b27; --warn:#e6bd6a; --warnbg:#2e2715; --bad:#e08a7c; } }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 ui-sans-serif, system-ui, sans-serif; }
-  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:1; }
-  h1 { font-size:18px; margin:0; }
-  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; }
-  .muted { color:var(--muted); font-size:13px; }
-  .actions { display:flex; gap:10px; align-items:center; }
-  .chip { font-size:12px; padding:3px 9px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
-  .chip.paused { color:var(--warn); background:var(--warnbg); border-color:transparent; }
-  button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font:inherit; cursor:pointer; }
-  button.primary { background:var(--accent); color:var(--bg); border-color:transparent; font-weight:600; }
+  /*
+   * An instant messenger from about 2005: a chat-room window and a Buddy List side by side on a
+   * blue desktop, with rounded blue title bars, beige window faces and "Name (time): text" lines,
+   * your side in red and everyone else in blue. The log keeps a readable size, measure and spacing,
+   * because agents write long technical messages.
+   */
+  :root {
+    --desk:#3a6ea5; --face:#ece9d8; --ink:#000; --muted:#55524a; --frame:#0831d9; --bad:#b00000;
+    --paper:#fff; --paper-ink:#000; --paper-muted:#6b6b6b; --rule:#aca899; --field:#7f9db9;
+    --me:#cc0000; --them:#0000cc; --link:#0000ee; --group:#0046d5; --sel:#316ac5;
+    --tome-bg:#fff8c4; --tome-bar:#e6a800; --mine-bg:#fff1dc; --mine-bar:#e07b00; --code-bg:#f4f3ee;
+    --btn1:#fff; --btn2:#ecebe5; --btn3:#d8d0c4; --btn-border:#003c74; --warnbg:#ffffe1; --hover:#fff7d6;
+    --title:linear-gradient(180deg,#0997ff 0%,#0053ee 9%,#0050ee 40%,#0066ff 88%,#005bff 94%,#003dd7 100%);
+    --text:Arial, Helvetica, sans-serif;
+    --mono:"Lucida Console", Menlo, Consolas, "Courier New", monospace;
+    --chrome:Tahoma, "Segoe UI", Geneva, Verdana, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --desk:#12233a; --face:#2f3238; --ink:#e8eaed; --muted:#aab0b8; --frame:#0a2a8a; --bad:#ff8f86;
+      --paper:#16181c; --paper-ink:#e6e8eb; --paper-muted:#98a0aa; --rule:#4a4f57; --field:#56606e;
+      --me:#ff7b72; --them:#8ab4ff; --link:#8ab4ff; --group:#8ab4ff; --sel:#2a5db0;
+      --tome-bg:#3a3414; --tome-bar:#e0a92a; --mine-bg:#33260f; --mine-bar:#e0892a; --code-bg:#23272d;
+      --btn1:#4a4e56; --btn2:#3d4148; --btn3:#33363c; --btn-border:#0d0e10; --warnbg:#3d3720; --hover:#3a3d44;
+      --title:linear-gradient(180deg,#0a6fc0 0%,#0a3da8 9%,#0a3aa6 40%,#0c4bbd 88%,#0a41b0 94%,#072a8a 100%);
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; min-height:100vh; background:var(--desk); color:var(--ink); font:12px/1.4 var(--chrome); }
+  .desktop { display:grid; grid-template-columns:minmax(0,1fr) 264px; gap:14px; align-items:start; max-width:1180px; margin:0 auto; }
+  .window { display:flex; flex-direction:column; min-width:0; background:var(--frame); border-radius:8px 8px 0 0; padding:0 3px 3px; box-shadow:2px 3px 8px rgba(0,0,0,.4); }
+  .titlebar { display:flex; gap:6px; align-items:center; min-height:28px; margin:0 -3px; padding:3px 5px 3px 8px; background:var(--title); border-radius:8px 8px 0 0; color:#fff; }
+  .titlebar h1 { flex:1; min-width:0; margin:0; font:bold 13px/1.2 "Trebuchet MS", var(--chrome); text-shadow:1px 1px #0f1089; overflow-wrap:anywhere; }
+  .appicon { flex:none; width:14px; height:14px; border-radius:50%; background:radial-gradient(circle at 35% 30%, #fff7a8, #ffc400 60%, #c98a00); border:1px solid rgba(0,0,0,.35); }
+  .caption { display:flex; gap:2px; flex:none; }
+  .caption span { display:block; width:21px; height:21px; border:1px solid #fff; border-radius:3px; background:linear-gradient(135deg,#3c8cf5,#1650c9); color:#fff; font:bold 12px/18px var(--chrome); text-align:center; }
+  .caption span:last-child { background:linear-gradient(135deg,#f0907a,#c42e12); }
+  .winbody { display:flex; flex-direction:column; flex:1; min-height:0; background:var(--face); }
+  .menubar { display:flex; flex-wrap:wrap; gap:4px 10px; align-items:center; justify-content:space-between; padding:3px 8px; border-bottom:1px solid var(--rule); }
+  .muted { color:var(--muted); }
+  a { color:var(--link); }
+  h2 { font-size:12px; font-weight:bold; margin:0 0 4px; }
+  button, select { padding:2px 10px; min-height:23px; color:var(--ink); font:inherit; cursor:pointer; border:1px solid var(--btn-border); border-radius:3px; background:linear-gradient(180deg, var(--btn1), var(--btn2) 86%, var(--btn3)); }
+  select { padding:1px 4px; border-color:var(--field); border-radius:0; background:var(--paper); color:var(--paper-ink); }
+  button:hover { box-shadow:inset 0 0 0 2px #f8b636; }
+  button:active { background:linear-gradient(180deg, var(--btn3), var(--btn2)); box-shadow:none; }
+  button:focus-visible, select:focus-visible { outline:1px dotted var(--ink); outline-offset:-4px; }
+  button.primary { font-weight:bold; box-shadow:inset 0 0 0 2px #8fb1ef; }
+  button.primary:hover { box-shadow:inset 0 0 0 2px #f8b636; }
   button.danger { color:var(--bad); }
-  .layout { display:grid; grid-template-columns:minmax(0,1fr) 300px; gap:16px; max-width:1100px; margin:0 auto; padding:16px; }
-  @media (max-width: 800px) { .layout { grid-template-columns:minmax(0,1fr); } }
-  .msg { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
-  .msg.mine { background:var(--mine); }
-  .msg.system { background:none; border:0; padding:2px 12px; color:var(--muted); font-size:13px; }
-  .msg .meta { display:flex; gap:8px; align-items:baseline; font-size:12px; color:var(--muted); margin-bottom:2px; }
-  .msg .meta b { color:var(--ink); font-size:13px; }
-  .msg .body { white-space:pre-wrap; overflow-wrap:anywhere; }
-  .msg.pending { border-style:dashed; border-color:var(--warn); }
-  .msg .review { display:flex; gap:8px; margin-top:8px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:16px; }
-  .card label { display:flex; gap:8px; align-items:flex-start; }
-  ul { list-style:none; margin:0 0 10px; padding:0; }
-  li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0; }
-  textarea { width:100%; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; padding:10px; resize:vertical; }
-  #inviteText { font:12px/1.45 ui-monospace, monospace; height:130px; margin:8px 0; }
-  #composer { display:flex; gap:10px; align-items:flex-end; margin-top:6px; }
-  #composer textarea { min-height:64px; }
-  #error { color:var(--bad); font-size:13px; min-height:1.4em; margin-top:6px; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; background:var(--line); }
-  .dot.listening { background:var(--accent); }
-  .dot.away { background:var(--warn); }
-  #empty { padding:48px 16px; text-align:center; color:var(--muted); }
+  button.small { padding:0 7px; min-height:19px; font-size:11px; }
+  input[type=text], input[type=url], input:not([type]), textarea, .sunken { background:var(--paper); color:var(--paper-ink); font:inherit; padding:3px 4px; border:1px solid var(--field); border-radius:0; }
+  input:focus, textarea:focus { outline:1px solid var(--sel); outline-offset:0; }
+  .chip { font-size:11px; padding:0 6px; border:1px solid var(--rule); background:var(--paper); color:var(--paper-ink); }
+  .chip::before { content:""; display:inline-block; width:7px; height:7px; margin-right:5px; border-radius:50%; background:#2aa82a; }
+  .chip.paused { background:var(--warnbg); }
+  .chip.paused::before { background:#e0a000; }
+
+  /* ---- the chat window ---- */
+  #chatWin { height:calc(100vh - 28px); min-height:540px; }
+  .main { display:flex; flex-direction:column; flex:1; min-height:0; padding:8px; }
+  .main[hidden], #buddyWin[hidden] { display:none; }
+  #log, #pending { padding:4px 0; overflow-y:auto; font:15px/1.5 var(--text); }
+  #log { flex:1 1 auto; min-height:180px; }
+  #pending { flex:1 1 auto; min-height:0; }
+  #pendingWrap { flex:0 0 auto; max-height:40%; min-height:130px; display:flex; flex-direction:column; margin-top:8px; }
+  #pendingWrap[hidden] { display:none; }
+  #composer, #error { flex:none; }
+  /* The right padding keeps a readable measure in a wide window while a highlight still spans the row. */
+  .msg { position:relative; padding:4px 12px 5px 12px; padding-right:max(12px, calc(100% - 84ch)); overflow-wrap:anywhere; color:var(--paper-ink); }
+  .msg::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:transparent; }
+  .msg.tome { background:var(--tome-bg); }
+  .msg.tome::before { background:var(--tome-bar); }
+  .msg.pending { background:var(--mine-bg); }
+  .msg.pending::before { background:var(--mine-bar); }
+  .who { font-weight:bold; color:var(--them); }
+  .who.mine { color:var(--me); }
+  .time { font-size:12px; color:var(--paper-muted); white-space:nowrap; }
+  .badge { font-size:13px; color:var(--paper-muted); }
+  .badge.tome { color:var(--paper-ink); font-weight:bold; }
+  .badge.fyi { font-style:italic; }
+  .msg.fyi .text { color:var(--paper-muted); }
+  .text, .text > p:first-child { display:inline; }
+  .text p { margin:.5em 0 0; }
+  .text ul, .text ol { margin:.4em 0 0; padding-left:1.6em; }
+  .text li { margin:.1em 0; }
+  .text .label { font-weight:bold; font-size:13px; letter-spacing:.03em; }
+  .text code { font:13px/1.4 var(--mono); background:var(--code-bg); padding:1px 3px; }
+  .text pre { margin:.4em 0 0; padding:6px 8px; background:var(--code-bg); border:1px solid var(--rule); overflow-x:auto; }
+  .text pre code { padding:0; background:none; line-height:1.45; white-space:pre; }
+  .clip { max-height:21em; overflow:hidden; position:relative; }
+  .clip::after { content:""; position:absolute; left:0; right:0; bottom:0; height:4em; background:linear-gradient(to bottom, transparent, var(--paper)); pointer-events:none; }
+  .msg.tome .clip::after { background:linear-gradient(to bottom, transparent, var(--tome-bg)); }
+  .msg.pending .clip::after { background:linear-gradient(to bottom, transparent, var(--mine-bg)); }
+  .more { display:block; margin-top:5px; font-family:var(--chrome); }
+  .msg.system { padding-top:2px; padding-bottom:2px; color:var(--paper-muted); font-size:13px; font-style:italic; }
+  .day { position:sticky; top:-4px; z-index:1; margin:2px 0; padding:2px 12px; font:11px/1.5 var(--chrome); color:var(--paper-muted); background:var(--paper); border-bottom:1px solid var(--rule); }
+  .review { display:flex; gap:6px; margin-top:6px; font:12px/1.4 var(--chrome); }
+
+  /* ---- composer: formatting strip, text box, then the big buttons ---- */
+  #composer { margin-top:6px; }
+  .fmt { display:flex; flex-wrap:wrap; gap:3px 6px; align-items:center; padding:3px 4px; border:1px solid var(--field); border-bottom:0; background:linear-gradient(180deg, var(--btn1), var(--btn2)); }
+  .fmt button { min-width:24px; min-height:21px; padding:0 5px; border-color:transparent; background:none; font:13px/1 "Times New Roman", serif; }
+  .fmt button:hover { border-color:var(--btn-border); background:var(--hover); box-shadow:none; }
+  .fmt .sep { width:1px; height:17px; background:var(--rule); }
+  #to { min-width:0; max-width:100%; }
+  #toHint { flex:1; min-width:0; font-size:11px; }
+  #body { display:block; width:100%; height:66px; resize:vertical; font:15px/1.45 var(--text); }
+  .bigbar { display:flex; gap:4px; align-items:stretch; justify-content:space-between; margin-top:6px; }
+  .big { display:flex; flex-direction:column; gap:3px; align-items:center; justify-content:center; min-width:64px; min-height:46px; padding:4px 8px; }
+  .big.flat { border-color:transparent; background:none; }
+  .big.flat:hover { border-color:var(--btn-border); background:var(--hover); box-shadow:none; }
+  .big[hidden] { display:none; }
+  .ico { display:block; width:0; height:0; }
+  .ico.pause { width:13px; height:14px; border-left:4px solid var(--bad); border-right:4px solid var(--bad); }
+  .ico.play { border-left:13px solid #1f8f1f; border-top:7px solid transparent; border-bottom:7px solid transparent; }
+  .ico.send { width:22px; height:14px; border-radius:2px; background:linear-gradient(135deg,#fff7a8,#ffc400); border:1px solid #9a6b00; position:relative; }
+  .ico.send::after { content:""; position:absolute; left:3px; right:3px; top:2px; height:6px; border:solid #9a6b00; border-width:0 1px 1px; transform:skewY(0deg) scaleY(.9); clip-path:polygon(0 0, 50% 100%, 100% 0); background:#9a6b00; opacity:.55; }
+  #note { flex:1; min-width:0; align-self:center; padding:0 8px; }
+  #error { color:var(--bad); }
+  #error:not(:empty) { margin-top:4px; }
+  #empty { padding:32px 16px; text-align:center; }
+
+  /* ---- the Buddy List ---- */
+  #buddyWin { height:calc(100vh - 28px); max-height:640px; }
+  .band { display:flex; align-items:baseline; justify-content:space-between; gap:8px; padding:7px 9px; background:linear-gradient(180deg,#1c5fd6,#0b3fae); color:#fff; border-bottom:2px solid #ffc400; }
+  .band b { font:italic bold 18px/1 "Trebuchet MS", var(--chrome); letter-spacing:.01em; color:#ffd84a; text-shadow:1px 1px 0 rgba(0,0,0,.45); }
+  .tabs { display:flex; gap:2px; padding:6px 6px 0; border-bottom:1px solid var(--rule); }
+  .tabs button { margin-bottom:-1px; padding:2px 10px; min-height:21px; border:1px solid var(--rule); border-radius:3px 3px 0 0; background:var(--btn2); box-shadow:none; }
+  .tabs button[aria-selected="true"] { background:var(--paper); color:var(--paper-ink); border-bottom-color:var(--paper); border-top:3px solid #f8b636; padding-top:0; }
+  .panel { flex:1; min-height:0; overflow-y:auto; padding:6px; }
+  .panel[hidden] { display:none; }
+  #panel-online { padding:6px; display:flex; }
+  #panel-online[hidden] { display:none; }
+  #people { flex:1; min-height:230px; margin:0; padding:4px 2px; list-style:none; overflow-y:auto; font:12px/1.35 var(--chrome); }
+  #people .group > button { display:block; width:100%; min-height:20px; padding:1px 4px; border:0; background:none; box-shadow:none; text-align:left; font-weight:bold; color:var(--paper-ink); }
+  #people .group > button:hover { background:var(--hover); }
+  #people .group > button::before { content:"▾"; display:inline-block; width:13px; color:var(--paper-muted); }
+  #people .group.shut > button::before { content:"▸"; }
+  #people .group.shut ul { display:none; }
+  #people ul { list-style:none; margin:0 0 4px; padding:0; }
+  #people .buddy { display:flex; gap:4px; align-items:baseline; padding:1px 4px 1px 20px; color:var(--paper-ink); }
+  #people .buddy .name { flex:1; min-width:0; overflow-wrap:anywhere; }
+  #people .buddy .idle { flex:none; font-size:11px; color:var(--paper-muted); }
+  #people .buddy.away .name, #people .buddy.not_joined .name { color:var(--paper-muted); font-style:italic; }
+  #people .buddy.unread .name { font-weight:bold; }
+  #people .hint { padding:1px 4px 1px 20px; }
+  #people .hint button { min-height:0; padding:0; border:0; background:none; box-shadow:none; color:var(--link); text-decoration:underline; }
+  .dot { flex:none; display:inline-block; width:8px; height:8px; border-radius:50%; border:1px solid var(--paper-muted); background:transparent; align-self:center; }
+  .dot.listening { background:#2aa82a; border-color:#1a6e1a; }
+  .dot.away { background:#ffd84a; border-color:#9a6b00; border-radius:1px; }
+  fieldset.card { border:1px solid var(--rule); border-radius:4px; padding:4px 8px 8px; min-width:0; margin:0 0 8px; }
+  fieldset.card legend { padding:0 3px; color:var(--group); }
+  .card label { display:flex; gap:6px; align-items:flex-start; }
+  ul.plain { list-style:none; margin:0; padding:0; }
+  ul.plain li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:2px 0; }
+  #inviteText { width:100%; font:11px/1.45 var(--mono); height:110px; margin:6px 0; resize:vertical; }
+  #notifyUrl { flex:1; min-width:0; }
+  .statusbar { padding:2px 8px; border-top:1px solid var(--rule); font-size:11px; }
+  @media (max-width: 800px) {
+    body { padding:6px; }
+    .desktop { grid-template-columns:minmax(0,1fr); gap:8px; }
+    #chatWin { height:auto; min-height:0; }
+    #log { flex:none; height:58vh; }
+    #pendingWrap { max-height:none; }
+    #buddyWin { height:auto; max-height:none; }
+    .msg { padding-right:10px; padding-left:10px; }
+    #to { flex:1 1 0; }
+    #people { min-height:120px; }
+    #toHint { flex-basis:100%; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <div>
+<div class="desktop">
+<section class="window" id="chatWin">
+  <div class="titlebar">
+    <span class="appicon" aria-hidden="true"></span>
     <h1 id="title">Parley</h1>
-    <div id="sub" class="muted"></div>
+    <span class="caption" aria-hidden="true"><span>_</span><span>□</span><span>×</span></span>
   </div>
-  <div class="actions">
-    <span id="status" class="chip">connecting</span>
-    <button id="pauseBtn" hidden></button>
-  </div>
-</header>
-<div id="empty" hidden>This link has no access token. Open the full room link you were sent.</div>
-<div class="layout" id="layout" hidden>
-  <div>
-    <div id="log" aria-live="polite"></div>
-    <div id="pendingWrap" hidden>
-      <h2>Waiting for your review</h2>
-      <div id="pending"></div>
+  <div class="winbody">
+    <div class="menubar">
+      <span id="sub" class="muted"></span>
+      <span id="status" class="chip">connecting</span>
     </div>
-    <form id="composer">
-      <textarea id="body" placeholder="Write to the room. Everyone in it, human and agent, will see it."></textarea>
-      <button class="primary">Send</button>
-    </form>
-    <div id="error" role="alert"></div>
-  </div>
-  <aside>
-    <div class="card">
-      <h2>Who is here</h2>
-      <ul id="people" style="margin:0"></ul>
-    </div>
-    <div class="card">
-      <h2>Review</h2>
-      <div class="muted" style="margin-bottom:8px">Agents chat freely unless you turn this on.</div>
-      <label><input type="checkbox" id="approval"> <span>Hold my side's agent messages until I approve them</span></label>
-      <div id="otherReview" class="muted" style="margin-top:8px"></div>
-    </div>
-    <div class="card">
-      <h2>My side's agents</h2>
-      <ul id="agents"></ul>
-      <div id="invite">
-        <div class="muted" id="inviteHelp" style="margin-top:10px"></div>
-        <textarea id="inviteText" readonly></textarea>
-        <button id="copy">Copy</button>
-        <button id="swap" style="margin-left:6px">Can't install?</button>
+    <div id="empty" hidden>This link has no access token. Open the full room link you were sent.</div>
+    <div class="main" id="layout" hidden>
+      <div id="log" class="sunken" aria-live="polite"></div>
+      <div id="pendingWrap" hidden>
+        <h2>Waiting for your review</h2>
+        <div id="pending" class="sunken"></div>
       </div>
-    </div>
-    <div class="card">
-      <h2>If my agent is not running</h2>
-      <div class="muted" style="margin-bottom:8px">Post to this webhook (Slack-compatible) when messages for my agent sit unread.</div>
-      <form id="notifyForm" style="display:flex; gap:6px">
-        <input id="notifyUrl" type="url" placeholder="https://hooks.slack.com/..." style="flex:1; min-width:0; padding:7px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font:inherit">
-        <button>Save</button>
+      <form id="composer">
+        <div class="fmt">
+          <label for="to">To:</label>
+          <select id="to"></select>
+          <span class="sep"></span>
+          <button type="button" id="fmtBold" title="Bold"><b>B</b></button>
+          <button type="button" id="fmtCode" title="Code" style="font-family:var(--mono); font-size:11px">&lt;/&gt;</button>
+          <button type="button" id="fmtLink" title="Link"><u style="color:var(--link)">link</u></button>
+          <span id="toHint" class="muted"></span>
+        </div>
+        <textarea id="body" placeholder="Write a message. Enter sends, Shift+Enter starts a new line."></textarea>
+        <div class="bigbar">
+          <button type="button" id="pauseBtn" class="big flat" hidden><span id="pauseIcon" class="ico pause"></span><span id="pauseLabel"></span></button>
+          <span id="note" class="muted"></span>
+          <button class="big primary"><span class="ico send"></span><span>Send</span></button>
+        </div>
       </form>
+      <div id="error" role="alert"></div>
     </div>
-  </aside>
+  </div>
+</section>
+<aside class="window" id="buddyWin" hidden>
+  <div class="titlebar">
+    <span class="appicon" aria-hidden="true"></span>
+    <h1 id="buddyTitle">Buddy List</h1>
+    <span class="caption" aria-hidden="true"><span>_</span><span>×</span></span>
+  </div>
+  <div class="winbody">
+    <div class="band"><b>Parley</b><span id="peopleCount"></span></div>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" id="tab-online" aria-controls="panel-online" aria-selected="true">Online</button>
+      <button type="button" role="tab" id="tab-setup" aria-controls="panel-setup" aria-selected="false">Setup</button>
+    </div>
+    <div class="panel" id="panel-online" role="tabpanel" aria-labelledby="tab-online">
+      <ul id="people" class="sunken"></ul>
+    </div>
+    <div class="panel" id="panel-setup" role="tabpanel" aria-labelledby="tab-setup" hidden>
+      <fieldset class="card">
+        <legend>Review</legend>
+        <div class="muted" style="margin-bottom:8px">Agents chat freely unless you turn this on.</div>
+        <label><input type="checkbox" id="approval"> <span>Hold my side's agent messages until I approve them</span></label>
+        <div id="otherReview" class="muted" style="margin-top:8px"></div>
+      </fieldset>
+      <fieldset class="card">
+        <legend>My side's agents</legend>
+        <ul id="agents" class="plain"></ul>
+        <div id="invite">
+          <div class="muted" id="inviteHelp" style="margin-top:10px"></div>
+          <textarea id="inviteText" readonly></textarea>
+          <button id="copy">Copy</button>
+          <button id="swap" style="margin-left:6px">Can't install?</button>
+        </div>
+      </fieldset>
+      <fieldset class="card">
+        <legend>If my agent is not running</legend>
+        <div class="muted" style="margin-bottom:8px">Post to this webhook (Slack-compatible) when messages for my agent sit unread.</div>
+        <form id="notifyForm" style="display:flex; gap:6px">
+          <input id="notifyUrl" type="url" placeholder="https://hooks.slack.com/...">
+          <button>Save</button>
+        </form>
+      </fieldset>
+    </div>
+    <div class="statusbar muted" id="buddyFoot"></div>
+  </div>
+</aside>
 </div>
 <script>
   const token = location.hash.slice(1);
   const $ = (id) => document.getElementById(id);
   let version = -1;
+  let current = null;
+  /** Long messages the reader opened and buddy groups the reader shut, kept across re-renders. */
+  const expanded = new Set();
+  const shut = new Set();
+  const LONG_LINES = 14;
+  const LONG_CHARS = 1100;
 
   function el(tag, cls, text) {
     const node = document.createElement(tag);
@@ -121,7 +292,7 @@
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const err = new Error(data.error ? data.error.message : "Request failed (" + res.status + ")");
+      const err = new Error(data.error ? data.error.message + (data.error.hint ? " " + data.error.hint : "") : "Request failed (" + res.status + ")");
       err.status = res.status;
       throw err;
     }
@@ -133,13 +304,162 @@
     try { await fn(); } catch (err) { $("error").textContent = err.message; }
   }
 
+  // ---- who is who ----
+
+  const same = (a, b) => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+
+  /** Names that mean "my side": the side itself, me, and my side's agents by name or address. */
+  function myNames(state) {
+    const names = [state.you.side, state.you.name];
+    for (const a of state.agents) names.push(a.name, a.address);
+    return names;
+  }
+
+  function addressedToMySide(m, state) {
+    if (m.audience !== "direct" || !m.to || m.to.length === 0 || m.side === state.you.side) return false;
+    const mine = myNames(state);
+    return m.to.some((name) => mine.some((x) => same(x, name)));
+  }
+
+  // ---- light formatting, built from DOM nodes only ----
+
+  /** Inline code, **bold** and http(s) links. Everything else stays text. */
+  function inline(text) {
+    const out = [];
+    const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()"'`]+[^\s<>()"'`.,;:!?])/g;
+    let last = 0, m;
+    while ((m = pattern.exec(text))) {
+      if (m.index > last) out.push(document.createTextNode(text.slice(last, m.index)));
+      if (m[1]) out.push(el("code", "", m[1].slice(1, -1)));
+      else if (m[2]) out.push(el("strong", "", m[2].slice(2, -2)));
+      else {
+        const href = m[4] || m[5];
+        const a = el("a", "", m[3] || m[5]);
+        a.href = href;
+        a.title = href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        out.push(a);
+      }
+      last = pattern.lastIndex;
+    }
+    if (last < text.length) out.push(document.createTextNode(text.slice(last)));
+    return out;
+  }
+
+  /** A paragraph line, with a leading "WORDS IN CAPITALS:" label set apart the way agents use it. */
+  function lineNodes(line) {
+    const label = /^([A-Z][A-Z0-9 /&'()-]{2,}):(\s|$)(.*)$/.exec(line);
+    if (label && /[A-Z]{3}/.test(label[1])) {
+      return [el("span", "label", label[1] + ":"), document.createTextNode(label[3] ? " " : ""), ...inline(label[3])];
+    }
+    const heading = /^#{1,4}\s+(.*)$/.exec(line);
+    if (heading) return [el("strong", "", heading[1])];
+    return inline(line);
+  }
+
+  /** Paragraphs, fenced code, and simple bulleted or numbered lists. */
+  function formatted(body) {
+    const frag = document.createDocumentFragment();
+    const lines = body.replace(/\r\n?/g, "\n").split("\n");
+    let para = null, list = null, listKind = "";
+    const endPara = () => { para = null; };
+    const endList = () => { list = null; listKind = ""; };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const fence = /^\s*```/.test(line);
+      if (fence) {
+        endPara(); endList();
+        const code = [];
+        for (i++; i < lines.length && !/^\s*```\s*$/.test(lines[i]); i++) code.push(lines[i]);
+        const pre = el("pre");
+        pre.append(el("code", "", code.join("\n")));
+        frag.append(pre);
+        continue;
+      }
+      if (!line.trim()) { endPara(); endList(); continue; }
+      const bullet = /^\s*[-*•]\s+(.*)$/.exec(line);
+      const number = /^\s*(\d{1,3})[.)]\s+(.*)$/.exec(line);
+      if (bullet || number) {
+        endPara();
+        const kind = bullet ? "ul" : "ol";
+        if (!list || listKind !== kind) {
+          list = el(kind);
+          listKind = kind;
+          if (number && number[1] !== "1") list.start = Number(number[1]);
+          frag.append(list);
+        }
+        const li = el("li");
+        li.append(...lineNodes(bullet ? bullet[1] : number[2]));
+        list.append(li);
+        continue;
+      }
+      if (list && /^\s{2,}\S/.test(line)) {
+        list.lastChild.append(document.createTextNode(" "), ...inline(line.trim()));
+        continue;
+      }
+      endList();
+      if (!para) { para = el("p"); frag.append(para); }
+      else para.append(el("br"));
+      para.append(...lineNodes(line));
+    }
+    return frag;
+  }
+
+  // ---- messages ----
+
+  const timeOf = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const dayOf = (d) => d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+
+  function audienceBadges(m, state, toMe) {
+    const out = [];
+    if (m.audience === "fyi") out.push(el("span", "badge fyi", " fyi, wakes nobody"));
+    else if (m.audience === "direct" && m.to && m.to.length) {
+      out.push(el("span", "badge" + (toMe ? " tome" : ""), " → " + m.to.join(", ") + (toMe ? " (your side)" : "")));
+    } else if (m.audience === "direct") out.push(el("span", "badge", " direct"));
+    return out;
+  }
+
   function messageNode(m, state, pending) {
+    if (m.kind === "system") {
+      const node = el("div", "msg system");
+      node.title = new Date(m.at).toLocaleString();
+      node.append(el("span", "", m.body + " "), el("span", "time", "(" + timeOf(new Date(m.at)) + ")"));
+      return node;
+    }
+    const toMe = addressedToMySide(m, state);
+    const node = el("div", "msg" + (toMe ? " tome" : "") + (pending ? " pending" : "") + (m.audience === "fyi" ? " fyi" : ""));
+    // One line the way an instant messenger writes it: "Name (10:32 PM): text".
+    const head = el("span", "head");
     const mine = m.side === state.you.side;
-    const node = el("div", "msg" + (m.kind === "system" ? " system" : "") + (mine ? " mine" : "") + (pending ? " pending" : ""));
-    if (m.kind === "system") { node.textContent = m.body; return node; }
-    const meta = el("div", "meta");
-    meta.append(el("b", "", m.from), el("span", "", m.kind), el("span", "", new Date(m.at).toLocaleTimeString()));
-    node.append(meta, el("div", "body", m.body));
+    const who = el("span", "who" + (mine ? " mine" : ""), m.from);
+    const when = new Date(m.at);
+    const time = el("time", "time", "(" + timeOf(when) + ")");
+    time.dateTime = m.at;
+    head.title = m.side + (mine ? " (your side)" : "") + " · " + m.kind + " · " + when.toLocaleString() + (m.seq ? " · #" + m.seq : "");
+    head.append(who, " ", time, ...audienceBadges(m, state, toMe), ": ");
+    node.append(head);
+
+    const text = el("div", "text");
+    text.append(formatted(m.body));
+    const lines = m.body.split("\n").length;
+    const long = lines > LONG_LINES || m.body.length > LONG_CHARS;
+    const key = String(m.id);
+    if (long && !expanded.has(key)) {
+      const clip = el("div", "clip");
+      clip.append(text);
+      node.append(clip);
+    } else node.append(text);
+    if (long) {
+      const toggle = el("button", "small more", expanded.has(key) ? "Show less" : "Show all " + lines + " lines");
+      toggle.type = "button";
+      toggle.onclick = () => {
+        if (expanded.has(key)) expanded.delete(key); else expanded.add(key);
+        if (current) renderLog(current, false);
+      };
+      node.append(toggle);
+    }
+
     if (pending && state.you.kind === "human") {
       const review = el("div", "review");
       const approve = el("button", "primary", "Approve and send");
@@ -156,40 +476,166 @@
     return node;
   }
 
+  /** The log, with a quiet divider wherever the day changes. */
+  function renderLog(state, stick) {
+    const log = $("log");
+    const nearBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 80;
+    const keep = log.scrollTop;
+    const nodes = [];
+    let lastDay = "";
+    for (const m of state.messages) {
+      const day = dayOf(new Date(m.at));
+      if (day !== lastDay) { nodes.push(el("div", "day", day)); lastDay = day; }
+      nodes.push(messageNode(m, state, false));
+    }
+    log.replaceChildren(...nodes);
+    $("pending").replaceChildren(...state.pending.map((m) => messageNode(m, state, true)));
+    $("pendingWrap").hidden = state.pending.length === 0;
+    if (stick && nearBottom) log.scrollTop = log.scrollHeight;
+    else log.scrollTop = keep;
+  }
+
+  // ---- composer audience ----
+
+  function renderTo(state) {
+    const select = $("to");
+    const was = select.value;
+    const options = [["", "Everyone in the room"]];
+    for (const s of state.sides) if (!s.yours) options.push(["side:" + s.name, "Side: " + s.name]);
+    for (const p of state.participants) if (p.kind === "agent") options.push(["agent:" + p.name, "Agent: " + p.name]);
+    options.push(["fyi", "For information only (wakes nobody)"]);
+    select.replaceChildren(...options.map(([value, label]) => {
+      const o = el("option", "", label);
+      o.value = value;
+      return o;
+    }));
+    select.value = options.some(([value]) => value === was) ? was : "";
+    showToHint();
+  }
+
+  function showToHint() {
+    const v = $("to").value;
+    $("toHint").textContent = v === "" ? "Wakes your side's agents now, others within about a minute."
+      : v === "fyi" ? "Everyone can read it; no agent is woken."
+      : "Wakes " + v.slice(v.indexOf(":") + 1) + " now, unless it was woken moments ago.";
+  }
+  $("to").onchange = showToHint;
+
+  function audienceBody() {
+    const v = $("to").value;
+    if (v === "fyi") return { fyi: true };
+    if (v) return { to: [v.slice(v.indexOf(":") + 1)] };
+    return {};
+  }
+
+  // ---- the Buddy List: one group per side ----
+
+  function buddyNode(x) {
+    const li = el("li", "buddy " + x.state + (x.unread ? " unread" : ""));
+    const ago = x.last_seen_seconds_ago;
+    const since = ago < 90 ? ago + "s" : ago < 5400 ? Math.round(ago / 60) + "m" : Math.round(ago / 3600) + "h";
+    const when = x.state === "listening" ? (x.kind === "human" ? "watching" : "listening")
+      : x.state === "not_joined" ? (x.kind === "human" ? "link not opened" : "not joined")
+      : "last active " + since + " ago";
+    li.title = x.name + " · " + x.kind + " · " + when;
+    const note = [];
+    if (x.state === "away") note.push(since);
+    if (x.state === "not_joined") note.push(x.kind === "human" ? "link not opened" : "not joined");
+    if (x.unread) note.push(x.unread + " unread");
+    li.append(el("span", "dot " + x.state), el("span", "name", x.name));
+    if (note.length) li.append(el("span", "idle", "(" + note.join(", ") + ")"));
+    return li;
+  }
+
+  function renderPeople(state, human) {
+    const order = { listening: 0, away: 1, not_joined: 2 };
+    const names = state.sides.map((s) => s.name);
+    for (const x of state.participants) if (!names.includes(x.side)) names.push(x.side);
+    $("people").replaceChildren(...names.map((name) => {
+      const side = state.sides.find((s) => s.name === name);
+      const members = state.participants.filter((x) => x.side === name).sort((a, b) => order[a.state] - order[b.state]);
+      const here = members.filter((x) => x.state !== "not_joined").length;
+      const group = el("li", "group" + (shut.has(name) ? " shut" : ""));
+      const toggle = el("button", "", name + (side && side.yours ? ", your side" : "") + " (" + here + "/" + members.length + ")");
+      toggle.type = "button";
+      toggle.setAttribute("aria-expanded", String(!shut.has(name)));
+      toggle.onclick = () => {
+        if (shut.has(name)) shut.delete(name); else shut.add(name);
+        renderPeople(state, human);
+      };
+      const list = el("ul");
+      list.append(...members.map(buddyNode));
+      if (human && side && side.yours && state.agents.length === 0) {
+        const hint = el("li", "hint");
+        const open = el("button", "", "Bring your agent in...");
+        open.type = "button";
+        open.onclick = () => showTab("setup");
+        hint.append(open);
+        list.append(hint);
+      }
+      group.append(toggle, list);
+      return group;
+    }));
+    const here = state.participants.filter((x) => x.state !== "not_joined").length;
+    $("peopleCount").textContent = here + " of " + state.participants.length + " here";
+    $("buddyFoot").textContent = state.sides.map((s) => s.name).join(" ↔ ");
+  }
+
+  function showTab(name) {
+    for (const tab of ["online", "setup"]) {
+      $("tab-" + tab).setAttribute("aria-selected", String(tab === name));
+      $("panel-" + tab).hidden = tab !== name;
+    }
+  }
+  $("tab-online").onclick = () => showTab("online");
+  $("tab-setup").onclick = () => showTab("setup");
+
+  // ---- formatting buttons: they write the same marks the log renders ----
+
+  function wrapSelection(before, after, placeholder) {
+    const box = $("body");
+    const start = box.selectionStart;
+    const picked = box.value.slice(start, box.selectionEnd) || placeholder;
+    box.setRangeText(before + picked + after, start, box.selectionEnd, "end");
+    box.focus();
+    box.setSelectionRange(start + before.length, start + before.length + picked.length);
+  }
+  $("fmtBold").onclick = () => wrapSelection("**", "**", "bold text");
+  $("fmtCode").onclick = () => wrapSelection("`", "`", "code");
+  $("fmtLink").onclick = () => {
+    const url = prompt("Link address:", "https://");
+    if (url && /^https?:\/\/\S+$/.test(url.trim())) wrapSelection("[", "](" + url.trim() + ")", "link text");
+  };
+
+  // ---- the page ----
+
   function render(state) {
+    current = state;
     version = state.version;
     const human = state.you.kind === "human";
     document.title = state.thread.title + " · Parley";
-    $("title").textContent = state.thread.title;
-    $("sub").textContent = "You are " + state.you.name + " · " + state.sides.map((s) => s.name).join(" ↔ ");
+    $("title").textContent = state.thread.title + " - Chat Room";
+    $("buddyTitle").textContent = state.you.name + "'s Buddy List";
+    $("sub").textContent = "You are " + state.you.name + " on side " + state.you.side;
     $("status").textContent = state.thread.paused ? "paused" : "live";
     $("status").className = "chip" + (state.thread.paused ? " paused" : "");
     $("pauseBtn").hidden = !human;
-    $("pauseBtn").textContent = state.thread.paused ? "Resume agents" : "Pause agents";
+    $("pauseLabel").textContent = state.thread.paused ? "Resume agents" : "Pause agents";
+    $("pauseIcon").className = "ico " + (state.thread.paused ? "play" : "pause");
     $("pauseBtn").onclick = () => act(() => api("/api/pause", { paused: !state.thread.paused }));
 
-    const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
-    $("log").replaceChildren(...state.messages.map((m) => messageNode(m, state, false)));
-    $("pending").replaceChildren(...state.pending.map((m) => messageNode(m, state, true)));
-    $("pendingWrap").hidden = state.pending.length === 0;
+    // Shown before the log is filled: a hidden log has no height, so it could not scroll to the newest message.
+    showWindows();
+    renderLog(state, true);
+    renderTo(state);
 
     const mine = state.sides.find((s) => s.yours);
     $("approval").checked = mine.approval;
     $("approval").disabled = !human;
     $("otherReview").textContent = state.sides.filter((s) => !s.yours)
-      .map((s) => s.name + (s.approval ? " reviews its agent's messages." : " lets its agent post directly.")).join(" ");
+      .map((s) => s.name + (s.approval ? " reviews its agents' messages." : " lets its agents post directly.")).join(" ");
 
-    $("people").replaceChildren(...state.participants.map((x) => {
-      const li = el("li");
-      const who = el("span");
-      who.append(el("span", "dot " + x.state), x.name);
-      const ago = x.last_seen_seconds_ago;
-      const when = x.state === "listening" ? (x.kind === "human" ? "watching" : "listening")
-        : x.state === "not_joined" ? (x.kind === "human" ? "link not opened" : "not joined")
-        : "last active " + (ago < 90 ? ago + "s" : Math.round(ago / 60) + "m") + " ago";
-      li.append(who, el("span", "muted", when + (x.unread ? " · " + x.unread + " unread" : "")));
-      return li;
-    }));
+    renderPeople(state, human);
 
     $("agents").replaceChildren(...state.agents.map((a) => {
       const li = el("li");
@@ -197,7 +643,7 @@
       label.title = "Mailbox " + a.address;
       li.append(label);
       if (human) {
-        const revoke = el("button", "danger", "Remove");
+        const revoke = el("button", "danger small", "Remove");
         revoke.onclick = () => { if (confirm("Remove " + a.name + " from this room?")) act(() => api("/api/agents/" + a.id + "/revoke", {})); };
         li.append(revoke);
       }
@@ -208,8 +654,11 @@
     $("notifyForm").hidden = !human;
     $("invite").hidden = !human;
     $("composer").hidden = !human;
+  }
+
+  function showWindows() {
     $("layout").hidden = false;
-    if (nearBottom) window.scrollTo(0, document.body.scrollHeight);
+    $("buddyWin").hidden = false;
   }
 
   $("approval").onchange = (event) => act(() => api("/api/settings", { approval: event.target.checked }));
@@ -243,10 +692,15 @@
     event.preventDefault();
     const body = $("body").value.trim();
     if (!body) return;
-    act(async () => { await api("/api/messages", { body }); $("body").value = ""; });
+    act(async () => {
+      const res = await api("/api/messages", Object.assign({ body }, audienceBody()));
+      $("body").value = "";
+      // The server says who this wakes and when; it is how a human learns what To: does.
+      $("note").textContent = res && res.note ? res.note : "";
+    });
   });
   $("body").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) $("composer").requestSubmit();
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("composer").requestSubmit(); }
   });
 
   async function loop() {
