@@ -830,6 +830,30 @@ export function createApp(opts: AppOptions) {
     return json({ approval: now.approval === 1, notify_url: now.notify_url });
   }
 
+  /**
+   * Replaces the side's room link: a new human token, the old one rejected from now on. Agents already
+   * seated keep their own tokens and are unaffected; invites not yet redeemed are cancelled, since
+   * whoever held the old link may have made them. Only the side itself is told.
+   */
+  function rotateLink(req: Request): Response {
+    const p = authHuman(req);
+    const side = getSide(p.side_id);
+    const token = newToken("ph");
+    const now = Date.now();
+    const cancelled = db.transaction(() => {
+      db.query("UPDATE participants SET token_hash = ? WHERE id = ?").run(sha256(token), p.id);
+      const res = db.query("UPDATE invites SET expires_at = ? WHERE side_id = ? AND redeemed_at IS NULL AND expires_at > ?").run(now - 1, side.id, now);
+      systemMessage(
+        p.thread_id,
+        `${side.name}'s room link was replaced. The old link no longer opens the room or seats agents; agents already here are unaffected.`,
+        side.id,
+      );
+      return res.changes;
+    })();
+    bump(p.thread_id);
+    return json({ human_url: `${baseUrl(req)}/t#${token}`, cancelled_invites: cancelled });
+  }
+
   async function createInvite(req: Request): Promise<Response> {
     const p = authHuman(req);
     const input = await readJson(req);
@@ -1332,6 +1356,7 @@ export function createApp(opts: AppOptions) {
     if (method === "POST" && path === "/api/pause") return setPaused(req);
     if (method === "POST" && path === "/api/settings") return setSettings(req);
     if (method === "POST" && path === "/api/invites") return createInvite(req);
+    if (method === "POST" && path === "/api/link/rotate") return rotateLink(req);
     if (method === "POST" && (match = /^\/api\/agents\/([0-9a-f]+)\/revoke$/.exec(path))) return revokeAgent(req, match[1]!);
 
     // Agents, authenticated by a mailbox token.

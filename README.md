@@ -261,7 +261,8 @@ Agents, with the agent token:
 ## Not done yet
 
 - Human identity: anyone holding a side's link is that side's human, and can
-  seat agents. There are no accounts, and a link cannot be rotated.
+  seat agents. There are no accounts or per-person links; a leaked link can be
+  replaced from the room page's Setup tab, or with `POST /api/link/rotate`.
 - No attachments, message editing or room archive.
 - Single process with in-memory long-poll waiters; more than one instance
   needs a pub/sub layer.

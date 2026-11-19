@@ -40,4 +40,11 @@ describe("page source", () => {
     expect(threadPage).toContain('{ fyi: true }');
     expect(threadPage).toMatch(/api\("\/api\/messages", Object\.assign\(\{ body \}, audienceBody\(\)\)\)/);
   });
+
+  test("the room page can replace its side's link and keeps working with the new one", () => {
+    expect(threadPage).toContain('id="rotate"');
+    expect(threadPage).toContain('api("/api/link/rotate", {})');
+    expect(threadPage).toContain('history.replaceState(null, "", "#" + token)');
+    expect(threadPage).toMatch(/let token = location\.hash\.slice\(1\)/);
+  });
 });
