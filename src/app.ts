@@ -331,14 +331,15 @@ export function createApp(opts: AppOptions) {
   }
 
   /** True when unread mail after `floor` includes something this participant should be woken for by now. */
-  function wakeDue(p: ParticipantRow, floor = 0): boolean {
+  /** `base` replaces the participant's read mark: a session's own mark, which may sit below it. */
+  function wakeDue(p: ParticipantRow, floor = 0, base = p.read_seq): boolean {
     return (
       db
         .query(
           `SELECT 1 FROM wakes w JOIN messages m ON m.id = w.message_id
            WHERE w.participant_id = ? AND w.wake_at <= ? AND m.status = 'sent' AND m.seq > ? LIMIT 1`,
         )
-        .get(p.id, Date.now(), Math.max(p.read_seq, floor)) !== null
+        .get(p.id, Date.now(), Math.max(base, floor)) !== null
     );
   }
 
@@ -381,7 +382,8 @@ export function createApp(opts: AppOptions) {
   }
 
   /** Mail for a participant: delivered, visible to its side, after its read mark, and not written by it. */
-  function unreadFor(p: ParticipantRow, limit: number, floor = 0): MessageRow[] {
+  /** Messages after the read mark (or `base`, a session's own mark) and after `floor`, oldest first. */
+  function unreadFor(p: ParticipantRow, limit: number, floor = 0, base = p.read_seq): MessageRow[] {
     return db
       .query(
         `SELECT * FROM messages
@@ -389,7 +391,7 @@ export function createApp(opts: AppOptions) {
            AND participant_id IS NOT ?
          ORDER BY seq LIMIT ?`,
       )
-      .all(p.thread_id, Math.max(p.read_seq, floor), p.side_id, p.id, limit) as MessageRow[];
+      .all(p.thread_id, Math.max(base, floor), p.side_id, p.id, limit) as MessageRow[];
   }
 
   /** Humans see everything their side has waiting for review; agents see only their own. */
@@ -863,6 +865,8 @@ export function createApp(opts: AppOptions) {
       title: thread.title,
       paused: thread.paused === 1,
       you: { name: p.name, side: side.name },
+      /** The highest seq this agent marked read, from any session. A new session starts its own mark here. */
+      read_seq: p.read_seq,
       /** True when a human on your side reviews your messages before they are sent. */
       review: side.approval === 1,
     };
@@ -964,10 +968,13 @@ export function createApp(opts: AppOptions) {
     return raw === null ? undefined : raw.split(",").filter(Boolean);
   }
 
-  /** Parses `seen=<thread>:<seq>,...`: mail a client has already surfaced but not yet acknowledged. */
-  function seenMarks(url: URL): Map<string, number> {
+  /**
+   * Parses `<name>=<thread>:<seq>,...`. `seen` is mail a client has already surfaced but not yet
+   * acknowledged; `from` is a session's own read mark, used in place of the agent's shared one.
+   */
+  function seenMarks(url: URL, name = "seen"): Map<string, number> {
     const marks = new Map<string, number>();
-    for (const part of (url.searchParams.get("seen") ?? "").split(",")) {
+    for (const part of (url.searchParams.get(name) ?? "").split(",")) {
       const [thread, seq] = part.split(":");
       if (thread && Number.isInteger(Number(seq))) marks.set(thread, Number(seq));
     }
@@ -1007,18 +1014,21 @@ export function createApp(opts: AppOptions) {
     const box = authMailbox(req);
     const only = threadFilter(url);
     const seen = seenMarks(url);
+    // Several sessions can share one agent identity; each passes its own read mark so one session
+    // reading never hides mail from another. Without it, the shared mark applies.
+    const from = seenMarks(url, "from");
     const wait = Math.min(maxWait, Math.max(0, intParam(url, "wait", 0)));
     let removed: ReturnType<typeof removedSeats> = [];
     const collect = () => {
       removed = removedSeats(box, only);
       const threads = seats(box, only)
-        .map((p) => ({ p, unread: unreadFor(p, INBOX_PAGE + 1, seen.get(p.thread_id)) }))
+        .map((p) => ({ p, unread: unreadFor(p, INBOX_PAGE + 1, seen.get(p.thread_id), from.get(p.thread_id)) }))
         .filter((t) => t.unread.length > 0);
       // Being removed is always worth waking for: it is the last thing this agent hears from the room.
       if (removed.length) return threads;
       if (threads.length === 0) return null;
       // A waiting call is a request to be woken, so it returns only for mail that should wake this agent by now.
-      if (wait > 0 && !threads.some((t) => wakeDue(t.p, seen.get(t.p.thread_id)))) return null;
+      if (wait > 0 && !threads.some((t) => wakeDue(t.p, seen.get(t.p.thread_id), from.get(t.p.thread_id)))) return null;
       return threads;
     };
     const scope = seats(box, only);

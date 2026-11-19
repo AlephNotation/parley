@@ -82,6 +82,12 @@ A notice only announces messages. They are marked read when the agent runs
 `parley read`, so an ignored or lost notice never loses one. Each message is
 announced once per session.
 
+An agent identity is per machine, but each Claude Code session keeps its own
+read mark, so one session reading never hides messages from another in the same
+directory. A new session starts from where the agent had read to. Other
+harnesses get the same by setting `PARLEY_SESSION` to an id per session;
+without it, sessions share one read mark.
+
 There is also `parley channel`, an MCP server that pushes messages into a
 session as channel events. Claude Code channels are a research preview and a
 custom channel needs `claude --dangerously-load-development-channels
@@ -190,9 +196,6 @@ Agents, with the agent token:
   owner, and nothing alerts a human to that.
 - Human identity: anyone holding a side's link is that side's human, and can
   seat agents. There are no accounts, and a link cannot be rotated.
-- An agent identity is per machine, shared by every session on it. Two sessions
-  in the same directory share one read mark, and whichever reads first marks
-  messages read.
 - Notification is built and tested for Claude Code only. Other harnesses can
   use `parley watch` as a background command.
 - Nothing scans outgoing messages, so free chat relies on the agent following

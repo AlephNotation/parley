@@ -22,7 +22,8 @@ function machine() {
   const spawn = (args: string[], opts: { cwd?: string; stdin?: string; env?: Record<string, string> } = {}) =>
     Bun.spawn([process.execPath, CLIENT, ...args], {
       cwd: opts.cwd ?? project,
-      env: { ...process.env, PARLEY_HOME: home, ...opts.env },
+      // No session id unless a test gives one, so results do not depend on running inside Claude Code.
+      env: { ...process.env, PARLEY_HOME: home, CLAUDE_CODE_SESSION_ID: "", PARLEY_SESSION: "", ...opts.env },
       stdin: opts.stdin === undefined ? "ignore" : new Blob([opts.stdin]),
       stdout: "pipe",
       stderr: "pipe",
@@ -1011,5 +1012,59 @@ describe("removal", () => {
     await s.call(second.acmeHuman, "POST", `/api/agents/${otherId}/revoke`, {});
     const prompt = await second.acme.run(["hook", "prompt"], { stdin: hookJson(second.acme, "UserPromptSubmit") });
     expect(JSON.parse(prompt.stdout).hookSpecificOutput.additionalContext).toContain("removed you (Acme Claude)");
+  });
+});
+
+describe("read marks per session", () => {
+  const as = (id: string) => ({ env: { CLAUDE_CODE_SESSION_ID: id } });
+
+  test("two sessions in one directory each see mail until they read it themselves", async () => {
+    const { acme, vers, id } = await scene();
+    await acme.run(["read"], as("A"));
+    await acme.run(["read"], as("B"));
+    await s.send(vers.token, id, "for both of you");
+
+    const a = await acme.run(["read"], as("A"));
+    expect(a.stdout).toContain("for both of you");
+    // A reading it does not hide it from B.
+    const b = await acme.run(["read"], as("B"));
+    expect(b.stdout).toContain("for both of you");
+    expect((await acme.run(["read"], as("A"))).stdout).toContain("No new messages.");
+    expect((await acme.run(["read"], as("B"))).stdout).toContain("No new messages.");
+    // The shared mark still moves, so the room page and webhooks know the agent has read it.
+    expect((await s.call(vers.token, "GET", "/api/me")).status).toBe(200);
+  });
+
+  test("a new session starts where the agent has read to, not at the beginning", async () => {
+    const { acme, vers, id } = await scene();
+    await s.send(vers.token, id, "old news");
+    await acme.run(["read"], as("A"));
+    const fresh = await acme.run(["read"], as("C"));
+    expect(fresh.stdout).toContain("No new messages.");
+    expect(fresh.stdout).not.toContain("old news");
+  });
+
+  test("a session's waiter wakes for mail another session already read", async () => {
+    const { acme, vers, id } = await scene();
+    await acme.run(["read"], as("A"));
+    // B starts and gets its mark at session start.
+    await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "SessionStart", "B") });
+    await s.send(vers.token, id, "read by A first");
+    expect((await acme.run(["read"], as("A"))).stdout).toContain("read by A first");
+
+    const wait = await acme.run(["hook", "wait"], { stdin: hookJson(acme, "Stop", "B"), env: { PARLEY_HOOK_WAIT: "2" } });
+    expect(wait.code).toBe(2);
+    expect(wait.stderr).toContain("1 unread Parley message");
+    expect((await acme.run(["read"], as("B"))).stdout).toContain("read by A first");
+  });
+
+  test("history marks as new what this session has not read", async () => {
+    const { acme, vers, id } = await scene();
+    await acme.run(["read"], as("A"));
+    await acme.run(["read"], as("B"));
+    await s.send(vers.token, id, "history check");
+    await acme.run(["read"], as("A"));
+    expect((await acme.run(["history"], as("A"))).stdout).not.toMatch(/history check\s+\[new\]/);
+    expect((await acme.run(["history"], as("B"))).stdout).toMatch(/history check\s+\[new\]/);
   });
 });

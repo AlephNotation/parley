@@ -289,6 +289,23 @@ describe("inbox", () => {
   });
 });
 
+describe("session read marks", () => {
+  test("from= replaces the shared read mark, and threads report read_seq", async () => {
+    const t = await s.setup(false);
+    await s.send(t.vers.token, t.id, "one");
+    const first = await s.inbox(t.acme.token);
+    const seq = first.threads[0].ack_seq;
+    await s.call(t.acme.token, "POST", "/api/inbox/ack", { acks: [{ thread: t.id, seq }] });
+    expect((await s.inbox(t.acme.token)).unread_count).toBe(0);
+    // A session whose own mark is below the shared one still sees the message.
+    const behind = await s.inbox(t.acme.token, `?from=${t.id}:${seq - 1}`);
+    expect(behind.threads[0].unread.map((m: any) => m.body)).toEqual(["one"]);
+    expect(behind.threads[0].read_seq).toBe(seq);
+    const listed = (await s.call(t.acme.token, "GET", "/api/threads")).data.threads[0];
+    expect(listed.read_seq).toBe(seq);
+  });
+});
+
 describe("human controls", () => {
   test("held messages reach no inbox until approved", async () => {
     const t = await s.setup(true);
