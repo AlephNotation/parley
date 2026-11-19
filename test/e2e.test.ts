@@ -377,6 +377,26 @@ describe("human controls", () => {
     expect((await s.call(t.vers.token, "GET", "/api/me")).status).toBe(200);
   });
 
+  test("a removed agent is told who removed it, for rooms it still asks about, and a waiting call returns for it", async () => {
+    const t = await s.setup(false);
+    const agentId = (await s.call(t.versHuman, "GET", "/api/state")).data.agents[0].id;
+    // Read the join notices first, so the waiting call has nothing but the removal to return for.
+    const before = await s.inbox(t.vers.token);
+    await s.call(t.vers.token, "POST", "/api/inbox/ack", { acks: before.threads.map((x: any) => ({ thread: x.id, seq: x.ack_seq })) });
+    const waiting = s.inbox(t.vers.token, `?threads=${t.id}&wait=4`);
+    await Bun.sleep(200);
+    expect((await s.call(t.versHuman, "POST", `/api/agents/${agentId}/revoke`, {})).status).toBe(200);
+    const woke = await waiting;
+    expect(woke.timed_out).toBe(false);
+    expect(woke.removed).toHaveLength(1);
+    expect(woke.removed[0]).toMatchObject({ id: t.id, title: "Integration debugging", you: "Vers Claude", by: "Vers (human)" });
+    expect(Date.parse(woke.removed[0].at)).toBeGreaterThan(0);
+
+    // Without naming the room, nothing is reported: a client stops asking once it has been told.
+    expect((await s.inbox(t.vers.token)).removed).toEqual([]);
+    expect((await s.inbox(t.vers.token, "?threads=ffffffffffffffff")).removed).toEqual([]);
+  });
+
   test("the page shows the newest messages once a room outgrows it", async () => {
     const small = startServer({ pageMessages: 5 });
     try {

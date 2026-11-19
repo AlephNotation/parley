@@ -979,15 +979,43 @@ export function createApp(opts: AppOptions) {
    * `threads` narrows it to some threads; `seen` hides mail up to a seq without acknowledging it,
    * so a notifier can wait for mail that is newer than what it already announced.
    */
+  /**
+   * Rooms among `only` that this mailbox was removed from, with who removed it and when, read from the
+   * system message the removal posted. Only rooms the client names are reported: a client that still
+   * asks about a room it was removed from has not been told yet, and stops asking once it has.
+   */
+  function removedSeats(box: MailboxRow, only: string[] | undefined) {
+    if (!only?.length) return [];
+    const rows = db
+      .query(`SELECT * FROM participants WHERE mailbox_id = ? AND revoked = 1 AND thread_id IN (${only.map(() => "?").join(",")})`)
+      .all(box.id, ...only) as ParticipantRow[];
+    return rows.map((p) => {
+      const note = db
+        .query("SELECT body, created_at FROM messages WHERE thread_id = ? AND kind = 'system' AND body LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 1")
+        .get(p.thread_id, `% removed ${p.name.replace(/[\\%_]/g, (c) => "\\" + c)} from the room.`) as { body: string; created_at: number } | null;
+      return {
+        id: p.thread_id,
+        title: getThread(p.thread_id).title,
+        you: p.name,
+        by: note ? note.body.slice(0, note.body.length - ` removed ${p.name} from the room.`.length) : null,
+        at: note ? new Date(note.created_at).toISOString() : null,
+      };
+    });
+  }
+
   async function getInbox(req: Request, url: URL): Promise<Response> {
     const box = authMailbox(req);
     const only = threadFilter(url);
     const seen = seenMarks(url);
     const wait = Math.min(maxWait, Math.max(0, intParam(url, "wait", 0)));
+    let removed: ReturnType<typeof removedSeats> = [];
     const collect = () => {
+      removed = removedSeats(box, only);
       const threads = seats(box, only)
         .map((p) => ({ p, unread: unreadFor(p, INBOX_PAGE + 1, seen.get(p.thread_id)) }))
         .filter((t) => t.unread.length > 0);
+      // Being removed is always worth waking for: it is the last thing this agent hears from the room.
+      if (removed.length) return threads;
       if (threads.length === 0) return null;
       // A waiting call is a request to be woken, so it returns only for mail that should wake this agent by now.
       if (wait > 0 && !threads.some((t) => wakeDue(t.p, seen.get(t.p.thread_id)))) return null;
@@ -1024,6 +1052,8 @@ export function createApp(opts: AppOptions) {
       mailbox: { address: box.address, label: box.label },
       unread_count: threads.reduce((n, t) => n + t.unread.length, 0),
       threads,
+      /** Rooms named in `threads=` that a human removed this agent from. */
+      removed,
       timed_out: wait > 0 && found === null,
     });
   }
