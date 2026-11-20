@@ -15,6 +15,7 @@ import {
 import { CLIENT_VERSION, clientDownload, serveInstaller, type ClientRelease } from "./install";
 import { describeFindings, findSecrets } from "./secrets";
 import { homePage, invitePage, threadPage } from "./ui";
+import { SlackError, fromSlackText, slackCall, slackManifest, toSlackText, verifySlackRequest } from "./slack";
 import { sendWebhook, type Resolver } from "./webhook";
 
 export interface AppOptions {
@@ -46,6 +47,8 @@ export interface AppOptions {
   notifyDelayMs?: number;
   /** How often to look for unread mail to notify about. 0 disables the sweeper. */
   sweepIntervalMs?: number;
+  /** Where the Slack Web API lives. Defaults to https://slack.com/api; tests point it at a stand-in. */
+  slackApi?: string;
   /** Shortest gap between two calls to one agent's wake webhook. */
   wakeCooldownMs?: number;
   /** Allow notification webhooks to plain-http and private hosts. For local development and tests only. */
@@ -249,6 +252,7 @@ export function createApp(opts: AppOptions) {
       .query("SELECT DISTINCT mailbox_id FROM participants WHERE thread_id = ? AND mailbox_id IS NOT NULL AND revoked = 0")
       .all(threadId) as { mailbox_id: string }[];
     for (const row of rows) wake(`m:${row.mailbox_id}`);
+    slackSoon();
   }
 
   const touch = (participantId: string) => db.query("UPDATE participants SET last_seen = ? WHERE id = ?").run(Date.now(), participantId);
@@ -267,13 +271,14 @@ export function createApp(opts: AppOptions) {
     visibleTo?: string;
     to?: string[];
     fyi?: boolean;
+    viaSlack?: string;
   }): MessageRow {
     const side = m.participant ? getSide(m.participant.side_id) : null;
     const now = Date.now();
     const row = db
       .query(
-        `INSERT INTO messages (thread_id, participant_id, side_id, side_name, kind, author, body, status, seq, visible_to, created_at, delivered_at, audience, addressed)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        `INSERT INTO messages (thread_id, participant_id, side_id, side_name, kind, author, body, status, seq, visible_to, created_at, delivered_at, audience, addressed, via_slack)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(
         m.threadId,
@@ -290,6 +295,7 @@ export function createApp(opts: AppOptions) {
         m.deliver ? now : null,
         m.fyi ? "fyi" : m.to?.length ? "direct" : "room",
         m.to?.length ? JSON.stringify(m.to) : null,
+        m.viaSlack ?? null,
       ) as MessageRow;
     return m.deliver ? scheduleWakes(row) : row;
   }
@@ -697,6 +703,8 @@ export function createApp(opts: AppOptions) {
       you: { id: p.id, name: p.name, kind: p.kind, side: mine.name },
       sides: getSides(p.thread_id).map((s) => ({ name: s.name, approval: s.approval === 1, yours: s.id === p.side_id })),
       notify_url: mine.notify_url,
+      /** This side's Slack mirror. The token and signing secret are never sent back. */
+      slack: mine.slack_channel ? { channel: mine.slack_channel } : null,
       agents,
       open_invites: openInvites,
       participants: publicPresence(p.thread_id),
@@ -922,9 +930,13 @@ export function createApp(opts: AppOptions) {
       db.query("UPDATE sides SET notify_url = ?, notified_seq = ? WHERE id = ?").run(value, maxSeq(p.thread_id), side.id);
       changed = true;
     }
+    if (input.slack !== undefined) {
+      await setSlack(p, side, input.slack);
+      changed = true;
+    }
     if (changed) bump(p.thread_id);
     const now = getSide(side.id);
-    return json({ approval: now.approval === 1, notify_url: now.notify_url });
+    return json({ approval: now.approval === 1, notify_url: now.notify_url, slack: now.slack_channel ? { channel: now.slack_channel } : null });
   }
 
   /**
@@ -1027,7 +1039,8 @@ export function createApp(opts: AppOptions) {
     return { body, to, fyi };
   }
 
-  function post(p: ParticipantRow, draft: Draft): Response {
+  /** `via` is set for a message a human typed in their side's Slack channel instead of on the room page. */
+  function post(p: ParticipantRow, draft: Draft, via?: { author: string; slackSide: string }): Response {
     const { body, to, fyi } = draft;
     requireOpen(p.thread_id);
     const wait = postLimit.take(p.id);
@@ -1068,7 +1081,17 @@ export function createApp(opts: AppOptions) {
       const thread = getThread(p.thread_id);
       const side = getSide(p.side_id);
       if (p.kind === "human") {
-        const message = insertMessage({ threadId: thread.id, participant: p, kind: "human", author: p.name, body, deliver: true, to, fyi });
+        const message = insertMessage({
+          threadId: thread.id,
+          participant: p,
+          kind: "human",
+          author: via?.author ?? p.name,
+          body,
+          deliver: true,
+          to,
+          fyi,
+          viaSlack: via?.slackSide,
+        });
         db.query("UPDATE threads SET agent_streak = 0 WHERE id = ?").run(thread.id);
         return { message, note: undefined as string | undefined };
       }
@@ -1414,6 +1437,205 @@ export function createApp(opts: AppOptions) {
     }
   }
 
+  // ---- a side's Slack channel as a second window on the room ---------------
+  //
+  // Each side may connect its own Slack app. Everything that side can see in the room is posted to
+  // one channel, and what a person types in that channel is posted to the room as that side's
+  // human. The other side never sees, or needs to know about, the app.
+
+  const slackApi = (opts.slackApi ?? "https://slack.com/api").replace(/\/+$/, "");
+  const slackEventsUrl = (req: Request, side: SideRow) => `${baseUrl(req)}/api/slack/events/${side.id}`;
+
+  const SLACK_HINTS: Record<string, string> = {
+    invalid_auth: "The bot token was not accepted. Copy the Bot User OAuth Token (it starts with xoxb-) from the app's OAuth & Permissions page.",
+    not_authed: "The bot token was not accepted. Copy the Bot User OAuth Token (it starts with xoxb-) from the app's OAuth & Permissions page.",
+    not_in_channel: "Invite the app to the channel first: type /invite @Parley in it.",
+    channel_not_found: "Use the channel's ID (it starts with C or G; see the channel's details in Slack), and invite the app to the channel with /invite @Parley.",
+    missing_scope: "The app is missing a permission. Recreate it from the manifest, or add the chat:write scope and reinstall it.",
+  };
+
+  /** Connects, replaces or (with null) disconnects this side's Slack channel. */
+  async function setSlack(p: ParticipantRow, side: SideRow, input: unknown): Promise<void> {
+    if (input === null) {
+      db.query("UPDATE sides SET slack_token = NULL, slack_secret = NULL, slack_channel = NULL WHERE id = ?").run(side.id);
+      return;
+    }
+    const given = input as Record<string, unknown>;
+    const field = (name: string) => (typeof given?.[name] === "string" ? (given[name] as string).trim() : "");
+    const token = field("token");
+    const secret = field("signing_secret");
+    const channel = field("channel");
+    if (!token || !secret || !channel) {
+      throw new HttpError(400, "bad_request", '"slack" must be null or {token, signing_secret, channel}.');
+    }
+    if (!/^[CG][A-Z0-9]{2,}$/.test(channel)) {
+      throw new HttpError(400, "bad_slack_channel", "channel must be a Slack channel ID.", SLACK_HINTS.channel_not_found);
+    }
+    const thread = getThread(p.thread_id);
+    try {
+      await slackCall(slackApi, token, "auth.test", {});
+      await slackCall(slackApi, token, "chat.postMessage", {
+        channel,
+        text: toSlackText(
+          `This channel now shows the Parley room "${thread.title}" as ${side.name} sees it. What people type here is posted to the room as ${side.name}'s human, so treat the channel like the room link.`,
+        ),
+      });
+    } catch (err) {
+      const code = err instanceof SlackError ? err.code : "unknown_error";
+      throw new HttpError(400, "slack_error", `Slack did not accept that (${code}).`, SLACK_HINTS[code]);
+    }
+    // Start from the present so connecting does not replay the room so far.
+    db.query("UPDATE sides SET slack_token = ?, slack_secret = ?, slack_channel = ?, slack_seq = ? WHERE id = ?").run(
+      token,
+      secret,
+      channel,
+      maxSeq(p.thread_id),
+      side.id,
+    );
+  }
+
+  /** The manifest this side pastes into Slack to create its app, with this room's address already in it. */
+  function getSlackManifest(req: Request): Response {
+    const p = authHuman(req);
+    const side = getSide(p.side_id);
+    return json({ events_url: slackEventsUrl(req, side), manifest: slackManifest(getThread(p.thread_id).title, side.name, slackEventsUrl(req, side)) });
+  }
+
+  /** How one room message reads in Slack. Room text is escaped, so it cannot mention or disguise links. */
+  function slackLine(m: MessageRow): string {
+    const text = m.body.length > 38_000 ? `${m.body.slice(0, 38_000)}\n(cut short here; the room page has the rest)` : m.body;
+    if (m.kind === "system") return `_${toSlackText(text)}_`;
+    return `*${toSlackText(m.author)}*${m.side_name ? ` (${toSlackText(m.side_name)})` : ""}: ${toSlackText(text)}`;
+  }
+
+  let mirroring = false;
+  let mirrorAgain = false;
+  /**
+   * Posts what each connected side has not yet seen in Slack, in room order. A message that fails
+   * stops that side's run and is tried again on the next change or sweep, so nothing is skipped.
+   */
+  async function mirrorSlack(): Promise<void> {
+    if (mirroring) {
+      mirrorAgain = true;
+      return;
+    }
+    mirroring = true;
+    try {
+      do {
+        mirrorAgain = false;
+        const sides = db.query("SELECT * FROM sides WHERE slack_token IS NOT NULL").all() as SideRow[];
+        for (const side of sides) {
+          if (closed) return;
+          const rows = db
+            .query(
+              `SELECT * FROM messages WHERE thread_id = ? AND status = 'sent' AND seq > ? AND (visible_to IS NULL OR visible_to = ?)
+               ORDER BY seq LIMIT 100`,
+            )
+            .all(side.thread_id, side.slack_seq, side.id) as MessageRow[];
+          for (const m of rows) {
+            // What was typed in this channel is already there.
+            if (m.via_slack !== side.id) {
+              try {
+                await slackCall(slackApi, side.slack_token!, "chat.postMessage", {
+                  channel: side.slack_channel,
+                  text: slackLine(m),
+                  unfurl_links: false,
+                  unfurl_media: false,
+                });
+              } catch (err) {
+                console.error(`Slack mirror for side ${side.id} failed: ${(err as Error).message}`);
+                break;
+              }
+            }
+            if (closed) return;
+            db.query("UPDATE sides SET slack_seq = ? WHERE id = ? AND slack_seq < ?").run(m.seq, side.id, m.seq);
+          }
+        }
+      } while (mirrorAgain && !closed);
+    } finally {
+      mirroring = false;
+    }
+  }
+
+  let slackTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Mirrors right after the current request, so Slack does not wait for the next sweep. */
+  function slackSoon() {
+    if (slackTimer || closed) return;
+    slackTimer = setTimeout(() => {
+      slackTimer = null;
+      void mirrorSlack().catch((err) => console.error(err));
+    }, 0);
+  }
+
+  const slackNames = new Map<string, string>();
+  /** The name a Slack user goes by, for the author line in the room. */
+  async function slackName(side: SideRow, user: string): Promise<string> {
+    const key = `${side.id}:${user}`;
+    const known = slackNames.get(key);
+    if (known) return known;
+    let name = "Someone";
+    try {
+      const res = await slackCall(slackApi, side.slack_token!, "users.info", { user });
+      name = String(res.user?.profile?.display_name || res.user?.real_name || res.user?.name || name);
+    } catch (err) {
+      console.error(`Slack users.info for side ${side.id} failed: ${(err as Error).message}`);
+      return name;
+    }
+    name = name.replace(/\s+/g, " ").trim().slice(0, 60) || "Someone";
+    slackNames.set(key, name);
+    return name;
+  }
+
+  /** Posts one message typed in a side's Slack channel to the room, and says so in Slack if it could not. */
+  async function fromSlack(side: SideRow, event: { user: string; text: string; ts?: string }): Promise<void> {
+    const body = fromSlackText(event.text).trim();
+    if (!body) return;
+    const name = await slackName(side, event.user);
+    try {
+      const human = db.query("SELECT * FROM participants WHERE side_id = ? AND kind = 'human' AND revoked = 0 LIMIT 1").get(side.id) as ParticipantRow | null;
+      if (!human) throw new HttpError(409, "no_human", "This side has no human seat in the room.");
+      if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw new HttpError(413, "message_too_large", `The message exceeds ${MAX_BODY_BYTES} bytes.`);
+      post(human, { body }, { author: `${name} (via Slack)`, slackSide: side.id });
+    } catch (err) {
+      if (!(err instanceof HttpError)) throw err;
+      await slackCall(slackApi, side.slack_token!, "chat.postMessage", {
+        channel: side.slack_channel,
+        thread_ts: event.ts,
+        text: toSlackText(`Not posted to the room: ${err.message}`),
+      }).catch((failure) => console.error(`Slack reply for side ${side.id} failed: ${(failure as Error).message}`));
+    }
+  }
+
+  /** Slack's Events API calls this for the side's app. Only a request signed with that app's secret is believed. */
+  async function slackEvents(req: Request, sideId: string): Promise<Response> {
+    const raw = await req.text();
+    const side = getSide(sideId) as SideRow | null;
+    if (!side?.slack_secret || !side.slack_token) throw new HttpError(404, "not_found", "No Slack app is connected here.");
+    if (!verifySlackRequest(side.slack_secret, req.headers, raw)) throw new HttpError(401, "bad_signature", "The request is not signed by this side's Slack app.");
+    let payload: any;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      throw new HttpError(400, "bad_json", "Request body must be JSON.");
+    }
+    if (payload?.type === "url_verification") return json({ challenge: payload.challenge });
+    if (payload?.type === "event_callback") {
+      // Slack sends an event again when it is not answered within three seconds; each is acted on once.
+      if (typeof payload.event_id === "string") {
+        db.query("DELETE FROM slack_events WHERE received_at < ?").run(Date.now() - 24 * 60 * 60 * 1000);
+        if (db.query("INSERT OR IGNORE INTO slack_events (event_id, received_at) VALUES (?, ?)").run(payload.event_id, Date.now()).changes === 0) {
+          return json({ ok: true });
+        }
+      }
+      const event = payload.event;
+      const typed =
+        event?.type === "message" && !event.subtype && !event.bot_id && event.channel === side.slack_channel && typeof event.text === "string" && typeof event.user === "string";
+      // Answered at once; the post itself may need a lookup at Slack first.
+      if (typed) void fromSlack(side, event).catch((err) => console.error(err));
+    }
+    return json({ ok: true });
+  }
+
   // ---- waking an agent that has no session running ------------------------
 
   /** Reads or sets the URL Parley calls to start this agent when mail arrives and nothing of it is listening. */
@@ -1496,6 +1718,7 @@ export function createApp(opts: AppOptions) {
       ? setInterval(() => {
           void sweep().catch((err) => console.error(err));
           void sweepWakes().catch((err) => console.error(err));
+          void mirrorSlack().catch((err) => console.error(err));
         }, sweepEvery)
       : null;
 
@@ -1542,6 +1765,8 @@ export function createApp(opts: AppOptions) {
     if (method === "POST" && path === "/api/settings") return setSettings(req);
     if (method === "POST" && path === "/api/invites") return createInvite(req);
     if (method === "POST" && path === "/api/link/rotate") return rotateLink(req);
+    if (method === "GET" && path === "/api/slack/manifest") return getSlackManifest(req);
+    if (method === "POST" && (match = /^\/api\/slack\/events\/([0-9a-zA-Z_-]+)$/.exec(path))) return slackEvents(req, match[1]!);
     if (method === "POST" && (match = /^\/api\/agents\/([0-9a-f]+)\/revoke$/.exec(path))) return revokeAgent(req, match[1]!);
 
     // Agents, authenticated by a mailbox token.
@@ -1589,9 +1814,12 @@ export function createApp(opts: AppOptions) {
     sweep,
     /** Calls the wake webhooks that are due now. Exposed for tests. */
     sweepWakes,
+    /** Posts to Slack whatever connected sides have not seen there yet. Exposed for tests. */
+    mirrorSlack,
     close: () => {
       closed = true;
       if (wakeTimer) clearTimeout(wakeTimer);
+      if (slackTimer) clearTimeout(slackTimer);
       if (sweeper) clearInterval(sweeper);
       for (const timer of heldWakes) clearTimeout(timer);
       db.close();

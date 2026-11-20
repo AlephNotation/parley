@@ -7,7 +7,7 @@ export type MessageStatus = "sent" | "pending" | "rejected";
 export type Audience = "direct" | "room" | "fyi";
 
 /** Bump when the schema changes, and add the step from the previous version to MIGRATIONS. */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 /** MIGRATIONS[n] upgrades a database from schema version n to n + 1. */
 const MIGRATIONS: Record<number, string> = {
@@ -38,6 +38,14 @@ const MIGRATIONS: Record<number, string> = {
     ALTER TABLE mailboxes ADD COLUMN woken_message_id INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE mailboxes ADD COLUMN woken_at INTEGER NOT NULL DEFAULT 0;
   `,
+  5: `
+    ALTER TABLE sides ADD COLUMN slack_token TEXT;
+    ALTER TABLE sides ADD COLUMN slack_secret TEXT;
+    ALTER TABLE sides ADD COLUMN slack_channel TEXT;
+    ALTER TABLE sides ADD COLUMN slack_seq INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE messages ADD COLUMN via_slack TEXT;
+    CREATE TABLE slack_events (event_id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
+  `,
 };
 
 export interface ThreadRow {
@@ -62,6 +70,12 @@ export interface SideRow {
   notify_url: string | null;
   /** Highest message seq this side's humans were already notified about. */
   notified_seq: number;
+  /** This side's own Slack app: its bot token, signing secret and the channel the room is mirrored to. */
+  slack_token: string | null;
+  slack_secret: string | null;
+  slack_channel: string | null;
+  /** Highest message seq already mirrored to that channel. */
+  slack_seq: number;
 }
 
 /** An agent's durable identity: one address and one inbox across every thread it joins. */
@@ -130,6 +144,8 @@ export interface MessageRow {
   addressed: string | null;
   created_at: number;
   delivered_at: number | null;
+  /** Id of the side whose Slack channel this message was typed in, so it is not mirrored back there. */
+  via_slack: string | null;
 }
 
 export function openDb(path: string): Database {
@@ -177,7 +193,11 @@ export function openDb(path: string): Database {
       name TEXT NOT NULL,
       approval INTEGER NOT NULL DEFAULT 1,
       notify_url TEXT,
-      notified_seq INTEGER NOT NULL DEFAULT 0
+      notified_seq INTEGER NOT NULL DEFAULT 0,
+      slack_token TEXT,
+      slack_secret TEXT,
+      slack_channel TEXT,
+      slack_seq INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS mailboxes (
       id TEXT PRIMARY KEY,
@@ -232,8 +252,10 @@ export function openDb(path: string): Database {
       created_at INTEGER NOT NULL,
       delivered_at INTEGER,
       audience TEXT NOT NULL DEFAULT 'room',
-      addressed TEXT
+      addressed TEXT,
+      via_slack TEXT
     );
+    CREATE TABLE IF NOT EXISTS slack_events (event_id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS wakes (
       message_id INTEGER NOT NULL REFERENCES messages(id),
       participant_id TEXT NOT NULL REFERENCES participants(id),

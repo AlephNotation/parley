@@ -287,6 +287,28 @@
           <button>Save</button>
         </form>
       </fieldset>
+      <fieldset class="card" id="slackCard">
+        <legend>Follow this room in Slack</legend>
+        <div id="slackOff">
+          <div class="muted" style="margin-bottom:8px">Show the room in one of your Slack channels and reply from there. You create your own Slack app for it; the other side never sees it. Anyone who can post in that channel speaks as your side's human.</div>
+          <ol class="muted" style="margin:0 0 8px; padding-left:18px">
+            <li><button id="slackManifest" type="button" class="small">Copy app manifest</button> then at api.slack.com/apps choose Create New App, From a manifest, and paste it.</li>
+            <li>Install the app to your workspace and invite it to a channel: /invite @Parley</li>
+            <li>Paste its Bot User OAuth Token, its Signing Secret and the channel's ID here.</li>
+          </ol>
+          <form id="slackForm" style="display:grid; gap:6px">
+            <input id="slackToken" type="password" autocomplete="off" placeholder="Bot token (xoxb-...)" required>
+            <input id="slackSecret" type="password" autocomplete="off" placeholder="Signing secret" required>
+            <input id="slackChannel" autocomplete="off" placeholder="Channel ID (C...)" required>
+            <div><button>Connect</button></div>
+          </form>
+          <div id="slackNote" class="muted" style="margin-top:6px; overflow-wrap:anywhere"></div>
+        </div>
+        <div id="slackOn" hidden>
+          <div class="muted" style="margin-bottom:8px">Connected to channel <span id="slackWhere"></span>. Messages appear there, and what people type there is posted here as your side's human.</div>
+          <button id="slackDisconnect" type="button" class="danger">Disconnect</button>
+        </div>
+      </fieldset>
     </div>
     <div class="statusbar muted" id="buddyFoot"></div>
   </div>
@@ -759,6 +781,10 @@
     if (state.agents.length === 0) $("agents").append(el("li", "muted", "None joined yet."));
     if (document.activeElement !== $("notifyUrl")) $("notifyUrl").value = state.notify_url || "";
     $("notifyForm").hidden = !human;
+    $("slackCard").hidden = !human;
+    $("slackOn").hidden = !state.slack;
+    $("slackOff").hidden = !!state.slack;
+    $("slackWhere").textContent = state.slack ? state.slack.channel : "";
     $("invite").hidden = !human;
     $("linkCard").hidden = !human;
     $("roomCard").hidden = !human;
@@ -792,6 +818,27 @@
     event.preventDefault();
     act(() => api("/api/settings", { notify_url: $("notifyUrl").value.trim() || null }));
   });
+  $("slackManifest").onclick = () => act(async () => {
+    const res = await api("/api/slack/manifest");
+    const text = JSON.stringify(res.manifest, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      $("slackNote").textContent = "Manifest copied. It already holds this room's address for your side: " + res.events_url;
+    } catch {
+      $("slackNote").textContent = text;
+    }
+  });
+  $("slackForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    act(async () => {
+      await api("/api/settings", { slack: { token: $("slackToken").value, signing_secret: $("slackSecret").value, channel: $("slackChannel").value } });
+      $("slackForm").reset();
+      $("slackNote").textContent = "";
+    });
+  });
+  $("slackDisconnect").onclick = () => {
+    if (confirm("Stop showing this room in Slack? Replies typed there will no longer reach the room.")) act(() => api("/api/settings", { slack: null }));
+  };
   $("rotate").onclick = () => {
     if (!confirm("Replace this side's link? The old link stops working for everyone who has it, and invites not yet used are cancelled. Agents already in the room are not affected.")) return;
     act(async () => {
