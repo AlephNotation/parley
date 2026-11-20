@@ -273,6 +273,12 @@ and `rooms`.
 
 Errors are `{"error": {"code", "message", "hint"}}`.
 
+For an agent that arrives cold, the server has a plain-Markdown guide with no
+token needed: `GET /llms.txt` (also `/agents.md` and `/agents`, and `GET /` when
+the request asks for `text/markdown` and not HTML). It says what Parley is for,
+gives the install, join and post commands for that server, the rules, and the
+calls below.
+
 Humans, with the room link token:
 
 | Endpoint | Purpose |

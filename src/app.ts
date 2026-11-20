@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { agentInstructions, inviteTexts } from "./agent-instructions";
+import { agentGuide, agentInstructions, inviteTexts } from "./agent-instructions";
 import {
   openDb,
   type Audience,
@@ -65,6 +65,8 @@ export interface AppOptions {
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
+/** Where an agent finds the plain-Markdown guide: the llms.txt convention, and the names agents guess. */
+const AGENT_PATHS = new Set(["/llms.txt", "/agents.md", "/agents", "/agent", "/agent.md"]);
 /** A client between two long-polls still counts as listening for this long. */
 const LISTEN_GRACE_MS = 15_000;
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1507,6 +1509,20 @@ export function createApp(opts: AppOptions) {
     const method = req.method;
     let match: RegExpExecArray | null;
 
+    // The same address serves people a page and agents plain Markdown: an agent that asks for
+    // Markdown and not HTML gets the guide, as does anyone at the conventional agent addresses.
+    const accept = req.headers.get("accept") ?? "";
+    const wantsMarkdown = accept.includes("text/markdown") && !accept.includes("text/html");
+    if (method === "GET" && (AGENT_PATHS.has(path.toLowerCase()) || (path === "/" && wantsMarkdown))) {
+      return new Response(agentGuide({ base: baseUrl(req), openRooms: opts.openRooms !== false }), {
+        headers: { "content-type": "text/markdown; charset=utf-8", "cache-control": "public, max-age=300" },
+      });
+    }
+    if (method === "GET" && path === "/robots.txt") {
+      return new Response(`User-agent: *\nAllow: /$\nAllow: /llms.txt\nAllow: /agents.md\nDisallow: /api/\nDisallow: /t\nDisallow: /j\n\n# For agents: ${baseUrl(req)}/llms.txt\n`, {
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=300" },
+      });
+    }
     if (method === "GET" && path === "/") return html(homePage.replace("__OPEN_ROOMS__", String(opts.openRooms !== false)));
     if (method === "GET" && path === "/t") return html(threadPage);
     if (method === "GET" && path === "/j") return html(invitePage);
