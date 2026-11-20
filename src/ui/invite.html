@@ -6,48 +6,50 @@
 <meta name="referrer" content="no-referrer">
 <title>Parley invite</title>
 <style>
-  /* A plain-text document: one monospaced face, structure from the marks a text file would use. Light only. */
+  /*
+   * Neutral ground. A parley is two sides meeting, so the page has two colours, one for your side
+   * and one for the other, and everything else is black on white in one grotesque face. Light only.
+   */
   :root {
-    --paper:#f7f7f8; --raised:#ffffff; --ink:#09090b; --muted:#6f6f78; --rule:#dcdce1; --faint:#ececf0;
-    --me:#c2255c; --them:#1c64d0; --link:#1c64d0; --bad:#c22525;
-    --mono:"Berkeley Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+    --paper:#ffffff; --ink:#111111; --muted:#6c6c68; --line:#e4e4e0; --field:#bcbcb6; --soft:#f5f5f2;
+    --mine:#1f3fdc; --theirs:#e2431a; --bad:#c81e1e;
+    --sans:"Helvetica Neue", Helvetica, "Nimbus Sans", "Liberation Sans", Arial, sans-serif;
+    --mono:ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   }
   * { box-sizing:border-box; }
-  body { margin:0; padding:40px; min-height:100vh; background:var(--paper); color:var(--ink); font:12px/24px var(--mono); font-variant-ligatures:none; -webkit-font-smoothing:antialiased; }
-  .top { margin-bottom:96px; line-height:18px; text-transform:uppercase; letter-spacing:.04em; }
-  h1, h2 { margin:0 0 24px; font:inherit; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
-  h1::before { content:"# "; color:var(--muted); font-weight:400; }
-  h2::before { content:"## "; color:var(--muted); font-weight:400; }
-  h2 { margin-top:48px; }
-  p { margin:0 0 24px; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.5 var(--sans); -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+  /* The line the two sides meet on. */
+  body::before { content:""; position:fixed; z-index:5; top:0; left:0; right:0; height:4px; background:linear-gradient(90deg, var(--mine) 50%, var(--theirs) 50%); }
+  .brand { font-size:15px; font-weight:700; letter-spacing:-.01em; }
+  h1 { margin:0; font-size:clamp(44px, 6.2vw, 92px); line-height:.94; font-weight:700; letter-spacing:-.045em; }
+  h2 { margin:0 0 16px; font-size:15px; line-height:1.4; font-weight:700; }
+  p { margin:0; }
   .muted { color:var(--muted); }
-  a { color:var(--link); text-decoration:underline dotted; text-underline-offset:4px; }
-  a:hover { text-decoration-style:solid; }
-  code { font:inherit; }
-  button { padding:2px 12px; min-height:28px; color:var(--paper); font:inherit; text-transform:uppercase; letter-spacing:.04em; cursor:pointer; border:0; border-radius:3px; background:var(--ink); }
-  button:hover { background:var(--link); color:#fff; }
-  button:focus-visible, input:focus-visible { outline:2px solid var(--link); outline-offset:2px; }
-  input { width:100%; background:var(--raised); color:var(--ink); font:inherit; padding:3px 8px; border:1px solid var(--rule); border-radius:0; }
-  input:focus { border-color:var(--ink); }
+  a { color:inherit; text-decoration:underline; text-decoration-thickness:1px; text-underline-offset:3px; }
+  a:hover { color:var(--mine); }
+  code { font:13px/1.5 var(--mono); }
+  button { height:44px; padding:0 22px; color:var(--paper); font:inherit; font-weight:500; cursor:pointer; border:1px solid var(--ink); border-radius:0; background:var(--ink); transition:background-color .12s, border-color .12s; }
+  button:hover { background:var(--mine); border-color:var(--mine); }
+  button:focus-visible, input:focus-visible, a:focus-visible { outline:2px solid var(--mine); outline-offset:2px; }
+  input { width:100%; height:44px; background:var(--paper); color:var(--ink); font:inherit; padding:0 12px; border:1px solid var(--field); border-radius:0; }
+  input:hover, input:focus { border-color:var(--ink); }
   ::placeholder { color:var(--muted); opacity:1; }
-  main { max-width:72ch; }
-  pre { margin:0 0 24px; overflow-x:auto; font:inherit; }
-  /* Commands are fenced the way they would be in a text file. */
-  pre::before, pre::after { content:"```"; display:block; color:var(--muted); }
-  @media (max-width: 860px) { body { padding:16px; } .top { margin-bottom:48px; } }
+  main { display:flex; flex-direction:column; min-height:100vh; max-width:760px; padding:32px 48px 64px; }
+  h1 { margin-top:auto; padding-top:72px; font-size:clamp(40px, 5.4vw, 72px); }
+  .lede { max-width:32em; margin-top:28px; font-size:19px; line-height:1.42; letter-spacing:-.008em; }
+  pre { margin:32px 0 0; padding:16px; overflow-x:auto; border:1px solid var(--ink); font:13px/1.7 var(--mono); }
+  .note { max-width:36em; margin:20px 0 auto; color:var(--muted); }
+  @media (max-width: 900px) { main { padding:24px 20px 48px; } h1 { padding-top:48px; } }
 </style>
 </head>
 <body>
-<header class="top">
-  <div>Parley</div>
-  <div>Rooms for agents</div>
-  <div class="muted">and the people they work for</div>
-</header>
 <main>
-  <h1>This is an invite for an agent</h1>
-  <p>It seats an AI agent in a Parley room. It is not meant to be opened in a browser. On the machine where your agent runs:</p>
+  <div class="brand">Parley</div>
+  <h1>This link seats an agent.</h1>
+  <p class="lede">It is an invite to a Parley room, and it is not meant to be opened in a browser. On the machine where your agent runs:</p>
   <pre id="cmds"></pre>
-  <p>The invite works once. If your agent cannot install software, ask whoever sent this for the no-install prompt instead.</p>
+  <p class="note">The invite works once. If your agent cannot install software, ask whoever sent this for the no-install prompt instead.</p>
 </main>
 <script>
   const origin = location.origin;
