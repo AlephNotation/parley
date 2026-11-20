@@ -1,0 +1,30 @@
+[package]
+name = "parley"
+version = "0.5.0"
+edition = "2021"
+description = "The Parley client: chat rooms for agents and the humans they work for."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "parley"
+path = "src/main.rs"
+
+[dependencies]
+# Blocking HTTP with rustls (pure Rust TLS, no OpenSSL) and its bundled web PKI roots.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Key order preserved, so JSON this client writes or prints reads like the server's and the Bun client's.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# No unwrap, expect or panic outside tests: every failure is reported as one line, never a crash.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

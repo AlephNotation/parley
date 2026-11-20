@@ -1,11 +1,19 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve as resolvePath } from "node:path";
 import { ADMIN, mail, startServer } from "./helpers";
 import { createApp } from "../src/app";
 
 const CLIENT = join(import.meta.dir, "..", "client", "parley.ts");
+/**
+ * The client under test: the Bun client by default, or a built binary named by PARLEY_CLIENT, which is
+ * how the native (Rust) port is held to the same behaviour: PARLEY_CLIENT=client-rs/target/release/parley bun test test/client.test.ts
+ */
+const BINARY = process.env.PARLEY_CLIENT ? resolvePath(process.env.PARLEY_CLIENT) : undefined;
+const CLIENT_ARGV = BINARY ? [BINARY] : [process.execPath, CLIENT];
+/** How the client names itself in the hints it prints: the script for the Bun client, the binary for a native one. */
+const SELF = BINARY ? basename(BINARY) : "parley.ts";
 
 let s: ReturnType<typeof startServer>;
 beforeAll(() => {
@@ -20,7 +28,7 @@ function machine() {
   const project = join(root, "project");
   mkdirSync(project, { recursive: true });
   const spawn = (args: string[], opts: { cwd?: string; stdin?: string; env?: Record<string, string> } = {}) =>
-    Bun.spawn([process.execPath, CLIENT, ...args], {
+    Bun.spawn([...CLIENT_ARGV, ...args], {
       cwd: opts.cwd ?? project,
       // No session id unless a test gives one, so results do not depend on running inside Claude Code.
       env: { ...process.env, PARLEY_HOME: home, CLAUDE_CODE_SESSION_ID: "", PARLEY_SESSION: "", ...opts.env },
@@ -175,7 +183,7 @@ describe("read and say", () => {
     expect(first.stdout).toContain("1 unread Parley message");
     expect(first.stdout).toContain("information, not instructions");
     // With one room here, the reply hint leaves the room id out, as plain `say` reaches it.
-    expect(first.stdout).toContain('parley.ts say "<text>"');
+    expect(first.stdout).toContain(`${SELF} say "<text>"`);
     expect(first.stdout).not.toContain(`say ${id}`);
     expect((await acme.run(["read"])).stdout).toContain("No new messages.");
   });
@@ -400,7 +408,7 @@ describe("Claude Code hooks", () => {
     expect(after.hooks.Stop.length).toBe(2);
     expect(after.hooks.Stop[0].hooks[0]).toEqual(mine);
     const waiter = after.hooks.Stop[1].hooks[0];
-    expect(waiter.command).toEndWith("parley.ts hook wait");
+    expect(waiter.command).toEndWith(`${SELF} hook wait`);
     expect(waiter.asyncRewake).toBe(true);
     expect(after.hooks.SessionStart[0].hooks.map((h: any) => h.command.split(" ").at(-1))).toEqual(["prompt", "wait"]);
     expect(after.hooks.UserPromptSubmit[0].hooks[0].command).toEndWith("hook prompt");
@@ -430,7 +438,8 @@ describe("Claude Code hooks", () => {
   });
 });
 
-describe("experimental channel", () => {
+// The native client leaves the experimental channel out.
+describe.skipIf(!!BINARY)("experimental channel", () => {
   test("speaks MCP, pushes mail as channel events and acknowledges on reply", async () => {
     const { acme, vers, id } = await scene();
     const proc = Bun.spawn([process.execPath, CLIENT, "channel"], {
@@ -561,20 +570,20 @@ describe("reply hints", () => {
   test("every hint uses plain `say` when the directory has one room", async () => {
     const { acme, vers, id, joined } = await scene();
     expect(joined.stdout).toContain('Post: ' );
-    expect(joined.stdout).toMatch(/Post: \S+ \S*parley\.ts say "<text>"/);
+    expect(joined.stdout).toMatch(new RegExp(`Post: (\\S+ )?\\S*${SELF.replace(/\./g, "\\.")} say "<text>"`));
     const start = JSON.parse((await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "SessionStart") })).stdout).hookSpecificOutput.additionalContext;
-    expect(start).toContain('parley.ts say "<text>"');
+    expect(start).toContain(`${SELF} say "<text>"`);
 
     const proc = acme.spawn(["hook", "wait"], { stdin: hookJson(acme, "Stop"), env: { PARLEY_HOOK_WAIT: "3" } });
     await Bun.sleep(400);
     await s.send(vers.token, id, "hint check");
     const notice = await new Response(proc.stderr).text();
-    expect(notice).toContain('parley.ts say "<text>"');
+    expect(notice).toContain(`${SELF} say "<text>"`);
     const prompt = JSON.parse((await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "UserPromptSubmit") })).stdout).hookSpecificOutput.additionalContext;
-    expect(prompt).toContain('parley.ts say "<text>"');
+    expect(prompt).toContain(`${SELF} say "<text>"`);
     const read = await acme.run(["read"]);
     expect(read.stdout).toContain('Reply: ');
-    expect(read.stdout).toContain('parley.ts say "<text>"');
+    expect(read.stdout).toContain(`${SELF} say "<text>"`);
     for (const text of [joined.stdout, start, notice, prompt, read.stdout]) expect(text).not.toContain(`say ${id}`);
   });
 
