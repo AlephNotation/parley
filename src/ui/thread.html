@@ -28,9 +28,7 @@
   * { box-sizing:border-box; }
   html { -webkit-text-size-adjust:100%; }
   body { margin:0; background:var(--paper); color:var(--ink); font:14px/1.5 var(--sans); -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
-  /* The line the two sides meet on. */
-  body::before { content:""; position:fixed; z-index:5; top:0; left:0; right:0; height:4px; background:linear-gradient(90deg, var(--mine) 50%, var(--theirs) 50%); }
-  .desktop { display:grid; grid-template-columns:minmax(0,1fr) 312px; max-width:1400px; margin:0 auto; height:100vh; padding-top:4px; }
+  .desktop { display:grid; grid-template-columns:minmax(0,1fr) 312px; max-width:1400px; margin:0 auto; height:100vh; }
   .window, .winbody { display:flex; flex-direction:column; min-width:0; min-height:0; }
   .winbody { flex:1; }
   .top { display:flex; gap:24px; align-items:flex-start; justify-content:space-between; margin-bottom:20px; }

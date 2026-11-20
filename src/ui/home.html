@@ -24,8 +24,6 @@
   * { box-sizing:border-box; }
   html { -webkit-text-size-adjust:100%; }
   body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.5 var(--sans); -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
-  /* The line the two sides meet on. */
-  body::before { content:""; position:fixed; z-index:5; top:0; left:0; right:0; height:4px; background:linear-gradient(90deg, var(--mine) 50%, var(--theirs) 50%); }
   .brand { font-size:15px; font-weight:700; letter-spacing:-.01em; }
   h1 { margin:0; font-size:clamp(44px, 6.2vw, 92px); line-height:.94; font-weight:700; letter-spacing:-.045em; }
   h2 { margin:0 0 16px; font-size:15px; line-height:1.4; font-weight:700; }
@@ -41,7 +39,7 @@
   input:hover, input:focus { border-color:var(--ink); }
   ::placeholder { color:var(--muted); opacity:1; }
   /* All the words run down one column on the left; the figure stays beside them and changes as they pass. */
-  .hero { position:relative; display:grid; grid-template-columns:minmax(0,5fr) minmax(0,7fr); align-items:start; padding-top:4px; }
+  .hero { position:relative; display:grid; grid-template-columns:minmax(0,5fr) minmax(0,7fr); align-items:start; }
   .lead { position:relative; z-index:1; padding:28px 0 96px 48px; }
   .foragents { margin-left:16px; font-size:13px; font-weight:400; letter-spacing:0; color:var(--muted); }
   .opening { display:flex; flex-direction:column; min-height:calc(100vh - 32px); padding-bottom:48px; }
@@ -63,7 +61,7 @@
   #result a { display:block; }
   #result code { display:block; overflow-wrap:anywhere; font-size:12px; }
   /* Rings spread from two points, one per side; where they cross they draw a pattern neither made alone. */
-  .field { position:sticky; top:4px; height:calc(100vh - 4px); min-height:420px; overflow:hidden; }
+  .field { position:sticky; top:0; height:100vh; min-height:420px; overflow:hidden; }
   .field canvas { position:absolute; inset:0; width:100%; height:100%; }
   /* Each name sits in the clear centre of its own rings and moves with them. */
   .field .who { position:absolute; left:0; top:0; width:0; height:0; display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:700; letter-spacing:-.01em; white-space:nowrap; visibility:hidden; }
@@ -88,7 +86,7 @@
     .lead { padding:20px 20px 64px; }
     .opening { min-height:0; }
     .opening h1 { padding-top:40px; }
-    .field { order:-1; top:4px; z-index:2; height:38vh; min-height:220px; margin-top:4px; background:var(--paper); border-bottom:1px solid var(--ink); }
+    .field { order:-1; top:0; z-index:2; height:38vh; min-height:220px; background:var(--paper); border-bottom:1px solid var(--ink); }
     .field figcaption { display:none; }
     .problem, .how { padding-top:48px; }
     .problem { padding-bottom:56px; }
