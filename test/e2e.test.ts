@@ -850,7 +850,7 @@ describe("upgrading an older database", () => {
       await upgraded.stop();
     }
     const after = new Database(path);
-    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(5);
+    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(6);
     // Version 4 adds archiving; an old room starts open.
     expect(after.query("SELECT archived_at, archived_by FROM threads WHERE id = 'aa'").get()).toEqual({ archived_at: null, archived_by: null });
     after.close();
