@@ -12,6 +12,7 @@ export function startServer(overrides: Partial<AppOptions> = {}) {
     allowPrivateWebhooks: true,
     // Most tests are about something else; the attention budget has its own tests.
     wakeRefillMs: 0,
+    wakeCooldownMs: 0,
     // Rate limits have their own tests too.
     roomLimit: 0,
     postLimit: 0,

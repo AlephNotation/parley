@@ -46,6 +46,8 @@ export interface AppOptions {
   notifyDelayMs?: number;
   /** How often to look for unread mail to notify about. 0 disables the sweeper. */
   sweepIntervalMs?: number;
+  /** Shortest gap between two calls to one agent's wake webhook. */
+  wakeCooldownMs?: number;
   /** Allow notification webhooks to plain-http and private hosts. For local development and tests only. */
   allowPrivateWebhooks?: boolean;
   /** Rooms one client address may create per hour without the admin token. 0 turns the limit off. */
@@ -173,6 +175,7 @@ export function createApp(opts: AppOptions) {
   const pageMessages = opts.pageMessages ?? 1000;
   const wakeBucket = opts.wakeBucket ?? 3;
   const wakeRefillMs = opts.wakeRefillMs ?? 20_000;
+  const wakeCooldownMs = opts.wakeCooldownMs ?? 30_000;
   /** Timers for wakes being held until an agent's budget can pay for them. */
   const heldWakes = new Set<ReturnType<typeof setTimeout>>();
   const waiters = new Map<string, Set<() => void>>();
@@ -365,10 +368,12 @@ export function createApp(opts: AppOptions) {
         const timer = setTimeout(() => {
           heldWakes.delete(timer);
           wake(`m:${agent.mailbox_id}`);
+          wakeSoon();
         }, at - now + 5);
         heldWakes.add(timer);
       }
     }
+    wakeSoon();
     return { ...m, audience };
   }
 
@@ -513,6 +518,8 @@ export function createApp(opts: AppOptions) {
         parts.push(`${a.name} will be woken in about ${Math.ceil((at - now) / 1000)}s.`);
       } else if (seen?.state === "listening") {
         parts.push(`${a.name} is listening and will be notified now.`);
+      } else if (a.mailbox_id && (db.query("SELECT wake_url FROM mailboxes WHERE id = ?").get(a.mailbox_id) as { wake_url: string | null } | null)?.wake_url) {
+        parts.push(`${a.name} has no session running; Parley is calling its wake address to start one.`);
       } else {
         parts.push(`${a.name} is not listening right now (last active ${seen?.last_seen_seconds_ago}s ago); it will see this when it next checks.`);
       }
@@ -869,18 +876,18 @@ export function createApp(opts: AppOptions) {
     return json({ paused });
   }
 
-  function checkWebhook(raw: string): string {
+  function checkWebhook(raw: string, field: "notify_url" | "wake_url" = "notify_url"): string {
     let url: URL;
     try {
       url = new URL(raw);
     } catch {
-      throw new HttpError(400, "bad_notify_url", "notify_url is not a valid URL.");
+      throw new HttpError(400, `bad_${field}`, `${field} is not a valid URL.`);
     }
     if (opts.allowPrivateWebhooks) return url.toString();
     const host = url.hostname.toLowerCase();
     const isIp = /^\d+(\.\d+){3}$/.test(host) || host.includes(":");
     if (url.protocol !== "https:" || isIp || host === "localhost" || /\.(local|internal|localhost)$/.test(host)) {
-      throw new HttpError(400, "bad_notify_url", "notify_url must be an https URL on a public hostname.");
+      throw new HttpError(400, `bad_${field}`, `${field} must be an https URL on a public hostname.`);
     }
     return url.toString();
   }
@@ -1407,8 +1414,90 @@ export function createApp(opts: AppOptions) {
     }
   }
 
+  // ---- waking an agent that has no session running ------------------------
+
+  /** Reads or sets the URL Parley calls to start this agent when mail arrives and nothing of it is listening. */
+  async function wakeSettings(req: Request): Promise<Response> {
+    const box = authMailbox(req);
+    if (req.method === "POST") {
+      const input = await readJson(req);
+      if (input.url !== null && typeof input.url !== "string") throw new HttpError(400, "bad_request", '"url" must be a URL string or null.');
+      const value = input.url ? checkWebhook(input.url.trim(), "wake_url") : null;
+      // Start from the present so turning wakes on does not replay old mail.
+      const newest = (db.query("SELECT COALESCE(MAX(id), 0) AS id FROM messages").get() as { id: number }).id;
+      db.query("UPDATE mailboxes SET wake_url = ?, woken_message_id = ?, woken_at = 0 WHERE id = ?").run(value, newest, box.id);
+      return json({ wake_url: value });
+    }
+    return json({ wake_url: box.wake_url });
+  }
+
+  /**
+   * Calls the wake webhook of every agent that has mail it should be woken for and no session
+   * listening. Each piece of mail calls it once, so a webhook that starts nothing is not retried
+   * forever; mail arriving inside the cooldown is picked up by a later sweep. The request carries
+   * no message text: what starts on the other end reads its mail through the usual route.
+   */
+  async function sweepWakes(): Promise<void> {
+    const now = Date.now();
+    const boxes = db.query("SELECT * FROM mailboxes WHERE wake_url IS NOT NULL").all() as MailboxRow[];
+    const calls: Promise<void>[] = [];
+    for (const box of boxes) {
+      if (now - box.woken_at < wakeCooldownMs) continue;
+      const seats = db.query("SELECT id FROM participants WHERE mailbox_id = ? AND revoked = 0").all(box.id) as { id: string }[];
+      const listening = seats.some((seat) => {
+        const poll = polls.get(seat.id);
+        return !!poll && (poll.open > 0 || now - poll.endedAt < LISTEN_GRACE_MS);
+      });
+      if (listening) continue;
+      const due = db
+        .query(
+          `SELECT m.id AS id, m.thread_id AS thread_id FROM wakes w
+           JOIN messages m ON m.id = w.message_id JOIN participants p ON p.id = w.participant_id
+           WHERE p.mailbox_id = ? AND p.revoked = 0 AND w.wake_at <= ? AND m.status = 'sent' AND m.seq > p.read_seq AND m.id > ?
+           ORDER BY m.id`,
+        )
+        .all(box.id, now, box.woken_message_id) as { id: number; thread_id: string }[];
+      if (due.length === 0) continue;
+      db.query("UPDATE mailboxes SET woken_message_id = ?, woken_at = ? WHERE id = ?").run(due.at(-1)!.id, now, box.id);
+      const rooms = [...new Set(due.map((d) => d.thread_id))].map((id) => ({ id, title: getThread(id).title }));
+      const text = `Parley: ${due.length} new message${due.length === 1 ? "" : "s"} for ${box.label} in ${rooms.map((r) => `"${r.title}"`).join(", ")}.`;
+      // Sent side by side and given a minute: the machine on the other end may be asleep, and a
+      // host that wakes it on the incoming request can hold the call open while it starts.
+      calls.push(
+        sendWebhook(
+          box.wake_url!,
+          { text, agent: box.address, unread: due.length, rooms },
+          { allowPrivate: opts.allowPrivateWebhooks, resolve: opts.resolveHost, timeoutMs: 60_000 },
+        ).then(
+          (status) => {
+            if (status < 200 || status >= 300) console.error(`wake webhook for ${box.address} returned ${status}`);
+          },
+          (err) => console.error(`wake webhook for ${box.address} failed: ${(err as Error).message}`),
+        ),
+      );
+    }
+    await Promise.all(calls);
+  }
+
+  let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+  /** Looks for agents to wake right after the current request, so a wake does not wait for the next sweep. */
+  function wakeSoon() {
+    if (wakeTimer || closed) return;
+    wakeTimer = setTimeout(() => {
+      wakeTimer = null;
+      void sweepWakes().catch((err) => console.error(err));
+    }, 0);
+  }
+
   const sweepEvery = opts.sweepIntervalMs ?? 15_000;
-  const sweeper = sweepEvery > 0 ? setInterval(() => void sweep().catch((err) => console.error(err)), sweepEvery) : null;
+  const sweeper =
+    sweepEvery > 0
+      ? setInterval(() => {
+          void sweep().catch((err) => console.error(err));
+          void sweepWakes().catch((err) => console.error(err));
+        }, sweepEvery)
+      : null;
 
   // ---- routing ------------------------------------------------------------
 
@@ -1461,6 +1550,7 @@ export function createApp(opts: AppOptions) {
     if (method === "GET" && path === "/api/agent") return getInstructions(req);
     if (method === "GET" && path === "/api/inbox") return getInbox(req, url);
     if (method === "POST" && path === "/api/inbox/ack") return ackInbox(req);
+    if ((method === "GET" || method === "POST") && path === "/api/wake") return wakeSettings(req);
     if (method === "GET" && path === "/api/threads") return listThreads(req);
     if (method === "GET" && (match = /^\/api\/threads\/([0-9a-f]+)\/transcript$/.exec(path))) {
       return transcript(seat(authMailbox(req), match[1]!), url);
@@ -1497,7 +1587,11 @@ export function createApp(opts: AppOptions) {
     fetch: fetchHandler,
     /** Runs one notification sweep now. Exposed for tests. */
     sweep,
+    /** Calls the wake webhooks that are due now. Exposed for tests. */
+    sweepWakes,
     close: () => {
+      closed = true;
+      if (wakeTimer) clearTimeout(wakeTimer);
       if (sweeper) clearInterval(sweeper);
       for (const timer of heldWakes) clearTimeout(timer);
       db.close();

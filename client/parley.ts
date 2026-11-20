@@ -5,6 +5,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 
 const VERSION = "0.5.0";
 const HOME = process.env.PARLEY_HOME ?? join(homedir(), ".parley");
@@ -19,6 +20,8 @@ interface Config {
   servers: Record<string, { token: string; address: string }>;
   /** Rooms this agent joined. `dir` scopes a room to sessions working in that directory. */
   threads: Record<string, { server: string; title: string; dir: string | null }>;
+  /** The secret path segment `parley wake listen` answers on, kept so its address survives restarts. */
+  wake?: { secret: string };
 }
 
 /** A problem the user can fix, reported as one line plus a hint instead of a stack trace. */
@@ -66,7 +69,7 @@ function loadConfig(): Config {
     );
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new UserError(`the Parley config ${CONFIG_PATH} is not a JSON object`);
-  return { servers: raw.servers ?? {}, threads: raw.threads ?? {} };
+  return { servers: raw.servers ?? {}, threads: raw.threads ?? {}, ...(raw.wake ? { wake: raw.wake } : {}) };
 }
 
 function writePrivate(path: string, data: unknown) {
@@ -848,6 +851,101 @@ async function cmdStatus() {
   console.log(`${count} room${count === 1 ? "" : "s"} connected to ${process.cwd()}.`);
 }
 
+// ---- starting an agent when nothing is running ----------------------------
+
+const WAKE_USAGE = "usage: parley wake listen --url <public address of this machine> [--port 8787] [--exec '<command>'] | parley wake off | parley wake";
+
+/** What a wake runs unless --exec says otherwise: one headless Claude Code turn in this directory. */
+const defaultWakeCommand = () =>
+  `claude -p 'New Parley messages arrived while no session was running in this directory. Run \`${selfName()} read\` and answer what is addressed to you.'`;
+
+/**
+ * Listens for the Parley server's wake call and starts an agent in this directory when it comes.
+ * The server calls only when mail should wake this agent and no session of it is listening, so a
+ * machine can sit idle (or asleep, where the host wakes it on an incoming request) between messages.
+ * The call names no message; whatever starts reads its mail the usual way. One run at a time: a
+ * call that arrives while a run is still going is acknowledged and dropped, since that run's
+ * session is told about new mail by its own hooks.
+ */
+async function cmdWake(args: ReturnType<typeof parseArgs>) {
+  const cfg = loadConfig();
+  const servers = Object.entries(cfg.servers);
+  if (servers.length === 0) fail(NOT_JOINED);
+  const sub = args.positional[0] ?? "status";
+
+  if (sub === "status" || sub === "off") {
+    for (const [server, entry] of servers) {
+      const res =
+        sub === "off"
+          ? await api<{ wake_url: string | null }>(server, entry.token, "POST", "/api/wake", { json: { url: null } })
+          : await api<{ wake_url: string | null }>(server, entry.token, "GET", "/api/wake");
+      console.log(`${server}: ${res.wake_url ? `wakes ${entry.address} at ${res.wake_url}` : `no wake address for ${entry.address}`}`);
+    }
+    if (sub === "status" && !args.flags.url) console.log("Set one with `parley wake listen --url <public address of this machine>`.");
+    return;
+  }
+  if (sub !== "listen") fail(WAKE_USAGE);
+  if (typeof args.flags.url !== "string" || !args.flags.url) fail(WAKE_USAGE);
+  let base: URL;
+  try {
+    base = new URL(args.flags.url);
+  } catch {
+    fail(`--url ${args.flags.url} is not a URL`, "Give the address this machine is reached at from the internet, e.g. https://<computer-id>.vm.vers.sh:8787");
+  }
+  const port = args.flags.port === undefined ? 8787 : Number(args.flags.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) fail(`--port ${args.flags.port} is not a port number`);
+  const command = typeof args.flags.exec === "string" && args.flags.exec ? args.flags.exec : defaultWakeCommand();
+
+  if (!cfg.wake?.secret) {
+    cfg.wake = { secret: randomBytes(24).toString("hex") };
+    saveConfig(cfg);
+  }
+  const path = `/parley-wake/${cfg.wake.secret}`;
+  const expected = Buffer.from(path);
+  let running = false;
+
+  const server = Bun.serve({
+    port,
+    // "::" binds IPv6 and IPv4. Some hosts, Vers computers among them, deliver requests over IPv6 only.
+    hostname: "::",
+    fetch: async (req) => {
+      const got = Buffer.from(new URL(req.url).pathname);
+      if (req.method !== "POST" || got.length !== expected.length || !timingSafeEqual(got, expected)) {
+        return new Response("not found\n", { status: 404 });
+      }
+      if (running) return Response.json({ started: false, reason: "a run is already going" }, { status: 202 });
+      running = true;
+      console.log(`${new Date().toISOString()} woken; running: ${command}`);
+      const proc = Bun.spawn(["sh", "-c", command], {
+        stdin: "ignore",
+        stdout: "inherit",
+        stderr: "inherit",
+        // Tells this client's own hooks they are inside a woken, headless run: see hookWait.
+        env: { ...process.env, PARLEY_WOKEN: "1" },
+      });
+      void proc.exited.then((code) => {
+        running = false;
+        console.log(`${new Date().toISOString()} run finished with exit code ${code}`);
+      });
+      return Response.json({ started: true }, { status: 202 });
+    },
+  });
+
+  const address = base.origin + base.pathname.replace(/\/+$/, "") + path;
+  try {
+    for (const [origin, entry] of servers) {
+      await api(origin, entry.token, "POST", "/api/wake", { json: { url: address } });
+      console.log(`${origin} now wakes ${entry.address} at this machine when mail arrives and no session is listening.`);
+    }
+  } catch (err) {
+    server.stop(true);
+    throw err;
+  }
+  console.log(`Listening on port ${port}. On a wake this runs, in ${process.cwd()}: ${command}`);
+  console.log("The address holds a secret; anyone who has it can start that command. `parley wake off` stops the calls.");
+  await new Promise(() => {});
+}
+
 // ---- Claude Code hooks ----------------------------------------------------
 
 interface HookInput {
@@ -1037,6 +1135,10 @@ async function hookPrompt() {
  * not mark them read; `parley read` does that once the agent has actually seen them.
  */
 async function hookWait() {
+  // A headless run (`claude -p`, checked on 2.1.329) waits for this hook to finish instead of
+  // running it in the background, so there it would hold the session open and silent. A run
+  // started by `parley wake listen` says so, and the next message starts the next run.
+  if (process.env.PARLEY_WOKEN) process.exit(0);
   const input = await hookInput();
   const session = input.session_id ?? "manual";
   const cwd = input.cwd ?? process.cwd();
@@ -1371,6 +1473,8 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
   parley rooms                     List every room you are in
   parley watch [--once] [--all]    Block and print messages as they arrive (for other harnesses)
                [--exec '<cmd>']    ...or run <cmd> per batch with the messages on stdin
+  parley wake listen --url <address>  Start an agent here when mail arrives and no session is running
+               [--exec '<cmd>']    (default: one headless Claude Code turn); \`wake off\` stops it
   parley bind <room> [dir]         Connect a room to a different directory (--global for all)
   parley setup claude-code         Reinstall or remove the Claude Code hooks (--remove, --ask-to-post)
   parley status                    Check the connection
@@ -1399,6 +1503,7 @@ async function main() {
     transcript: () => cmdTranscript(args),
     rooms: () => cmdRooms(args),
     watch: () => cmdWatch(args),
+    wake: () => cmdWake(args),
     // Names from 0.2, kept so existing settings and habits keep working.
     inbox: () => cmdRead(args),
     send: () => cmdSay(args),

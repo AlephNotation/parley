@@ -7,7 +7,7 @@ export type MessageStatus = "sent" | "pending" | "rejected";
 export type Audience = "direct" | "room" | "fyi";
 
 /** Bump when the schema changes, and add the step from the previous version to MIGRATIONS. */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /** MIGRATIONS[n] upgrades a database from schema version n to n + 1. */
 const MIGRATIONS: Record<number, string> = {
@@ -32,6 +32,11 @@ const MIGRATIONS: Record<number, string> = {
   3: `
     ALTER TABLE threads ADD COLUMN archived_at INTEGER;
     ALTER TABLE threads ADD COLUMN archived_by TEXT;
+  `,
+  4: `
+    ALTER TABLE mailboxes ADD COLUMN wake_url TEXT;
+    ALTER TABLE mailboxes ADD COLUMN woken_message_id INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE mailboxes ADD COLUMN woken_at INTEGER NOT NULL DEFAULT 0;
   `,
 };
 
@@ -65,6 +70,12 @@ export interface MailboxRow {
   address: string;
   label: string;
   token_hash: string;
+  /** Webhook called when mail should wake this agent and no session of it is listening. */
+  wake_url: string | null;
+  /** Newest message the wake webhook was already called for, so each piece of mail calls it once. */
+  woken_message_id: number;
+  /** When the wake webhook was last called. */
+  woken_at: number;
   last_seen: number | null;
   created_at: number;
 }
@@ -174,7 +185,10 @@ export function openDb(path: string): Database {
       label TEXT NOT NULL,
       token_hash TEXT NOT NULL UNIQUE,
       last_seen INTEGER,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      wake_url TEXT,
+      woken_message_id INTEGER NOT NULL DEFAULT 0,
+      woken_at INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS participants (
       id TEXT PRIMARY KEY,
