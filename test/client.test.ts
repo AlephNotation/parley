@@ -1130,3 +1130,95 @@ describe("archived rooms and transcripts in the client", () => {
     expect(json.messages.some((m: any) => m.body === "last words")).toBe(true);
   });
 });
+
+describe("wake listen: starting an agent when no session is running", () => {
+  async function freePort() {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response("") });
+    const port = probe.port;
+    await probe.stop(true);
+    return port!;
+  }
+  async function until(check: () => boolean, ms = 5000) {
+    for (const end = Date.now() + ms; Date.now() < end && !check(); ) await Bun.sleep(20);
+    return check();
+  }
+  const lines = (path: string) => (existsSync(path) ? readFileSync(path, "utf8").trim().split("\n") : []);
+  const config = (m: ReturnType<typeof machine>) => JSON.parse(readFileSync(join(m.home, "config.json"), "utf8"));
+  const registered = async (m: ReturnType<typeof machine>) => (await s.call(config(m).servers[s.base].token, "GET", "/api/wake")).data.wake_url as string | null;
+  /** Starts the listener and waits until the server knows its address. */
+  async function listen(m: ReturnType<typeof machine>, exec: string) {
+    const port = await freePort();
+    const listener = m.spawn(["wake", "listen", "--url", `http://127.0.0.1:${port}`, "--port", String(port), "--exec", exec]);
+    for (let i = 0; i < 250 && !(await registered(m)); i++) await Bun.sleep(20);
+    const url = `http://127.0.0.1:${port}/parley-wake/${config(m).wake.secret}`;
+    return { port, url, listener };
+  }
+
+  test("mail arriving with no session running starts the command once, in the project directory", async () => {
+    const t = await scene();
+    const marker = join(t.acme.root, "runs");
+    const { port, url, listener } = await listen(t.acme, `pwd >> ${marker}; sleep 0.4`);
+    try {
+      expect(await registered(t.acme)).toBe(url);
+
+      await s.send(t.vers.token, t.id, "anyone home?");
+      expect(await until(() => lines(marker).length === 1)).toBe(true);
+      expect(realpathSync(lines(marker)[0]!)).toBe(realpathSync(t.acme.project));
+
+      // A call while that run is still going starts nothing; a wrong secret or a GET is not found.
+      const again = await fetch(url, { method: "POST", body: "{}" });
+      expect(again.status).toBe(202);
+      expect(await again.json()).toEqual({ started: false, reason: "a run is already going" });
+      expect((await fetch(`http://127.0.0.1:${port}/parley-wake/wrong`, { method: "POST" })).status).toBe(404);
+      expect((await fetch(url)).status).toBe(404);
+      await Bun.sleep(600);
+      expect(lines(marker).length).toBe(1);
+
+      // The mail is still unread for whatever was started, and the next message starts a new run.
+      const read = await t.acme.run(["read"]);
+      expect(read.stdout).toContain("anyone home?");
+      await s.send(t.vers.token, t.id, "one more");
+      expect(await until(() => lines(marker).length === 2)).toBe(true);
+
+      const status = await t.acme.run(["wake"]);
+      expect(status.stdout).toContain(`at ${url}`);
+      const off = await t.acme.run(["wake", "off"]);
+      expect(off.stdout).toContain("no wake address");
+      expect(await registered(t.acme)).toBeNull();
+    } finally {
+      listener.kill();
+      await listener.exited;
+    }
+  });
+
+  test("inside a woken run the wait hook stands down, so a headless session is not held open", async () => {
+    const t = await scene();
+    const out = join(t.acme.root, "env");
+    const { listener } = await listen(t.acme, `echo "woken=$PARLEY_WOKEN" > ${out}`);
+    try {
+      await s.send(t.vers.token, t.id, "wake up");
+      expect(await until(() => lines(out)[0] === "woken=1")).toBe(true);
+    } finally {
+      listener.kill();
+      await listener.exited;
+    }
+    // With mail waiting, the hook would normally block and then exit 2; here it returns at once.
+    const started = Date.now();
+    const hook = await t.acme.run(["hook", "wait"], { stdin: hookJson(t.acme, "Stop"), env: { PARLEY_WOKEN: "1" } });
+    expect(hook.code).toBe(0);
+    expect(hook.stderr).toBe("");
+    expect(Date.now() - started).toBeLessThan(3000);
+    const normal = await t.acme.run(["hook", "wait"], { stdin: hookJson(t.acme, "Stop") });
+    expect(normal.code).toBe(2);
+  });
+
+  test("it needs an address, and a room to have been joined", async () => {
+    const t = await scene();
+    const missing = await t.acme.run(["wake", "listen"]);
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toContain("usage: parley wake listen --url");
+    const fresh = await machine().run(["wake", "listen", "--url", "https://example.com"]);
+    expect(fresh.code).toBe(1);
+    expect(fresh.stderr).toContain("not in any room");
+  });
+});

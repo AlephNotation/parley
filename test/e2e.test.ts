@@ -850,7 +850,7 @@ describe("upgrading an older database", () => {
       await upgraded.stop();
     }
     const after = new Database(path);
-    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(4);
+    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(5);
     // Version 4 adds archiving; an old room starts open.
     expect(after.query("SELECT archived_at, archived_by FROM threads WHERE id = 'aa'").get()).toEqual({ archived_at: null, archived_by: null });
     after.close();
@@ -1143,5 +1143,118 @@ describe("pages", () => {
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
     }
+  });
+});
+
+describe("waking an agent that has no session running", () => {
+  function receiver() {
+    const hits: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        hits.push(await req.json());
+        return new Response("ok");
+      },
+    });
+    return { hits, url: server.url.origin + "/parley-wake/s3cret", stop: () => server.stop(true) };
+  }
+  /** Waits for the call made right after a message is delivered. */
+  async function arrived(hits: unknown[], n: number) {
+    for (let i = 0; i < 100 && hits.length < n; i++) await Bun.sleep(10);
+    return hits.length;
+  }
+  const setWake = (token: string, url: string | null) => s.call(token, "POST", "/api/wake", { url });
+
+  test("mail for an agent with nothing listening calls its wake URL at once, without the message text", async () => {
+    const hook = receiver();
+    const t = await s.setup(false);
+    expect((await setWake(t.acme.token, hook.url)).data.wake_url).toBe(hook.url);
+    expect((await s.call(t.acme.token, "GET", "/api/wake")).data.wake_url).toBe(hook.url);
+    const sent = await s.send(t.vers.token, t.id, "the launch code is swordfish");
+    expect(JSON.stringify(sent.data)).toContain("has no session running; Parley is calling its wake address to start one.");
+    expect(await arrived(hook.hits, 1)).toBe(1);
+    expect(hook.hits[0].text).toContain('1 new message for');
+    expect(hook.hits[0].rooms).toEqual([{ id: t.id, title: "Integration debugging" }]);
+    expect(hook.hits[0].agent).toBe(t.acme.address);
+    expect(JSON.stringify(hook.hits[0])).not.toContain("swordfish");
+    // The same mail never calls twice, however long it sits unread.
+    await s.app.sweepWakes();
+    await s.app.sweepWakes();
+    expect(hook.hits.length).toBe(1);
+    // Newer mail does.
+    await s.send(t.vers.token, t.id, "still there?");
+    expect(await arrived(hook.hits, 2)).toBe(2);
+    hook.stop();
+  });
+
+  test("an agent that is listening is told the usual way, and its wake URL is left alone", async () => {
+    const hook = receiver();
+    const t = await s.setup(false);
+    await setWake(t.acme.token, hook.url);
+    const waiting = s.inbox(t.acme.token, "?wait=5");
+    await Bun.sleep(50);
+    await s.send(t.vers.token, t.id, "you are awake");
+    expect(mail(await waiting)).toEqual(["you are awake"]);
+    await Bun.sleep(50);
+    await s.app.sweepWakes();
+    expect(hook.hits.length).toBe(0);
+    hook.stop();
+  });
+
+  test("an fyi wakes nobody, and mail from before the URL was set is not replayed", async () => {
+    const hook = receiver();
+    const t = await s.setup(false);
+    await s.send(t.vers.token, t.id, "sent before wakes were on");
+    await setWake(t.acme.token, hook.url);
+    await s.call(t.vers.token, "POST", `/api/threads/${t.id}/messages?fyi=1`, "just a status note");
+    await Bun.sleep(50);
+    await s.app.sweepWakes();
+    expect(hook.hits.length).toBe(0);
+    hook.stop();
+  });
+
+  test("turning it off stops the calls, and only the agent itself can set it", async () => {
+    const hook = receiver();
+    const t = await s.setup(false);
+    await setWake(t.acme.token, hook.url);
+    expect((await setWake(t.acme.token, null)).data.wake_url).toBeNull();
+    await s.send(t.vers.token, t.id, "anyone?");
+    await Bun.sleep(50);
+    await s.app.sweepWakes();
+    expect(hook.hits.length).toBe(0);
+    expect((await setWake(t.acmeHuman, hook.url)).status).toBe(403);
+    expect((await s.call(null, "GET", "/api/wake")).status).toBe(401);
+    hook.stop();
+  });
+
+  test("calls are spaced by the cooldown, and mail that arrived meanwhile is picked up by a later sweep", async () => {
+    const spaced = startServer({ wakeCooldownMs: 300 });
+    const hook = receiver();
+    const t = await spaced.setup(false);
+    await spaced.call(t.acme.token, "POST", "/api/wake", { url: hook.url });
+    await spaced.send(t.vers.token, t.id, "one");
+    expect(await arrived(hook.hits, 1)).toBe(1);
+    await spaced.send(t.vers.token, t.id, "two");
+    await Bun.sleep(50);
+    await spaced.app.sweepWakes();
+    expect(hook.hits.length).toBe(1);
+    await Bun.sleep(300);
+    await spaced.app.sweepWakes();
+    expect(hook.hits.length).toBe(2);
+    expect(hook.hits[1].unread).toBe(1);
+    hook.stop();
+    await spaced.stop();
+  });
+
+  test("a wake URL must be a public https address", async () => {
+    const strict = startServer({ allowPrivateWebhooks: false });
+    const t = await strict.setup(false);
+    for (const url of ["http://example.com/x", "https://127.0.0.1/x", "https://localhost/x", "not a url"]) {
+      const res = await strict.call(t.acme.token, "POST", "/api/wake", { url });
+      expect(res.status).toBe(400);
+      expect(res.data.error.code).toBe("bad_wake_url");
+    }
+    expect((await strict.call(t.acme.token, "POST", "/api/wake", { url: "https://agent.example.com/parley-wake/x" })).status).toBe(200);
+    await strict.stop();
   });
 });
