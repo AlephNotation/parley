@@ -8,183 +8,177 @@
 <title>Parley</title>
 <style>
   /*
-   * An instant messenger from about 2005: a chat-room window and a Buddy List side by side on a
-   * blue desktop, with rounded blue title bars and beige window faces. The conversation is set the
-   * way that client set it: Times, tight lines, a bold "Name (10:32:15 PM):" in red for your side and
-   * blue for everyone else, OnlineHost for room events, and typed smileys drawn as yellow faces.
+   * A room set as a plain-text document: one monospaced face at one size, structure carried by the
+   * marks a text file would use (# headings, [ bracketed ] actions, * bullets, --- rules), near-black
+   * ink on a pale page, and colour kept for who is speaking and for links.
    */
   :root {
-    --desk:#3a6ea5; --face:#ece9d8; --ink:#000; --muted:#55524a; --frame:#0831d9; --bad:#b00000;
-    --paper:#fff; --paper-ink:#000; --paper-muted:#6b6b6b; --rule:#aca899; --field:#7f9db9;
-    --me:#cc0000; --them:#0000cc; --link:#0000ee; --group:#0046d5; --sel:#316ac5;
-    --tome-bg:#fff8c4; --tome-bar:#e6a800; --mine-bg:#fff1dc; --mine-bar:#e07b00; --code-bg:#f4f3ee;
-    --btn1:#fff; --btn2:#ecebe5; --btn3:#d8d0c4; --btn-border:#003c74; --warnbg:#ffffe1; --hover:#fff7d6;
-    --title:linear-gradient(180deg,#0997ff 0%,#0053ee 9%,#0050ee 40%,#0066ff 88%,#005bff 94%,#003dd7 100%);
-    --text:"Times New Roman", Times, "Liberation Serif", serif;
-    --mono:"Courier New", Courier, monospace;
-    --chrome:Tahoma, "Segoe UI", Geneva, Verdana, sans-serif;
+    --paper:#f7f7f8; --raised:#ffffff; --ink:#09090b; --muted:#6f6f78; --rule:#dcdce1; --faint:#ececf0;
+    --me:#c2255c; --them:#1c64d0; --link:#1c64d0; --bad:#c22525; --ok:#17803d; --warn:#a15c00;
+    --mono:"Berkeley Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --desk:#12233a; --face:#2f3238; --ink:#e8eaed; --muted:#aab0b8; --frame:#0a2a8a; --bad:#ff8f86;
-      --paper:#16181c; --paper-ink:#e6e8eb; --paper-muted:#98a0aa; --rule:#4a4f57; --field:#56606e;
-      --me:#ff7b72; --them:#8ab4ff; --link:#8ab4ff; --group:#8ab4ff; --sel:#2a5db0;
-      --tome-bg:#3a3414; --tome-bar:#e0a92a; --mine-bg:#33260f; --mine-bar:#e0892a; --code-bg:#23272d;
-      --btn1:#4a4e56; --btn2:#3d4148; --btn3:#33363c; --btn-border:#0d0e10; --warnbg:#3d3720; --hover:#3a3d44;
-      --title:linear-gradient(180deg,#0a6fc0 0%,#0a3da8 9%,#0a3aa6 40%,#0c4bbd 88%,#0a41b0 94%,#072a8a 100%);
+      --paper:#0d0d0f; --raised:#17171a; --ink:#ececef; --muted:#8f8f99; --rule:#2e2e34; --faint:#1d1d21;
+      --me:#ff7aa8; --them:#7db0ff; --link:#7db0ff; --bad:#ff8080; --ok:#5fd08a; --warn:#f0b35a;
     }
   }
   * { box-sizing:border-box; }
-  body { margin:0; padding:14px; min-height:100vh; background:var(--desk); color:var(--ink); font:12px/1.4 var(--chrome); }
-  .desktop { display:grid; grid-template-columns:minmax(0,1fr) 264px; gap:14px; align-items:start; max-width:1180px; margin:0 auto; }
-  .window { display:flex; flex-direction:column; min-width:0; background:var(--frame); border-radius:8px 8px 0 0; padding:0 3px 3px; box-shadow:2px 3px 8px rgba(0,0,0,.4); }
-  .titlebar { display:flex; gap:6px; align-items:center; min-height:28px; margin:0 -3px; padding:3px 5px 3px 8px; background:var(--title); border-radius:8px 8px 0 0; color:#fff; }
-  .titlebar h1 { flex:1; min-width:0; margin:0; font:bold 13px/1.2 "Trebuchet MS", var(--chrome); text-shadow:1px 1px #0f1089; overflow-wrap:anywhere; }
-  .appicon { flex:none; width:14px; height:14px; border-radius:50%; background:radial-gradient(circle at 35% 30%, #fff7a8, #ffc400 60%, #c98a00); border:1px solid rgba(0,0,0,.35); }
-  .caption { display:flex; gap:2px; flex:none; }
-  .caption span { display:block; width:21px; height:21px; border:1px solid #fff; border-radius:3px; background:linear-gradient(135deg,#3c8cf5,#1650c9); color:#fff; font:bold 12px/18px var(--chrome); text-align:center; }
-  .caption span:last-child { background:linear-gradient(135deg,#f0907a,#c42e12); }
-  .winbody { display:flex; flex-direction:column; flex:1; min-height:0; background:var(--face); }
-  .menubar { display:flex; flex-wrap:wrap; gap:4px 10px; align-items:center; justify-content:space-between; padding:3px 8px; border-bottom:1px solid var(--rule); }
+  body { margin:0; padding:40px; min-height:100vh; background:var(--paper); color:var(--ink); font:12px/24px var(--mono); font-variant-ligatures:none; -webkit-font-smoothing:antialiased; }
+  .desktop { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:56px; align-items:start; max-width:1320px; margin:0 auto; }
+  .window, .winbody { display:flex; flex-direction:column; min-width:0; min-height:0; }
+  .winbody { flex:1; }
+  .top { display:flex; gap:16px; align-items:flex-start; justify-content:space-between; margin-bottom:24px; line-height:18px; }
+  .top .brand { text-transform:uppercase; letter-spacing:.04em; }
+  h1, h2 { margin:0; font:inherit; font-weight:700; text-transform:uppercase; letter-spacing:.04em; overflow-wrap:anywhere; }
+  h1::before { content:"# "; color:var(--muted); font-weight:400; }
+  h2::before { content:"## "; color:var(--muted); font-weight:400; }
   .muted { color:var(--muted); }
-  a { color:var(--link); }
-  h2 { font-size:12px; font-weight:bold; margin:0 0 4px; }
-  button, select { padding:2px 10px; min-height:23px; color:var(--ink); font:inherit; cursor:pointer; border:1px solid var(--btn-border); border-radius:3px; background:linear-gradient(180deg, var(--btn1), var(--btn2) 86%, var(--btn3)); }
-  select { padding:1px 4px; border-color:var(--field); border-radius:0; background:var(--paper); color:var(--paper-ink); }
-  button:hover { box-shadow:inset 0 0 0 2px #f8b636; }
-  button:active { background:linear-gradient(180deg, var(--btn3), var(--btn2)); box-shadow:none; }
-  button:focus-visible, select:focus-visible { outline:1px dotted var(--ink); outline-offset:-4px; }
-  button.primary { font-weight:bold; box-shadow:inset 0 0 0 2px #8fb1ef; }
-  button.primary:hover { box-shadow:inset 0 0 0 2px #f8b636; }
-  button.danger { color:var(--bad); }
-  button.small { padding:0 7px; min-height:19px; font-size:11px; }
-  input[type=text], input[type=url], input:not([type]), textarea, .sunken { background:var(--paper); color:var(--paper-ink); font:inherit; padding:3px 4px; border:1px solid var(--field); border-radius:0; }
-  input:focus, textarea:focus { outline:1px solid var(--sel); outline-offset:0; }
-  .chip { font-size:11px; padding:0 6px; border:1px solid var(--rule); background:var(--paper); color:var(--paper-ink); }
-  .chip::before { content:""; display:inline-block; width:7px; height:7px; margin-right:5px; border-radius:50%; background:#2aa82a; }
-  .chip.paused { background:var(--warnbg); }
-  .chip.paused::before { background:#e0a000; }
+  a { color:var(--link); text-decoration:underline; text-decoration-style:dotted; text-underline-offset:4px; }
+  a:hover { text-decoration-style:solid; }
 
-  /* ---- the chat window ---- */
-  #chatWin { height:calc(100vh - 28px); min-height:540px; }
-  .main { display:flex; flex-direction:column; flex:1; min-height:0; padding:8px; }
+  /* Actions read as [ bracketed ] words; the one that sends is a solid label. */
+  button { padding:0 2px; min-height:24px; color:var(--ink); font:inherit; text-transform:uppercase; letter-spacing:.04em; cursor:pointer; border:0; border-radius:0; background:none; }
+  button::before { content:"[ "; color:var(--muted); }
+  button::after { content:" ]"; color:var(--muted); }
+  button:hover { background:var(--ink); color:var(--paper); }
+  button:hover::before, button:hover::after { color:var(--paper); }
+  button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible { outline:2px solid var(--link); outline-offset:2px; }
+  button.primary { padding:2px 12px; border-radius:3px; background:var(--ink); color:var(--paper); }
+  button.primary::before, button.primary::after { content:none; }
+  button.primary:hover { background:var(--link); color:#fff; }
+  button.danger { color:var(--bad); }
+  button.danger:hover { background:var(--bad); color:var(--paper); }
+  button.small { min-height:20px; }
+  select { padding:1px 4px; min-height:24px; color:var(--ink); font:inherit; cursor:pointer; border:1px solid var(--rule); border-radius:0; background:var(--raised); }
+  input[type=text], input[type=url], input[type=password], input:not([type]), textarea { background:var(--raised); color:var(--ink); font:inherit; padding:3px 8px; border:1px solid var(--rule); border-radius:0; }
+  input:focus, textarea:focus { border-color:var(--ink); }
+  input[type=checkbox] { accent-color:var(--ink); margin:6px 0 0; }
+  ::placeholder { color:var(--muted); opacity:1; }
+  .chip { flex:none; text-transform:uppercase; letter-spacing:.04em; white-space:nowrap; }
+  .chip::before { content:"[ ● "; color:var(--ok); }
+  .chip::after { content:" ]"; color:var(--muted); }
+  .chip.paused::before { content:"[ ○ "; color:var(--warn); }
+
+  /* ---- the room ---- */
+  #chatWin { height:calc(100vh - 80px); min-height:540px; }
+  .menubar { display:contents; }
+  .main { display:flex; flex-direction:column; flex:1; min-height:0; }
   .main[hidden], #buddyWin[hidden] { display:none; }
-  #log, #pending { padding:3px 0; overflow-y:auto; font:16px/1.3 var(--text); }
-  #log { flex:1 1 auto; min-height:180px; }
-  #pending { flex:1 1 auto; min-height:0; }
-  #pendingWrap { flex:0 0 auto; max-height:40%; min-height:130px; display:flex; flex-direction:column; margin-top:8px; }
+  #log, #pending { overflow-y:auto; font-size:13px; line-height:22px; }
+  #log { flex:1 1 auto; min-height:180px; border-top:1px dashed var(--rule); border-bottom:1px dashed var(--rule); padding:8px 0; }
+  #pending { flex:1 1 auto; min-height:0; padding:4px 0; }
+  #pendingWrap { flex:0 0 auto; max-height:40%; min-height:0; display:flex; flex-direction:column; margin-top:16px; }
   #pendingWrap[hidden] { display:none; }
   #composer, #error { flex:none; }
   /* The right padding keeps a readable measure in a wide window while a highlight still spans the row. */
-  .msg { position:relative; padding:1px 8px 2px 8px; padding-right:max(8px, calc(100% - 92ch)); overflow-wrap:anywhere; color:var(--paper-ink); }
-  .msg::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:transparent; }
-  .msg.tome { background:var(--tome-bg); }
-  .msg.tome::before { background:var(--tome-bar); }
-  .msg.pending { background:var(--mine-bg); }
-  .msg.pending::before { background:var(--mine-bar); }
-  /* The whole "Name (10:32:15 PM):" is bold in the speaker's colour, with the time set small. */
-  .head { font-weight:bold; color:var(--them); }
+  .msg { position:relative; padding:3px 12px 3px 14px; padding-right:max(12px, calc(100% - 88ch)); overflow-wrap:anywhere; }
+  .msg::before { content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:transparent; }
+  .msg.tome { background:var(--raised); }
+  .msg.tome::before { background:var(--ink); }
+  .msg.pending { background:var(--raised); }
+  .msg.pending::before { background:var(--me); }
+  .head { font-weight:700; color:var(--them); }
   .head.mine { color:var(--me); }
-  .time { font-size:.72em; white-space:nowrap; }
-  .badge { font-size:.8em; font-weight:normal; color:var(--paper-muted); }
-  .badge.tome { color:var(--paper-ink); font-weight:bold; }
-  .badge.fyi { font-style:italic; }
-  .smiley { width:1em; height:1em; vertical-align:-.15em; }
-  .msg.fyi .text { color:var(--paper-muted); }
+  .time { font-weight:400; color:var(--muted); white-space:nowrap; }
+  .badge { font-weight:400; color:var(--muted); }
+  .badge.tome { color:var(--ink); font-weight:700; }
+  .smiley { width:1.15em; height:1.15em; vertical-align:-.22em; }
+  .msg.fyi .text { color:var(--muted); }
   .text, .text > p:first-child { display:inline; }
-  .text p { margin:.35em 0 0; }
-  .text ul, .text ol { margin:.25em 0 0; padding-left:1.8em; }
+  .text p { margin:.4em 0 0; }
+  .text ul, .text ol { margin:.3em 0 0; padding-left:2.4em; }
+  .text ul { list-style:none; }
+  .text ul > li::before { content:"* "; color:var(--muted); margin-left:-2ch; }
   .text li { margin:0; }
-  .text .label { font-weight:bold; }
-  .text code { font:14px/1.3 var(--mono); }
-  .text pre { margin:.3em 0 .2em; padding:3px 6px; background:var(--code-bg); overflow-x:auto; }
-  .text pre code { line-height:1.35; white-space:pre; }
-  .clip { max-height:21em; overflow:hidden; position:relative; }
+  .text .label { font-weight:700; }
+  .text code { font:inherit; padding:1px 4px; background:var(--faint); }
+  /* A code block is fenced the way it was typed. */
+  .text pre { margin:.4em 0 .3em; overflow-x:auto; }
+  .text pre::before, .text pre::after { content:"```"; display:block; color:var(--muted); }
+  .text pre code { padding:0; background:none; white-space:pre; }
+  .clip { max-height:22em; overflow:hidden; position:relative; }
   .clip::after { content:""; position:absolute; left:0; right:0; bottom:0; height:4em; background:linear-gradient(to bottom, transparent, var(--paper)); pointer-events:none; }
-  .msg.tome .clip::after { background:linear-gradient(to bottom, transparent, var(--tome-bg)); }
-  .msg.pending .clip::after { background:linear-gradient(to bottom, transparent, var(--mine-bg)); }
-  .more { display:block; margin:3px 0; font-family:var(--chrome); }
-  .msg.system .head { color:var(--them); }
-  .day { position:sticky; top:-3px; z-index:1; margin:0 0 2px; padding:2px 8px; font:11px/1.5 var(--chrome); color:var(--paper-muted); background:var(--paper); border-bottom:1px solid var(--rule); }
-  .review { display:flex; gap:6px; margin-top:6px; font:12px/1.4 var(--chrome); }
+  .msg.tome .clip::after, .msg.pending .clip::after { background:linear-gradient(to bottom, transparent, var(--raised)); }
+  .more { display:block; margin:2px 0; }
+  .msg.system, .msg.system .head { color:var(--muted); font-weight:400; }
+  .day { position:sticky; top:-8px; z-index:1; padding:2px 14px; color:var(--muted); background:var(--paper); }
+  .day::before { content:"--- "; }
+  .day::after { content:" ---"; }
+  .review { display:flex; gap:12px; margin-top:6px; font-size:12px; }
 
-  /* ---- composer: formatting strip, text box, then the big buttons ---- */
-  #composer { margin-top:6px; }
-  .fmt { display:flex; flex-wrap:wrap; gap:3px 6px; align-items:center; padding:3px 4px; border:1px solid var(--field); border-bottom:0; background:linear-gradient(180deg, var(--btn1), var(--btn2)); }
-  .fmt button { min-width:24px; min-height:21px; padding:0 5px; border-color:transparent; background:none; font:13px/1 "Times New Roman", serif; }
-  .fmt button:hover { border-color:var(--btn-border); background:var(--hover); box-shadow:none; }
-  .fmt .sep { width:1px; height:17px; background:var(--rule); }
+  /* ---- composer ---- */
+  #composer { margin-top:16px; }
+  .fmt { display:flex; flex-wrap:wrap; gap:2px 10px; align-items:center; margin-bottom:6px; }
+  .fmt button { text-transform:none; letter-spacing:0; padding:0 6px; }
+  .fmt button::before, .fmt button::after { content:none; }
+  .fmt .sep { width:1px; height:14px; background:var(--rule); }
   #to { min-width:0; max-width:100%; }
-  #toHint { flex:1; min-width:0; font-size:11px; }
-  #body { display:block; width:100%; height:66px; resize:vertical; font:16px/1.3 var(--text); }
-  .bigbar { display:flex; gap:4px; align-items:stretch; justify-content:space-between; margin-top:6px; }
-  .big { display:flex; flex-direction:column; gap:3px; align-items:center; justify-content:center; min-width:64px; min-height:46px; padding:4px 8px; }
-  .big.flat { border-color:transparent; background:none; }
-  .big.flat:hover { border-color:var(--btn-border); background:var(--hover); box-shadow:none; }
-  .big[hidden] { display:none; }
-  .ico { display:block; width:0; height:0; }
-  .ico.pause { width:13px; height:14px; border-left:4px solid var(--bad); border-right:4px solid var(--bad); }
-  .ico.play { border-left:13px solid #1f8f1f; border-top:7px solid transparent; border-bottom:7px solid transparent; }
-  .ico.send { width:22px; height:14px; border-radius:2px; background:linear-gradient(135deg,#fff7a8,#ffc400); border:1px solid #9a6b00; position:relative; }
-  .ico.send::after { content:""; position:absolute; left:3px; right:3px; top:2px; height:6px; border:solid #9a6b00; border-width:0 1px 1px; transform:skewY(0deg) scaleY(.9); clip-path:polygon(0 0, 50% 100%, 100% 0); background:#9a6b00; opacity:.55; }
-  #note { flex:1; min-width:0; align-self:center; padding:0 8px; }
+  #toHint { flex:1; min-width:0; line-height:18px; }
+  #body { display:block; width:100%; height:74px; resize:vertical; font-size:13px; line-height:22px; }
+  .bigbar { display:flex; gap:12px; align-items:center; justify-content:space-between; margin-top:8px; }
+  .big[hidden], .ico { display:none; }
+  #note { flex:1; min-width:0; }
   #error { color:var(--bad); }
-  #error:not(:empty) { margin-top:4px; }
-  #empty { padding:32px 16px; text-align:center; }
+  #error:not(:empty) { margin-top:6px; }
+  #error:not(:empty)::before { content:"! "; }
+  #empty { padding:48px 0; }
   /* A room-wide message every agent read and nobody answered: only a human can give it an owner. */
-  #unowned { flex:none; display:flex; flex-wrap:wrap; gap:4px 8px; align-items:center; margin-top:6px; padding:4px 8px; background:var(--warnbg); color:var(--ink); border:1px solid var(--tome-bar); }
-  #unowned[hidden] { display:none; }
-  #archivedNote { flex:none; margin-top:6px; padding:6px 8px; background:var(--warnbg); color:var(--ink); border:1px solid var(--rule); }
-  #archivedNote[hidden] { display:none; }
+  #unowned, #archivedNote { flex:none; margin-top:12px; padding:6px 12px; background:var(--raised); border-left:2px solid var(--warn); }
+  #unowned { display:flex; flex-wrap:wrap; gap:4px 12px; align-items:center; }
+  #unowned[hidden], #archivedNote[hidden] { display:none; }
   #unowned span { flex:1; min-width:12em; }
-  .msg.flash { outline:2px solid var(--tome-bar); outline-offset:-2px; }
+  .msg.flash { outline:1px solid var(--ink); outline-offset:-1px; }
 
-  /* ---- the Buddy List ---- */
-  #buddyWin { height:calc(100vh - 28px); max-height:640px; }
-  .band { display:flex; align-items:baseline; justify-content:space-between; gap:8px; padding:7px 9px; background:linear-gradient(180deg,#1c5fd6,#0b3fae); color:#fff; border-bottom:2px solid #ffc400; }
-  .band b { font:italic bold 18px/1 "Trebuchet MS", var(--chrome); letter-spacing:.01em; color:#ffd84a; text-shadow:1px 1px 0 rgba(0,0,0,.45); }
-  .tabs { display:flex; gap:2px; padding:6px 6px 0; border-bottom:1px solid var(--rule); }
-  .tabs button { margin-bottom:-1px; padding:2px 10px; min-height:21px; border:1px solid var(--rule); border-radius:3px 3px 0 0; background:var(--btn2); box-shadow:none; }
-  .tabs button[aria-selected="true"] { background:var(--paper); color:var(--paper-ink); border-bottom-color:var(--paper); border-top:3px solid #f8b636; padding-top:0; }
-  .panel { flex:1; min-height:0; overflow-y:auto; padding:6px; }
+  /* ---- who is here, and setup ---- */
+  #buddyWin { height:calc(100vh - 80px); }
+  .tabs { display:flex; gap:10px; margin-bottom:12px; }
+  .tabs button[aria-selected="true"] { background:var(--ink); color:var(--paper); }
+  .tabs button[aria-selected="true"]::before, .tabs button[aria-selected="true"]::after { color:var(--paper); }
+  .panel { flex:1; min-height:0; overflow-y:auto; }
   .panel[hidden] { display:none; }
-  #panel-online { padding:6px; display:flex; }
-  #panel-online[hidden] { display:none; }
-  #people { flex:1; min-height:230px; margin:0; padding:4px 2px; list-style:none; overflow-y:auto; font:12px/1.35 var(--chrome); }
-  #people .group > button { display:block; width:100%; min-height:20px; padding:1px 4px; border:0; background:none; box-shadow:none; text-align:left; font-weight:bold; color:var(--paper-ink); }
-  #people .group > button:hover { background:var(--hover); }
-  #people .group > button::before { content:"▾"; display:inline-block; width:13px; color:var(--paper-muted); }
-  #people .group.shut > button::before { content:"▸"; }
+  #people { margin:0; padding:0; list-style:none; }
+  #people button { text-transform:none; letter-spacing:0; }
+  #people button::after { content:none; }
+  #people .group > button { display:block; width:100%; padding:0; text-align:left; font-weight:700; }
+  #people .group > button::before { content:"▾ "; color:var(--muted); font-weight:400; }
+  #people .group.shut > button::before { content:"▸ "; }
   #people .group.shut ul { display:none; }
-  #people ul { list-style:none; margin:0 0 4px; padding:0; }
-  #people .buddy { display:flex; gap:4px; align-items:baseline; padding:1px 4px 1px 20px; color:var(--paper-ink); }
+  #people ul { list-style:none; margin:0 0 12px; padding:0; }
+  #people .buddy { display:flex; gap:8px; align-items:baseline; padding-left:2ch; }
   #people .buddy .name { flex:1; min-width:0; overflow-wrap:anywhere; }
-  #people .buddy .idle { flex:none; font-size:11px; color:var(--paper-muted); }
-  #people .buddy.away .name, #people .buddy.not_joined .name { color:var(--paper-muted); font-style:italic; }
-  #people .buddy.unread .name { font-weight:bold; }
-  #people .hint { padding:1px 4px 1px 20px; }
-  #people .hint button { min-height:0; padding:0; border:0; background:none; box-shadow:none; color:var(--link); text-decoration:underline; }
-  .dot { flex:none; display:inline-block; width:8px; height:8px; border-radius:50%; border:1px solid var(--paper-muted); background:transparent; align-self:center; }
-  .dot.listening { background:#2aa82a; border-color:#1a6e1a; }
-  .dot.away { background:#ffd84a; border-color:#9a6b00; border-radius:1px; }
-  fieldset.card { border:1px solid var(--rule); border-radius:4px; padding:4px 8px 8px; min-width:0; margin:0 0 8px; }
-  fieldset.card legend { padding:0 3px; color:var(--group); }
-  .card label { display:flex; gap:6px; align-items:flex-start; }
-  ul.plain { list-style:none; margin:0; padding:0; }
-  ul.plain li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:2px 0; }
-  #inviteText { width:100%; font:11px/1.45 var(--mono); height:110px; margin:6px 0; resize:vertical; }
+  #people .buddy .idle { flex:none; color:var(--muted); }
+  #people .buddy.away .name, #people .buddy.not_joined .name { color:var(--muted); }
+  #people .buddy.unread .name { font-weight:700; }
+  #people .hint { padding-left:2ch; }
+  #people .hint button { padding:0; color:var(--link); text-decoration:underline dotted; text-underline-offset:4px; }
+  #people .hint button::before { content:none; }
+  #people .hint button:hover { background:none; text-decoration-style:solid; }
+  /* Presence is drawn like a node on a line: filled when listening, open when away, dashed before joining. */
+  .dot { flex:none; display:inline-block; width:9px; height:9px; border-radius:50%; border:1px solid var(--ink); background:transparent; align-self:center; }
+  .dot.listening { background:var(--ink); }
+  .dot.not_joined { border-style:dashed; border-color:var(--muted); }
+  fieldset.card { border:0; border-top:1px dashed var(--rule); padding:12px 0 4px; min-width:0; margin:0 0 12px; }
+  fieldset.card:first-child { border-top:0; padding-top:0; }
+  fieldset.card legend { float:left; width:100%; padding:0; margin-bottom:4px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  fieldset.card legend::before { content:"## "; color:var(--muted); font-weight:400; }
+  fieldset.card legend + * { clear:both; }
+  .card .muted { line-height:20px; }
+  .card label { display:flex; gap:8px; align-items:flex-start; }
+  ul.plain { list-style:none; margin:0; padding:0; clear:both; }
+  ul.plain li { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  #inviteText { width:100%; height:120px; margin:8px 0 4px; resize:vertical; line-height:18px; }
   #notifyUrl { flex:1; min-width:0; }
-  .statusbar { padding:2px 8px; border-top:1px solid var(--rule); font-size:11px; }
-  @media (max-width: 800px) {
-    body { padding:6px; }
-    .desktop { grid-template-columns:minmax(0,1fr); gap:8px; }
+  .statusbar { margin-top:12px; padding-top:8px; border-top:1px dashed var(--rule); }
+  @media (max-width: 860px) {
+    body { padding:16px; }
+    .desktop { grid-template-columns:minmax(0,1fr); gap:32px; }
     #chatWin { height:auto; min-height:0; }
     #log { flex:none; height:58vh; }
     #pendingWrap { max-height:none; }
-    #buddyWin { height:auto; max-height:none; }
-    .msg { padding-right:8px; }
+    #buddyWin { height:auto; }
+    .msg { padding-right:12px; }
     #to { flex:1 1 0; }
-    #people { min-height:120px; }
     #toHint { flex-basis:100%; }
   }
 </style>
@@ -192,22 +186,21 @@
 <body>
 <div class="desktop">
 <section class="window" id="chatWin">
-  <div class="titlebar">
-    <span class="appicon" aria-hidden="true"></span>
-    <h1 id="title">Parley</h1>
-    <span class="caption" aria-hidden="true"><span>_</span><span>□</span><span>×</span></span>
-  </div>
   <div class="winbody">
-    <div class="menubar">
-      <span id="sub" class="muted"></span>
+    <header class="top">
+      <div>
+        <div class="brand">Parley</div>
+        <h1 id="title">Parley</h1>
+        <div id="sub" class="muted"></div>
+      </div>
       <span id="status" class="chip">connecting</span>
-    </div>
+    </header>
     <div id="empty" hidden>This link has no access token. Open the full room link you were sent.</div>
     <div class="main" id="layout" hidden>
-      <div id="log" class="sunken" aria-live="polite"></div>
+      <div id="log" aria-live="polite"></div>
       <div id="pendingWrap" hidden>
         <h2>Waiting for your review</h2>
-        <div id="pending" class="sunken"></div>
+        <div id="pending"></div>
       </div>
       <div id="unowned" role="status" hidden></div>
       <div id="archivedNote" role="status" hidden></div>
@@ -217,8 +210,8 @@
           <select id="to"></select>
           <span class="sep"></span>
           <button type="button" id="fmtBold" title="Bold"><b>B</b></button>
-          <button type="button" id="fmtCode" title="Code" style="font-family:var(--mono); font-size:11px">&lt;/&gt;</button>
-          <button type="button" id="fmtLink" title="Link"><u style="color:var(--link)">link</u></button>
+          <button type="button" id="fmtCode" title="Code">&lt;/&gt;</button>
+          <button type="button" id="fmtLink" title="Link">link</button>
           <button type="button" id="fmtSmile" title="Smiley" aria-label="Smiley"></button>
           <span id="toHint" class="muted"></span>
         </div>
@@ -234,19 +227,17 @@
   </div>
 </section>
 <aside class="window" id="buddyWin" hidden>
-  <div class="titlebar">
-    <span class="appicon" aria-hidden="true"></span>
-    <h1 id="buddyTitle">Buddy List</h1>
-    <span class="caption" aria-hidden="true"><span>_</span><span>×</span></span>
-  </div>
   <div class="winbody">
-    <div class="band"><b>Parley</b><span id="peopleCount"></span></div>
+    <header class="top">
+      <h2 id="buddyTitle">In this room</h2>
+      <span id="peopleCount" class="muted"></span>
+    </header>
     <div class="tabs" role="tablist">
       <button type="button" role="tab" id="tab-online" aria-controls="panel-online" aria-selected="true">Online</button>
       <button type="button" role="tab" id="tab-setup" aria-controls="panel-setup" aria-selected="false">Setup</button>
     </div>
     <div class="panel" id="panel-online" role="tabpanel" aria-labelledby="tab-online">
-      <ul id="people" class="sunken"></ul>
+      <ul id="people"></ul>
     </div>
     <div class="panel" id="panel-setup" role="tabpanel" aria-labelledby="tab-setup" hidden>
       <fieldset class="card">
@@ -359,20 +350,20 @@
     return node;
   }
 
-  /** A typed smiley drawn as the round yellow face a 2005 messenger would swap in. */
+  /** A typed smiley drawn as a small line face in the text colour. */
   function smiley(typed) {
     const face = FACES[typed];
-    const ink = "#3b2a00";
+    const ink = "currentColor";
     const svg = shape("svg", { viewBox: "0 0 16 16", class: "smiley", role: "img", "aria-label": typed });
     svg.append(shape("title", {}));
     svg.firstChild.textContent = typed;
-    svg.append(shape("circle", { cx: 8, cy: 8, r: 7.2, fill: "#ffd83b", stroke: "#a06a00" }));
+    svg.append(shape("circle", { cx: 8, cy: 8, r: 7.2, fill: "none", stroke: ink }));
     if (face === "wink") svg.append(shape("path", { d: "M4.2 6.6h2.8", stroke: ink, "stroke-width": 1.2, "stroke-linecap": "round" }));
     else svg.append(shape("circle", { cx: 5.6, cy: 6.4, r: 1.1, fill: ink }));
     svg.append(shape("circle", { cx: 10.4, cy: 6.4, r: 1.1, fill: ink }));
     const mouth = face === "frown" ? "M4.6 11.8Q8 8.6 11.4 11.8" : face === "grin" ? "M4.2 9.2Q8 14.6 11.8 9.2Z" : "M4.6 9.6Q8 13 11.4 9.6";
-    svg.append(shape("path", { d: mouth, fill: face === "grin" ? "#fff" : "none", stroke: ink, "stroke-width": 1.1, "stroke-linecap": "round", "stroke-linejoin": "round" }));
-    if (face === "tongue") svg.append(shape("path", { d: "M7.4 11.2v1.6a1.3 1.3 0 0 0 2.6 0v-1.9Z", fill: "#e2463c", stroke: ink, "stroke-width": 0.6 }));
+    svg.append(shape("path", { d: mouth, fill: "none", stroke: ink, "stroke-width": 1.1, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+    if (face === "tongue") svg.append(shape("path", { d: "M7.4 11.2v1.6a1.3 1.3 0 0 0 2.6 0v-1.9Z", fill: "none", stroke: ink, "stroke-width": 0.6 }));
     return svg;
   }
 
@@ -479,7 +470,7 @@
       const node = el("div", "msg system");
       node.title = new Date(m.at).toLocaleString();
       const head = el("span", "head");
-      head.append("OnlineHost ", el("span", "time", "(" + timeOf(new Date(m.at)) + ")"), ": ");
+      head.append("Parley ", el("span", "time", "(" + timeOf(new Date(m.at)) + ")"), ": ");
       node.append(head, el("span", "text", m.body));
       return node;
     }
@@ -615,7 +606,7 @@
     return {};
   }
 
-  // ---- the Buddy List: one group per side ----
+  // ---- who is in the room: one group per side ----
 
   function buddyNode(x) {
     const li = el("li", "buddy " + x.state + (x.unread ? " unread" : ""));
@@ -708,8 +699,7 @@
     version = state.version;
     const human = state.you.kind === "human";
     document.title = state.thread.title + " · Parley";
-    $("title").textContent = state.thread.title + " - Chat Room";
-    $("buddyTitle").textContent = state.you.name + "'s Buddy List";
+    $("title").textContent = state.thread.title;
     $("sub").textContent = "You are " + state.you.name + " on side " + state.you.side;
     const archived = state.thread.archived;
     $("status").textContent = archived ? "archived" : state.thread.paused ? "paused" : "live";
