@@ -1,9 +1,9 @@
 //! Talking to a Parley server: one blocking call per request, JSON in and out.
 
+use crate::http;
 use crate::util::{obj, s, Error, Result};
 use crate::VERSION;
 use serde_json::Value;
-use std::io::Read;
 use std::time::Duration;
 
 pub enum Body {
@@ -48,41 +48,29 @@ pub fn api_error(status: u16, data: &Value) -> Error {
     }
 }
 
-/// The status and body text of one request, whatever the status.
+/// The status and body text of one request, whatever the status. The timeout covers the whole
+/// request, connecting and reading the body included.
 pub fn raw(server: &str, token: Option<&str>, method: &str, path: &str, body: Body, timeout: Duration) -> Result<(u16, String)> {
-    // The timeout covers the whole request, connecting and reading the body included, so a
-    // connection a proxy holds open after the server behind it died cannot stall a caller for good.
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
-    let mut request = agent
-        .request(method, &format!("{server}{path}"))
-        .set("user-agent", &format!("parley-client/{VERSION}"));
-    if let Some(token) = token {
-        request = request.set("authorization", &format!("Bearer {token}"));
+    let agent = format!("parley-client/{VERSION}");
+    let bearer = token.map(|t| format!("Bearer {t}"));
+    let mut headers: Vec<(&str, &str)> = vec![("User-Agent", &agent)];
+    if let Some(bearer) = &bearer {
+        headers.push(("Authorization", bearer));
     }
-    let result = match body {
-        Body::None => request.call(),
-        Body::Json(json) => request.set("content-type", "application/json").send_string(&json.to_string()),
-        Body::Text(text) => request.set("content-type", "text/plain").send_string(&text),
+    let text = match &body {
+        Body::None => None,
+        Body::Json(json) => {
+            headers.push(("Content-Type", "application/json"));
+            Some(json.to_string())
+        }
+        Body::Text(text) => {
+            headers.push(("Content-Type", "text/plain"));
+            Some(text.clone())
+        }
     };
-    let response = match result {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(err)) => return Err(Error::Network(transport_message(&err))),
-    };
-    let status = response.status();
-    let mut text = String::new();
-    response
-        .into_reader()
-        .take(64 * 1024 * 1024)
-        .read_to_string(&mut text)
-        .map_err(|e| Error::Network(e.to_string()))?;
-    Ok((status, text))
-}
-
-fn transport_message(err: &ureq::Transport) -> String {
-    match err.message() {
-        Some(message) => message.to_string(),
-        None => err.to_string(),
+    match http::request(method, &format!("{server}{path}"), &headers, text.as_deref(), timeout) {
+        Ok(response) => Ok((response.status, response.body)),
+        Err(http::Failure(message)) => Err(Error::Network(message)),
     }
 }
 

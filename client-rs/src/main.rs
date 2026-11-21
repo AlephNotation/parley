@@ -8,6 +8,7 @@ mod channel;
 mod commands;
 mod config;
 mod hooks;
+mod http;
 mod inbox;
 mod render;
 mod util;

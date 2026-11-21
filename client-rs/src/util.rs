@@ -229,6 +229,7 @@ pub struct Url {
     pub host: String,
     pub port: Option<u16>,
     pub path: String,
+    pub query: String,
     pub fragment: String,
 }
 
@@ -244,7 +245,10 @@ impl Url {
             Some((head, frag)) => (head, frag.to_string()),
             None => (rest, String::new()),
         };
-        let rest = rest.split_once('?').map(|(head, _)| head).unwrap_or(rest);
+        let (rest, query) = match rest.split_once('?') {
+            Some((head, query)) => (head, query.to_string()),
+            None => (rest, String::new()),
+        };
         let (authority, path) = match rest.find('/') {
             Some(at) => (&rest[..at], rest[at..].to_string()),
             None => (rest, "/".to_string()),
@@ -278,6 +282,7 @@ impl Url {
             host,
             port,
             path,
+            query,
             fragment,
         })
     }

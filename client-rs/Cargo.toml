@@ -11,8 +11,10 @@ name = "parley"
 path = "src/main.rs"
 
 [dependencies]
-# Blocking HTTP with rustls (pure Rust TLS, no OpenSSL) and its bundled web PKI roots.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# TLS in pure Rust (no OpenSSL) with ring for crypto, and the bundled web PKI roots. HTTP itself is
+# the small client in src/http.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "1"
 # Key order preserved, so JSON this client writes or prints reads like the server's and the Bun client's.
 serde_json = { version = "1", features = ["preserve_order"] }
 
