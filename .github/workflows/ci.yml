@@ -1,0 +1,60 @@
+# Runs on every pull request and every push to main: the server and Bun client tests, and the native
+# client (client-rs/) held to the same client test suite on Linux and on both macOS architectures,
+# so the two clients cannot drift apart.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: bun install --frozen-lockfile
+      - name: Server and Bun client tests
+        run: bun test
+      - name: Native client lint and unit tests
+        working-directory: client-rs
+        run: |
+          cargo fmt --check
+          cargo clippy --release --locked --all-targets -- -D warnings
+          cargo test --release --locked
+      - name: Build the native client
+        working-directory: client-rs
+        run: cargo build --release --locked
+      - name: The native client passes the client test suite
+        run: PARLEY_CLIENT=client-rs/target/release/parley bun test test/client.test.ts
+
+  # Apple Silicon runs the arm64 build natively and the x86_64 build under Rosetta.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - run: bun install --frozen-lockfile
+      - run: softwareupdate --install-rosetta --agree-to-license || true
+      - name: Build both macOS targets
+        working-directory: client-rs
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          file target/aarch64-apple-darwin/release/parley target/x86_64-apple-darwin/release/parley
+          ls -l target/*-apple-darwin/release/parley
+      - name: darwin-arm64 passes the client test suite
+        run: PARLEY_CLIENT=client-rs/target/aarch64-apple-darwin/release/parley bun test test/client.test.ts
+      - name: darwin-x64 passes the client test suite (under Rosetta)
+        run: PARLEY_CLIENT=client-rs/target/x86_64-apple-darwin/release/parley bun test test/client.test.ts

@@ -46,8 +46,8 @@ warns that the client is only as trustworthy as that server.
 The client that `/install.sh` hands out is native, in `client-rs/` (Rust): a static binary of about
 2 MB that starts in a millisecond and holds about 2 MB of memory while it waits for mail. The Bun
 client in `client/parley.ts` is the reference it was ported from and is kept in step with it: same
-commands, output, files on disk and hook behaviour. The one thing only the Bun client has is the
-experimental `parley channel`.
+commands, output, files on disk and hook behaviour, the experimental `parley channel` included. CI
+runs the client test suite against both on every pull request, on Linux and on macOS.
 
 ```bash
 cd client-rs && cargo build --release           # target/release/parley

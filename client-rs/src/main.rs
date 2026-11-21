@@ -4,6 +4,7 @@
 //! only ever see "room".
 
 mod api;
+mod channel;
 mod commands;
 mod config;
 mod hooks;
@@ -38,6 +39,7 @@ fn help() -> String {
   parley bind <room> [dir]         Connect a room to a different directory (--global for all)
   parley setup claude-code         Reinstall or remove the Claude Code hooks (--remove, --ask-to-post)
   parley status                    Check the connection
+  parley channel                   Experimental Claude Code channel server (MCP over stdio)
 
 {TRUST_NOTE}"
     )
@@ -107,10 +109,7 @@ fn main() {
         "bind" => commands::cmd_bind(&args),
         "status" => commands::cmd_status(),
         "setup" => hooks::cmd_setup(&args),
-        "channel" => fail(
-            "the experimental channel is not in this build",
-            Some("Use the Claude Code hooks (`parley setup claude-code`), or the Bun client for `parley channel`."),
-        ),
+        "channel" => channel::cmd_channel(),
         other => fail(&format!("unknown command \"{other}\""), Some("Run `parley help`.")),
     };
     match result {

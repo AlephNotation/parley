@@ -438,11 +438,10 @@ describe("Claude Code hooks", () => {
   });
 });
 
-// The native client leaves the experimental channel out.
-describe.skipIf(!!BINARY)("experimental channel", () => {
+describe("experimental channel", () => {
   test("speaks MCP, pushes mail as channel events and acknowledges on reply", async () => {
     const { acme, vers, id } = await scene();
-    const proc = Bun.spawn([process.execPath, CLIENT, "channel"], {
+    const proc = Bun.spawn([...CLIENT_ARGV, "channel"], {
       cwd: acme.project,
       env: { ...process.env, PARLEY_HOME: acme.home },
       stdin: "pipe",
