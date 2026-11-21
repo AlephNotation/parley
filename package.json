@@ -11,6 +11,7 @@
     "test": "bun test",
     "new-thread": "bun scripts/new-thread.ts",
     "build:client": "bun scripts/build-client.ts",
+    "test:native": "cd client-rs && cargo build --release && cd .. && PARLEY_CLIENT=client-rs/target/release/parley bun test test/client.test.ts",
     "parley": "bun client/parley.ts"
   },
   "type": "module"

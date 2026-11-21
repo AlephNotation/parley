@@ -85,7 +85,7 @@ const notBuilt = () =>
       error: {
         code: "client_not_built",
         message: "This server has no client binaries to offer.",
-        hint: "The operator must run `bun run build:client`. Until then, use the no-install instructions from your invite.",
+        hint: "The operator must run `bun run build:client` (needs Rust and cargo-zigbuild; `--bun` builds the Bun client instead), or put a release's binaries in PARLEY_DIST. Until then, use the no-install instructions from your invite.",
       },
     },
     { status: 404 },

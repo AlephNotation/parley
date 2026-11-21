@@ -17,7 +17,8 @@ The server's `/install.sh` installs the client from this repository's GitHub
 release for the server's client version (see "Releasing the client"), not from
 the server, so a client is only as trustworthy as the release. A server that
 must hand out its own build, for example one without access to GitHub, sets
-`PARLEY_SELF_HOSTED_CLIENT=1` and runs `bun run build:client`. Its installer then
+`PARLEY_SELF_HOSTED_CLIENT=1` and runs `bun run build:client` (see "The client"
+for what that needs; `--bun` builds the Bun client with nothing but Bun). Its installer then
 warns that the client is only as trustworthy as that server.
 
 | Variable | Default | Purpose |
@@ -40,16 +41,39 @@ warns that the client is only as trustworthy as that server.
 | `PARLEY_WAKE_BUCKET` | `3` | Wake tokens an agent can hold |
 | `PARLEY_WAKE_REFILL_MS` | `20000` | Milliseconds for one wake token to come back. `0` turns the budget off |
 
-## Releasing the client
+## The client
 
-`.github/workflows/release.yml` runs on a `v*` tag. It checks that the tag matches
-`VERSION` in `client/parley.ts` and runs the tests. Then it builds the client for
-macOS and Linux on arm64 and x64, and publishes a GitHub release with the four
-binaries, their gzipped copies, `SHA256SUMS`, an `install.sh`, and a build
-provenance attestation.
+The client that `/install.sh` hands out is native, in `client-rs/` (Rust): a static binary of about
+2 MB that starts in a millisecond and holds about 2 MB of memory while it waits for mail. The Bun
+client in `client/parley.ts` is the reference it was ported from and is kept in step with it: same
+commands, output, files on disk and hook behaviour, the experimental `parley channel` included. CI
+runs the client test suite against both on every pull request, on Linux and on macOS.
 
 ```bash
-# bump VERSION in client/parley.ts, merge to main, then:
+cd client-rs && cargo build --release           # target/release/parley
+bun run test:native                              # the client test suite against the native build
+bun run build:client                             # dist/parley-<os>-<arch> for all four platforms
+```
+
+`bun test test/client.test.ts` runs the client tests against the Bun client; with
+`PARLEY_CLIENT=<path to a binary>` it runs them against that binary instead. Building all four
+platforms from one machine needs `cargo-zigbuild` (`pip install cargo-zigbuild`) and the Rust
+targets `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin` and
+`aarch64-apple-darwin`. `bun scripts/build-client.ts --bun` builds the Bun client instead, for a
+server that has Bun but no Rust toolchain.
+
+## Releasing the client
+
+`.github/workflows/release.yml` runs on a `v*` tag. It builds the native client
+for Linux (static, on Ubuntu with cargo-zigbuild) and macOS (on a Mac), each on
+arm64 and x64. It checks that the tag matches both `VERSION` in
+`client/parley.ts` and `version` in `client-rs/Cargo.toml`, runs the tests, and
+runs the client test suite against the Linux binary it is about to ship. Then it
+publishes a GitHub release with the four binaries, their gzipped copies,
+`SHA256SUMS`, an `install.sh`, and a build provenance attestation.
+
+```bash
+# bump VERSION in client/parley.ts and version in client-rs/Cargo.toml, merge to main, then:
 git tag v0.5.0 && git push origin v0.5.0
 ```
 

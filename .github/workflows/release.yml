@@ -1,8 +1,9 @@
-# Builds the client for every platform on a version tag, and publishes it as a GitHub release with
-# SHA256SUMS, an install.sh, and a build provenance attestation. Servers' /install.sh downloads from
-# that release, so a client is only as trustworthy as this repository, not the server handing it out.
+# Builds the native client (client-rs/, Rust) for every platform on a version tag, and publishes it
+# as a GitHub release with SHA256SUMS, an install.sh, and a build provenance attestation. Servers'
+# /install.sh downloads from that release, so a client is only as trustworthy as this repository.
 #
-# Cut a release: bump VERSION in client/parley.ts, merge, then
+# Cut a release: bump VERSION in client/parley.ts and version in client-rs/Cargo.toml (they must
+# match), merge, then
 #   git tag v<version> && git push origin v<version>
 name: Release client
 
@@ -16,7 +17,45 @@ permissions:
   attestations: write # store it
 
 jobs:
+  # Static musl builds for both Linux architectures, cross-compiled with cargo-zigbuild.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - run: pip install cargo-zigbuild
+      - run: bun scripts/build-client.ts linux-x64 linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/parley-linux-*
+
+  # Both macOS architectures with Apple's own toolchain.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - run: bun scripts/build-client.ts darwin-arm64 darwin-x64
+        env:
+          PARLEY_CARGO: build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/parley-darwin-*
+
   release:
+    needs: [linux, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,20 +64,28 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      - name: Check the tag matches the client version
+      - name: Check the tag matches both clients' version
         run: |
-          want="v$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' client/parley.ts)"
-          if [ "$GITHUB_REF_NAME" != "$want" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match VERSION in client/parley.ts ($want)." >&2
+          ts="v$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' client/parley.ts)"
+          rs="v$(sed -n 's/^version = "\(.*\)"$/\1/p' client-rs/Cargo.toml | head -1)"
+          if [ "$GITHUB_REF_NAME" != "$ts" ] || [ "$GITHUB_REF_NAME" != "$rs" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match client/parley.ts ($ts) and client-rs/Cargo.toml ($rs)." >&2
             exit 1
           fi
 
       - run: bun install --frozen-lockfile
 
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: chmod +x dist/parley-*-*[!z]
+
       - run: bun test
 
-      - name: Build the client for every platform
-        run: bun scripts/build-client.ts
+      - name: The shipped Linux binary passes the client test suite
+        run: PARLEY_CLIENT=dist/parley-linux-x64 bun test test/client.test.ts
 
       - name: Checksums and installer
         run: |

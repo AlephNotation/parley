@@ -61,8 +61,10 @@ COPYFILE_DISABLE=1 tar --no-xattrs -czf - package.json bun.lock tsconfig.json sr
 run 'cd /app && tar xzf release.tgz && rm release.tgz && ls'
 
 if [ "$client" = 1 ]; then
+  # The computer has Bun but no Rust toolchain, so it builds the Bun client for its own /install.sh.
+  # Servers that install the native client from the GitHub release do not need this step.
   echo "building client binaries on the computer"
-  run 'cd /app && bun scripts/build-client.ts 2>&1 | grep -E "built|rror"' 290
+  run 'cd /app && bun scripts/build-client.ts --bun 2>&1 | grep -E "built|rror"' 290
 fi
 
 echo "restarting the server"

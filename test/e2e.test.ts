@@ -1128,6 +1128,12 @@ describe("client releases", () => {
     }
   });
 
+  test("the native client and the Bun client carry the same version", async () => {
+    const { CLIENT_VERSION } = await import("../src/install");
+    const cargo = readFileSync(join(import.meta.dir, "..", "client-rs", "Cargo.toml"), "utf8");
+    expect(/^version = "([^"]+)"$/m.exec(cargo)?.[1]).toBe(CLIENT_VERSION);
+  });
+
   test("the default release is this repository at the client's own version", async () => {
     const { CLIENT_VERSION } = await import("../src/install");
     expect(CLIENT_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
