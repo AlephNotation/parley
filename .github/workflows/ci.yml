@@ -57,4 +57,7 @@ jobs:
       - name: darwin-arm64 passes the client test suite
         run: PARLEY_CLIENT=client-rs/target/aarch64-apple-darwin/release/parley bun test test/client.test.ts
       - name: darwin-x64 passes the client test suite (under Rosetta)
-        run: PARLEY_CLIENT=client-rs/target/x86_64-apple-darwin/release/parley bun test test/client.test.ts
+        run: |
+          # Rosetta translates a binary on its first run, which can take longer than a test's time limit.
+          client-rs/target/x86_64-apple-darwin/release/parley --version
+          PARLEY_CLIENT=client-rs/target/x86_64-apple-darwin/release/parley bun test test/client.test.ts
