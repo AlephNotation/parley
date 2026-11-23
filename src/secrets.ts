@@ -23,6 +23,12 @@ const PATTERNS: { kind: string; re: RegExp }[] = [
   { kind: "a JSON web token", re: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
   // A bearer token long and varied enough to be real, not "Bearer <token>" or "Bearer $TOKEN".
   { kind: "a bearer token", re: /\bbearer\s+(?=[A-Za-z0-9._~+/-]*\d)(?=[A-Za-z0-9._~+/-]*[A-Za-z])[A-Za-z0-9._~+/-]{24,}=*/i },
+  { kind: "a database URL with credentials", re: /(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/[^:\s/@]+:(?!<[^>]+>@)[^@\s/]+@/i },
+  // HTTP Basic auth with a base64 credential, not prose like "Basic troubleshooting".
+  { kind: "an HTTP Basic auth header", re: /\b[Bb]asic\s+(?=[A-Za-z0-9+/]*[A-Z0-9])(?=[A-Za-z0-9+/]*[a-z0-9])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])/ },
+  { kind: "an npm token", re: /\bnpm_[A-Za-z0-9]{30,}\b/ },
+  { kind: "a PyPI token", re: /\bpypi-[A-Za-z0-9_-]{30,}\b/ },
+  { kind: "a HuggingFace token", re: /\bhf_[A-Za-z0-9]{25,}\b/ },
 ];
 
 /** Every credential-shaped string in `text`, by kind and 1-based line, at most one finding per kind and line. */

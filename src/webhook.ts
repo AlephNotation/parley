@@ -39,20 +39,24 @@ for (const [net, bits] of [
 for (const [net, bits] of [
   ["::", 128], // unspecified
   ["::1", 128], // loopback
+  ["64:ff9b:1::", 48], // local NAT64
   ["100::", 64], // discard
+  ["2001::", 32], // Teredo
   ["2001:db8::", 32], // documentation
   ["fc00::", 7], // unique local
   ["fe80::", 10], // link-local
+  ["fec0::", 10], // deprecated site-local
   ["ff00::", 8], // multicast
 ] as const) {
   blocked.addSubnet(net, bits, "ipv6");
 }
 
-/** The IPv4 address carried inside a NAT64 (64:ff9b::/96) or 6to4 (2002::/16) IPv6 address, if any. */
+/** The IPv4 address carried inside an IPv4-mapped/compatible, NAT64 (64:ff9b::/96), or 6to4 (2002::/16) IPv6 address, if any. */
 function embeddedIpv4(address: string): string | null {
   const groups = expandIpv6(address);
   if (!groups) return null;
   const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  if (groups.slice(0, 5).every((g) => g === 0) && (groups[5] === 0xffff || groups[5] === 0)) return v4(groups[6]!, groups[7]!);
   if (groups[0] === 0x64 && groups[1] === 0xff9b && groups.slice(2, 6).every((g) => g === 0)) return v4(groups[6]!, groups[7]!);
   if (groups[0] === 0x2002) return v4(groups[1]!, groups[2]!);
   return null;
@@ -98,6 +102,9 @@ export async function sendWebhook(
   opts: { allowPrivate?: boolean; resolve?: Resolver; timeoutMs?: number } = {},
 ): Promise<number> {
   const url = new URL(rawUrl);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`unsupported webhook protocol: ${url.protocol}`);
+  }
   const host = url.hostname.replace(/^\[|\]$/g, "");
   const literal = isIP(host);
   const addresses = literal ? [{ address: host, family: literal }] : await (opts.resolve ?? systemResolver)(host);
@@ -109,7 +116,16 @@ export async function sendWebhook(
   const pinned = addresses[0]!;
   const payload = JSON.stringify(body);
   const client = url.protocol === "https:" ? https : http;
+  const timeoutMs = opts.timeoutMs ?? 10_000;
   return new Promise<number>((resolve, reject) => {
+    let settled = false;
+    let deadline: ReturnType<typeof setTimeout> | null = null;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      fn();
+    };
     const req = client.request(
       {
         protocol: url.protocol,
@@ -118,17 +134,23 @@ export async function sendWebhook(
         path: url.pathname + url.search,
         method: "POST",
         headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
-        timeout: opts.timeoutMs ?? 10_000,
+        timeout: timeoutMs,
         // Connect to the address that was checked, never to a fresh lookup.
         lookup: (_host: string, options: { all?: boolean }, callback: (...args: any[]) => void) =>
           options?.all ? callback(null, [pinned]) : callback(null, pinned.address, pinned.family),
       },
       (res) => {
         res.resume();
-        resolve(res.statusCode ?? 0);
+        finish(() => resolve(res.statusCode ?? 0));
       },
     );
-    req.on("error", reject);
+    // Overall deadline in addition to socket idle timeout, so a slow-drip response cannot hang forever.
+    deadline = setTimeout(() => {
+      const err = new Error("timed out");
+      req.destroy(err);
+      finish(() => reject(err));
+    }, timeoutMs);
+    req.on("error", (err) => finish(() => reject(err)));
     req.on("timeout", () => req.destroy(new Error("timed out")));
     req.end(payload);
   });

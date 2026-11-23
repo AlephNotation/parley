@@ -44,3 +44,14 @@ const server = Bun.serve({
 });
 
 console.log(`Parley listening on ${server.url}`);
+
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  void server.stop();
+  app.close();
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

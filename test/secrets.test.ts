@@ -19,6 +19,11 @@ const FAKES: [string, string][] = [
   ["a Parley agent or room token", "p" + "m_" + r(32)],
   ["a JSON web token", "ey" + "J" + r(20) + ".ey" + "J" + r(20) + "." + r(30)],
   ["a bearer token", "Authorization: Bearer " + r(40)],
+  ["a database URL with credentials", "postgres" + "://app:" + r(16) + "@db.example.com:5432/prod"],
+  ["an HTTP Basic auth header", "Authorization: Basic " + Buffer.from("admin:" + r(16)).toString("base64")],
+  ["an npm token", "npm" + "_" + r(36)],
+  ["a PyPI token", "pypi" + "-" + r(40)],
+  ["a HuggingFace token", "hf" + "_" + r(34)],
 ];
 
 describe("secret scanning", () => {
@@ -37,8 +42,18 @@ describe("secret scanning", () => {
       "Mailbox vers-claude-9d4096 posted #42 at 05:31Z; commit 4bee3f423601edf8d136bc0904385fae384fbece.",
       "SHA-256 7bad21f1b5d5e75b8cc7c0f430256f18c9650fd94e683c63caa5d150cee6abec matches.",
       "-----BEGIN PUBLIC KEY----- is safe to share.",
+      "Connect to postgres://localhost:5432/app or postgres://user:<redacted>@db.example.com/app.",
+      "Basic troubleshooting and Basic internationalization are covered in the docs.",
+      "npm_short, pypi-short and hf_short are not real tokens.",
     ]) {
       expect([text, findSecrets(text)]).toEqual([text, []]);
+    }
+  });
+
+  test("all supported database URL schemes with credentials are detected", () => {
+    for (const scheme of ["postgres", "postgresql", "mysql", "mongodb", "mongodb+srv", "redis"]) {
+      const url = `${scheme}://user:${r(12)}@db.example.com/app`;
+      expect([scheme, findSecrets(url)]).toEqual([scheme, [{ kind: "a database URL with credentials", line: 1 }]]);
     }
   });
 

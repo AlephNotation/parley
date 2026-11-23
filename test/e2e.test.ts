@@ -989,7 +989,8 @@ describe("client distribution", () => {
     const script = (await withDist.call(null, "GET", "/install.sh")).data as string;
     const sum = new Bun.CryptoHasher("sha256").update("fake binary").digest("hex");
     expect(script).toContain(`parley-linux-x64) want=${sum}`);
-    expect(script).toContain(`${withDist.base}/dl/$file`);
+    expect(script).toContain(`base='${withDist.base}'`);
+    expect(script).toContain('"$base/dl/$file"');
     expect(script).toContain("file=parley-linux-x64;");
     expect((await withDist.call(null, "GET", "/dl/parley-linux-x64")).data).toBe("fake binary");
     expect((await withDist.call(null, "GET", "/dl/parley-linux-x64.gz")).status).toBe(404);
@@ -1305,5 +1306,179 @@ describe("the page for agents", () => {
     const robots = await get(s, "/robots.txt");
     expect(robots.text).toContain("Allow: /llms.txt");
     expect(robots.text).toContain("Disallow: /api/");
+  });
+});
+
+describe("proxy headers, installer quoting, and atomic invites", () => {
+  test("x-forwarded-proto and x-forwarded-host are ignored unless trustProxy is enabled", async () => {
+    const direct = startServer();
+    const proxied = startServer({ trustProxy: true });
+    try {
+      const headers = {
+        "content-type": "application/json",
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "spoofed.example.com",
+      };
+      const body = JSON.stringify({ title: "Proxy check", sides: ["Vers", "Acme"] });
+      const r1: any = await (await fetch(direct.base + "/api/threads", { method: "POST", headers, body })).json();
+      expect(r1.sides[0].human_url).toStartWith(direct.base + "/t#");
+      const r2: any = await (await fetch(proxied.base + "/api/threads", { method: "POST", headers, body })).json();
+      expect(r2.sides[0].human_url).toStartWith("https://spoofed.example.com/t#");
+    } finally {
+      await direct.stop();
+      await proxied.stop();
+    }
+  });
+
+  test("self-hosted installer safely shell-quotes base URLs containing metacharacters", async () => {
+    const { installScript } = await import("../src/install");
+    const dist = mkdtempSync(join(tmpdir(), "parley-dist-quote-"));
+    writeFileSync(join(dist, "parley-linux-x64"), "fake binary");
+    const marker = join(dist, "pwned");
+    const hostile = `http://example.test/$(touch ${marker})"'end`;
+    const res = await installScript(hostile, dist);
+    const script = await res.text();
+    expect(script).not.toContain(`"${hostile}`);
+    const baseLine = script.split("\n").find((l) => l.startsWith("base="))!;
+    expect(baseLine).toBe(`base='http://example.test/$(touch ${marker})"'\\''end'`);
+    const syntax = Bun.spawnSync(["sh", "-n", "-c", script]);
+    expect(syntax.exitCode).toBe(0);
+    // Running the assignment + echo under sh evaluates to the literal URL without executing $(touch ...).
+    const evalCheck = Bun.spawnSync(["sh", "-c", `${baseLine}\nprintf '%s' "$base"`]);
+    expect(evalCheck.exitCode).toBe(0);
+    expect(evalCheck.stdout.toString()).toBe(hostile);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("concurrent redemptions of a one-time invite succeed at most once", async () => {
+    const t = await s.thread(false);
+    const inv = await s.invite(t.versHuman);
+    const [a, b] = await Promise.all([
+      s.call(null, "POST", "/api/join", { code: inv.code }),
+      s.call(null, "POST", "/api/join", { code: inv.code }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([201, 410]);
+    const failed = a.status === 410 ? a : b;
+    expect(failed.data.error.code).toBe("invite_used");
+  });
+});
+
+describe("slim polling, message pagination, human display name, client version, and wake pruning", () => {
+  test("GET /api/state?slim=1 returns a lightweight payload when unchanged and full state when changed", async () => {
+    const t = await s.setup(false);
+    const initial = (await s.call(t.versHuman, "GET", "/api/state")).data;
+    expect(initial.has_more).toBe(false);
+    expect(initial.notify_error).toBeNull();
+
+    const slim = (await s.call(t.versHuman, "GET", `/api/state?v=${initial.version}&wait=0&slim=1`)).data;
+    expect(slim).toEqual({
+      unchanged: true,
+      version: initial.version,
+      participants: initial.participants,
+      unowned: null,
+    });
+    expect("messages" in slim).toBe(false);
+    expect("pending" in slim).toBe(false);
+
+    // Waiting slim poll returns full state as soon as the thread changes.
+    const waiting = s.call(t.versHuman, "GET", `/api/state?v=${initial.version}&wait=3&slim=1`);
+    await Bun.sleep(50);
+    await s.call(t.acmeHuman, "POST", "/api/messages", { body: "wake up" });
+    const full = (await waiting).data;
+    expect(full.unchanged).toBeUndefined();
+    expect(full.version).toBeGreaterThan(initial.version);
+    expect(full.messages.some((m: any) => m.body === "wake up")).toBe(true);
+  });
+
+  test("GET /api/messages paginates older visible messages and GET /api/state sets has_more", async () => {
+    const small = startServer({ pageMessages: 3 });
+    try {
+      const t = await small.setup(true);
+      // Create a side-private rejection notice on Vers's side so we can verify visibility filtering.
+      const draft = await small.send(t.vers.token, t.id, "secret draft");
+      await small.call(t.versHuman, "POST", `/api/messages/${draft.data.message.id}/reject`, { note: "vers only" });
+      for (let i = 1; i <= 5; i++) await small.call(t.acmeHuman, "POST", "/api/messages", { body: `msg ${i}` });
+
+      const acmeState = (await small.call(t.acmeHuman, "GET", "/api/state")).data;
+      expect(acmeState.has_more).toBe(true);
+      expect(acmeState.messages.map((m: any) => m.body)).toEqual(["msg 3", "msg 4", "msg 5"]);
+
+      const page1 = await small.call(t.acmeHuman, "GET", `/api/messages?before=${acmeState.messages[0].seq}&limit=2`);
+      expect(page1.status).toBe(200);
+      expect(page1.data.has_more).toBe(true);
+      expect(page1.data.messages.map((m: any) => m.body)).toEqual(["msg 1", "msg 2"]);
+
+      const page2 = await small.call(t.acmeHuman, "GET", `/api/messages?before=${page1.data.messages[0].seq}&limit=50`);
+      expect(page2.status).toBe(200);
+      expect(page2.data.has_more).toBe(false);
+      // Acme never sees Vers's private rejection notice.
+      expect(JSON.stringify(page2.data.messages)).not.toContain("vers only");
+      // Agents cannot call the human pagination endpoint.
+      expect((await small.call(t.acme.token, "GET", `/api/messages?before=10`)).status).toBe(403);
+    } finally {
+      await small.stop();
+    }
+  });
+
+  test("POST /api/messages accepts an optional human display name and rejects non-string values", async () => {
+    const t = await s.setup(false);
+    const named = await s.call(t.versHuman, "POST", "/api/messages", { body: "hello", from: "  Alex  " });
+    expect(named.status).toBe(201);
+    expect(named.data.message.from).toBe("Alex (Vers)");
+
+    const capped = await s.call(t.versHuman, "POST", "/api/messages", { body: "capped", from: "A".repeat(60) });
+    expect(capped.status).toBe(201);
+    expect(capped.data.message.from).toBe(`${"A".repeat(40)} (Vers)`);
+
+    const blank = await s.call(t.versHuman, "POST", "/api/messages", { body: "default", from: "   " });
+    expect(blank.status).toBe(201);
+    expect(blank.data.message.from).toBe("Vers (human)");
+
+    const invalid = await s.call(t.versHuman, "POST", "/api/messages", { body: "nope", from: 42 });
+    expect(invalid.status).toBe(400);
+    expect(invalid.data.error.code).toBe("bad_message");
+
+    // Agents keep their own name even if `from` is passed.
+    const agent = await s.call(t.vers.token, "POST", `/api/threads/${t.id}/messages`, { body: "agent msg", from: "Spoof" });
+    expect(agent.status).toBe(201);
+    expect(agent.data.message.from).toBe("Vers Claude");
+  });
+
+  test("API JSON responses carry the x-parley-client-version header", async () => {
+    const { CLIENT_VERSION } = await import("../src/install");
+    const res = await fetch(s.base + "/healthz");
+    expect(res.headers.get("x-parley-client-version")).toBe(CLIENT_VERSION);
+  });
+
+  test("acknowledging inbox messages keeps recent wakes for sibling sessions and prunes stale rows", async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "parley-wakes-")), "parley.db");
+    const srv = startServer({ dbPath });
+    try {
+      const t = await srv.setup(false);
+      await srv.send(t.vers.token, t.id, "wake me");
+      const box = await srv.inbox(t.acme.token);
+      const seq = box.threads[0].ack_seq;
+      await srv.call(t.acme.token, "POST", "/api/inbox/ack", { acks: [{ thread: t.id, seq }] });
+
+      // A sibling session whose own read mark is behind the shared ack still wakes for recent mail.
+      const sibling = await srv.inbox(t.acme.token, `?wait=1&from=${t.id}:${seq - 1}`);
+      expect(sibling.timed_out).toBe(false);
+      expect(mail(sibling)).toEqual(["wake me"]);
+
+      // Once wakes age past the retention window, a later ack prunes that participant's stale rows.
+      const aged = new Database(dbPath);
+      const acmeId = (aged.query("SELECT id FROM participants WHERE name = 'Acme Claude'").get() as { id: string }).id;
+      aged.query("UPDATE wakes SET wake_at = 0").run();
+      const before = (aged.query("SELECT COUNT(*) AS n FROM wakes WHERE participant_id = ?").get(acmeId) as { n: number }).n;
+      expect(before).toBeGreaterThan(0);
+      await srv.send(t.vers.token, t.id, "later");
+      const next = await srv.inbox(t.acme.token);
+      await srv.call(t.acme.token, "POST", "/api/inbox/ack", { acks: [{ thread: t.id, seq: next.threads[0].ack_seq }] });
+      const remainingOld = (aged.query("SELECT COUNT(*) AS n FROM wakes WHERE participant_id = ? AND wake_at = 0").get(acmeId) as { n: number }).n;
+      aged.close();
+      expect(remainingOld).toBe(0);
+    } finally {
+      await srv.stop();
+    }
   });
 });

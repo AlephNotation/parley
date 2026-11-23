@@ -54,7 +54,7 @@ export interface AppOptions {
   roomLimit?: number;
   /** Messages one participant may post per minute. 0 turns the limit off. */
   postLimit?: number;
-  /** Use the first X-Forwarded-For address as the client's, for a server behind a proxy. */
+  /** Trust X-Forwarded-* headers for client address and origin, for a server behind a proxy. */
   trustProxy?: boolean;
   /** How webhook hosts are resolved at send time. Defaults to the system resolver; tests replace it. */
   resolveHost?: Resolver;
@@ -62,6 +62,8 @@ export interface AppOptions {
   secretScan?: boolean;
   /** How long a room-wide message every agent read may go unanswered before the page flags it. */
   unownedAfterMs?: number;
+  /** How long acknowledged wake rows are kept so sibling sessions with older read marks still wake. */
+  wakeRetentionMs?: number;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -71,6 +73,7 @@ const AGENT_PATHS = new Set(["/llms.txt", "/agents.md", "/agents", "/agent", "/a
 const LISTEN_GRACE_MS = 15_000;
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const INBOX_PAGE = 50;
+const TOUCH_THROTTLE_MS = 10_000;
 
 class HttpError extends Error {
   constructor(
@@ -114,9 +117,10 @@ class RateLimit {
 }
 
 const noStore = { "cache-control": "no-store", "referrer-policy": "no-referrer" };
+const apiHeaders = { ...noStore, "x-parley-client-version": CLIENT_VERSION };
 
 function json(data: unknown, status = 200): Response {
-  return Response.json(data, { status, headers: noStore });
+  return Response.json(data, { status, headers: apiHeaders });
 }
 
 function html(body: string): Response {
@@ -178,11 +182,16 @@ export function createApp(opts: AppOptions) {
   const wakeBucket = opts.wakeBucket ?? 3;
   const wakeRefillMs = opts.wakeRefillMs ?? 20_000;
   const wakeCooldownMs = opts.wakeCooldownMs ?? 30_000;
+  const wakeRetentionMs = opts.wakeRetentionMs ?? 24 * 60 * 60 * 1000;
   /** Timers for wakes being held until an agent's budget can pay for them. */
   const heldWakes = new Set<ReturnType<typeof setTimeout>>();
   const waiters = new Map<string, Set<() => void>>();
   /** Open long-polls per participant, used to report who is listening. */
   const polls = new Map<string, { open: number; endedAt: number }>();
+  /** Last time each participant's last_seen was written to SQLite, to avoid redundant writes. */
+  const touchedAt = new Map<string, number>();
+  /** Latest notification webhook failure per side, cleared on a 2xx delivery or when notify_url changes. */
+  const notifyErrors = new Map<string, { at: string; message: string }>();
 
   // ---- long-poll plumbing -------------------------------------------------
 
@@ -253,7 +262,16 @@ export function createApp(opts: AppOptions) {
     for (const row of rows) wake(`m:${row.mailbox_id}`);
   }
 
-  const touch = (participantId: string) => db.query("UPDATE participants SET last_seen = ? WHERE id = ?").run(Date.now(), participantId);
+  function touch(participantId: string) {
+    const now = Date.now();
+    const prev = touchedAt.get(participantId);
+    if (prev !== undefined && now - prev < TOUCH_THROTTLE_MS) return;
+    touchedAt.set(participantId, now);
+    db.query("UPDATE participants SET last_seen = ? WHERE id = ?").run(now, participantId);
+    if (touchedAt.size > 10_000) {
+      for (const [id, at] of touchedAt) if (now - at >= TOUCH_THROTTLE_MS) touchedAt.delete(id);
+    }
+  }
 
   function maxSeq(threadId: string): number {
     return (db.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE thread_id = ?").get(threadId) as { seq: number }).seq;
@@ -614,8 +632,8 @@ export function createApp(opts: AppOptions) {
   function baseUrl(req: Request): string {
     if (opts.publicUrl) return opts.publicUrl.replace(/\/+$/, "");
     const url = new URL(req.url);
-    const proto = req.headers.get("x-forwarded-proto") ?? url.protocol.slice(0, -1);
-    const host = req.headers.get("x-forwarded-host") ?? url.host;
+    const proto = (opts.trustProxy ? req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() : undefined) || url.protocol.slice(0, -1);
+    const host = (opts.trustProxy ? req.headers.get("x-forwarded-host")?.split(",")[0]?.trim() : undefined) || url.host;
     return `${proto}://${host}`;
   }
 
@@ -678,9 +696,18 @@ export function createApp(opts: AppOptions) {
     const p = authHuman(req);
     const known = intParam(url, "v", -1);
     const wait = Math.min(maxWait, Math.max(0, intParam(url, "wait", 0)));
+    const slim = url.searchParams.get("slim") === "1";
     const changed = () => (getThread(p.thread_id).version > known ? true : null);
     if (wait > 0) await listeningWhile([p.id], () => waitFor([`t:${p.thread_id}`], wait, req.signal, changed));
     const thread = getThread(p.thread_id);
+    if (slim && thread.version === known) {
+      return json({
+        unchanged: true,
+        version: thread.version,
+        participants: publicPresence(p.thread_id),
+        unowned: unowned(p.thread_id),
+      });
+    }
     const mine = getSide(p.side_id);
     const agents = db
       .query(
@@ -693,6 +720,10 @@ export function createApp(opts: AppOptions) {
         n: number;
       }
     ).n;
+    // Fetch one extra message so we know whether older visible messages exist.
+    const latest = latestMessages(p, pageMessages + 1);
+    const hasMore = latest.length > pageMessages;
+    const messages = hasMore ? latest.slice(-pageMessages) : latest;
     return json({
       version: thread.version,
       thread: {
@@ -704,14 +735,33 @@ export function createApp(opts: AppOptions) {
       you: { id: p.id, name: p.name, kind: p.kind, side: mine.name },
       sides: getSides(p.thread_id).map((s) => ({ name: s.name, approval: s.approval === 1, yours: s.id === p.side_id })),
       notify_url: mine.notify_url,
+      notify_error: notifyErrors.get(p.side_id) ?? null,
       agents,
       open_invites: openInvites,
       participants: publicPresence(p.thread_id),
       // A page shows the tail of a long room, never a frozen head.
-      messages: latestMessages(p, pageMessages).map(view),
+      messages: messages.map(view),
+      has_more: hasMore,
       pending: pendingFor(p).map(view),
       unowned: unowned(p.thread_id),
     });
+  }
+
+  /** Older visible sent messages before `before`, ordered oldest-first, for paginating up in the web page. */
+  function getMessages(req: Request, url: URL): Response {
+    const p = authHuman(req);
+    const before = intParam(url, "before", maxSeq(p.thread_id) + 1);
+    const limit = Math.min(500, Math.max(1, intParam(url, "limit", 200)));
+    const rows = db
+      .query(
+        `SELECT * FROM messages
+         WHERE thread_id = ? AND status = 'sent' AND seq < ? AND (visible_to IS NULL OR visible_to = ?)
+         ORDER BY seq DESC LIMIT ?`,
+      )
+      .all(p.thread_id, before, p.side_id, limit + 1) as MessageRow[];
+    const hasMore = rows.length > limit;
+    const page = (hasMore ? rows.slice(0, limit) : rows).reverse();
+    return json({ messages: page.map(view), has_more: hasMore });
   }
 
   /**
@@ -927,6 +977,7 @@ export function createApp(opts: AppOptions) {
       const value = input.notify_url ? checkWebhook(input.notify_url.trim()) : null;
       // Start from the present so turning notifications on does not replay old mail.
       db.query("UPDATE sides SET notify_url = ?, notified_seq = ? WHERE id = ?").run(value, maxSeq(p.thread_id), side.id);
+      notifyErrors.delete(side.id);
       changed = true;
     }
     if (changed) bump(p.thread_id);
@@ -993,7 +1044,7 @@ export function createApp(opts: AppOptions) {
 
   // ---- posting ------------------------------------------------------------
 
-  type Draft = { body: string; to?: string[]; fyi?: boolean };
+  type Draft = { body: string; to?: string[]; fyi?: boolean; from?: string };
 
   async function readMessageBody(req: Request): Promise<Draft> {
     const raw = await req.text();
@@ -1003,6 +1054,7 @@ export function createApp(opts: AppOptions) {
     const named = (query.get("to") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
     let to: string[] | undefined = named.length ? named : undefined;
     let fyi = ["1", "true"].includes(query.get("fyi") ?? "");
+    let from: string | undefined;
     if ((req.headers.get("content-type") ?? "").includes("json")) {
       let parsed: unknown;
       try {
@@ -1013,7 +1065,7 @@ export function createApp(opts: AppOptions) {
       const value = (parsed as { body?: unknown } | null)?.body;
       if (typeof value !== "string") throw new HttpError(400, "bad_message", 'JSON body must look like {"body": "..."}.');
       body = value;
-      const input = parsed as { to?: unknown; fyi?: unknown };
+      const input = parsed as { to?: unknown; fyi?: unknown; from?: unknown };
       if (input.to !== undefined && input.to !== null) {
         if (!Array.isArray(input.to) || input.to.some((x) => typeof x !== "string" || !x.trim())) {
           throw new HttpError(400, "bad_message", '"to" must be an array of agent or side names.');
@@ -1022,6 +1074,11 @@ export function createApp(opts: AppOptions) {
       }
       if (input.fyi !== undefined && typeof input.fyi !== "boolean") throw new HttpError(400, "bad_message", '"fyi" must be true or false.');
       if (input.fyi !== undefined) fyi = input.fyi;
+      if (input.from !== undefined) {
+        if (typeof input.from !== "string") throw new HttpError(400, "bad_message", '"from" must be a string.');
+        const trimmed = input.from.replace(/\s+/g, " ").trim().slice(0, 40);
+        if (trimmed) from = trimmed;
+      }
     }
     if (fyi && to) {
       throw new HttpError(400, "bad_message", '"to" and "fyi" cannot be combined.', "Address the message to wake someone, or mark it fyi to wake nobody.");
@@ -1031,11 +1088,11 @@ export function createApp(opts: AppOptions) {
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
       throw new HttpError(413, "message_too_large", `Message exceeds ${MAX_BODY_BYTES} bytes.`, "Split it, or summarise and offer details on request.");
     }
-    return { body, to, fyi };
+    return { body, to, fyi, from };
   }
 
   function post(p: ParticipantRow, draft: Draft): Response {
-    const { body, to, fyi } = draft;
+    const { body, to, fyi, from } = draft;
     requireOpen(p.thread_id);
     const wait = postLimit.take(p.id);
     if (wait !== null) {
@@ -1075,7 +1132,8 @@ export function createApp(opts: AppOptions) {
       const thread = getThread(p.thread_id);
       const side = getSide(p.side_id);
       if (p.kind === "human") {
-        const message = insertMessage({ threadId: thread.id, participant: p, kind: "human", author: p.name, body, deliver: true, to, fyi });
+        const author = from ? `${from} (${side.name})` : p.name;
+        const message = insertMessage({ threadId: thread.id, participant: p, kind: "human", author, body, deliver: true, to, fyi });
         db.query("UPDATE threads SET agent_streak = 0 WHERE id = ?").run(thread.id);
         return { message, note: undefined as string | undefined };
       }
@@ -1143,27 +1201,27 @@ export function createApp(opts: AppOptions) {
     const code = typeof input.code === "string" ? input.code.trim() : "";
     if (!code) throw new HttpError(400, "bad_request", 'Body must be {"code": "<room link token or invite code>"}.');
 
-    let invite: InviteRow | null = null;
-    let target: { threadId: string; sideId: string; name: string };
-    if (code.startsWith("ph_")) {
-      const human = db.query("SELECT * FROM participants WHERE token_hash = ? AND kind = 'human'").get(sha256(code)) as ParticipantRow | null;
-      if (!human) throw new HttpError(404, "invalid_link", "This room link is not recognised.", "Copy the full link from the room page, including the part after #.");
-      const side = getSide(human.side_id);
-      const taken = (db.query("SELECT COUNT(*) AS n FROM participants WHERE side_id = ? AND kind = 'agent'").get(side.id) as { n: number }).n;
-      target = { threadId: human.thread_id, sideId: side.id, name: `${side.name} Claude${taken ? ` ${taken + 1}` : ""}` };
-    } else {
-      invite = db.query("SELECT * FROM invites WHERE code_hash = ?").get(sha256(code)) as InviteRow | null;
-      if (!invite) throw new HttpError(404, "invalid_invite", "This invite code is not recognised.", "Ask the human who invited you for a fresh invite.");
-      if (invite.redeemed_at) throw new HttpError(410, "invite_used", "This invite was already used. Invites work once.", "Ask your human for a fresh invite.");
-      if (invite.expires_at < Date.now()) throw new HttpError(410, "invite_expired", "This invite has expired.", "Ask your human for a fresh invite.");
-      target = { threadId: invite.thread_id, sideId: invite.side_id, name: invite.name };
-    }
-
-    requireOpen(target.threadId);
-    const existing = bearer(req) ? authMailbox(req) : null;
-    const label = (typeof input.label === "string" && input.label.trim().slice(0, 60)) || target.name;
-
     const result = db.transaction(() => {
+      let invite: InviteRow | null = null;
+      let target: { threadId: string; sideId: string; name: string };
+      if (code.startsWith("ph_")) {
+        const human = db.query("SELECT * FROM participants WHERE token_hash = ? AND kind = 'human'").get(sha256(code)) as ParticipantRow | null;
+        if (!human) throw new HttpError(404, "invalid_link", "This room link is not recognised.", "Copy the full link from the room page, including the part after #.");
+        const side = getSide(human.side_id);
+        const taken = (db.query("SELECT COUNT(*) AS n FROM participants WHERE side_id = ? AND kind = 'agent'").get(side.id) as { n: number }).n;
+        target = { threadId: human.thread_id, sideId: side.id, name: `${side.name} Claude${taken ? ` ${taken + 1}` : ""}` };
+      } else {
+        invite = db.query("SELECT * FROM invites WHERE code_hash = ?").get(sha256(code)) as InviteRow | null;
+        if (!invite) throw new HttpError(404, "invalid_invite", "This invite code is not recognised.", "Ask the human who invited you for a fresh invite.");
+        if (invite.redeemed_at !== null) throw new HttpError(410, "invite_used", "This invite was already used. Invites work once.", "Ask your human for a fresh invite.");
+        if (invite.expires_at < Date.now()) throw new HttpError(410, "invite_expired", "This invite has expired.", "Ask your human for a fresh invite.");
+        target = { threadId: invite.thread_id, sideId: invite.side_id, name: invite.name };
+      }
+
+      requireOpen(target.threadId);
+      const existing = bearer(req) ? authMailbox(req) : null;
+      const label = (typeof input.label === "string" && input.label.trim().slice(0, 60)) || target.name;
+
       let box = existing;
       let token: string | undefined;
       if (!box) {
@@ -1182,8 +1240,14 @@ export function createApp(opts: AppOptions) {
       const prior = db.query("SELECT * FROM participants WHERE mailbox_id = ? AND thread_id = ?").get(box.id, target.threadId) as ParticipantRow | null;
       if (prior && !prior.revoked) {
         // Joining again with the room link is harmless: the agent keeps its seat and its read mark.
-        if (!invite) return { box, token, participant: prior, rejoined: true };
+        if (!invite) return { box, token, participant: prior, rejoined: true, threadId: target.threadId };
         throw new HttpError(409, "already_member", `This agent is already in the room as ${prior.name}.`, "The invite was not used up; give it to another agent if needed.");
+      }
+      if (invite) {
+        const redeemed = db.query("UPDATE invites SET redeemed_at = ? WHERE id = ? AND redeemed_at IS NULL").run(Date.now(), invite.id);
+        if (redeemed.changes === 0) {
+          throw new HttpError(410, "invite_used", "This invite was already used. Invites work once.", "Ask your human for a fresh invite.");
+        }
       }
       const id = prior?.id ?? newId();
       if (prior) {
@@ -1193,13 +1257,12 @@ export function createApp(opts: AppOptions) {
           "INSERT INTO participants (id, thread_id, side_id, kind, name, mailbox_id, created_at) VALUES (?, ?, ?, 'agent', ?, ?, ?)",
         ).run(id, target.threadId, target.sideId, target.name, box.id, Date.now());
       }
-      if (invite) db.query("UPDATE invites SET redeemed_at = ? WHERE id = ?").run(Date.now(), invite.id);
       systemMessage(target.threadId, `${target.name} joined the room.`);
       // The join response carries the history, so everything up to here counts as read.
       db.query("UPDATE participants SET read_seq = ?, last_seen = ? WHERE id = ?").run(maxSeq(target.threadId), Date.now(), id);
-      return { box, token, participant: db.query("SELECT * FROM participants WHERE id = ?").get(id) as ParticipantRow, rejoined: false };
+      return { box, token, participant: db.query("SELECT * FROM participants WHERE id = ?").get(id) as ParticipantRow, rejoined: false, threadId: target.threadId };
     })();
-    if (!result.rejoined) bump(target.threadId);
+    if (!result.rejoined) bump(result.threadId);
 
     const p = result.participant;
     const recent = visibleMessages(p, Math.max(0, maxSeq(p.thread_id) - 30));
@@ -1345,6 +1408,11 @@ export function createApp(opts: AppOptions) {
         const seq = Math.min(raw.seq as number, maxSeq(p.thread_id));
         if (seq > p.read_seq) {
           db.query("UPDATE participants SET read_seq = ? WHERE id = ?").run(seq, p.id);
+          // Keep recent acknowledged wakes so sibling sessions with earlier `from=` marks still wake.
+          db.query(
+            `DELETE FROM wakes WHERE participant_id = ? AND wake_at <= ?
+             AND message_id IN (SELECT id FROM messages WHERE thread_id = ? AND seq <= ?)`,
+          ).run(p.id, Date.now() - wakeRetentionMs, p.thread_id, seq);
           touched.push(p.thread_id);
         }
       }
@@ -1408,6 +1476,20 @@ export function createApp(opts: AppOptions) {
   async function sweep(): Promise<void> {
     const cutoff = Date.now() - notifyDelayMs;
     const sides = db.query("SELECT * FROM sides WHERE notify_url IS NOT NULL").all() as SideRow[];
+    const calls: Promise<void>[] = [];
+    const recordOutcome = (side: SideRow, errMsg: string | null) => {
+      const had = notifyErrors.has(side.id);
+      if (errMsg === null) {
+        if (!had) return;
+        notifyErrors.delete(side.id);
+      } else {
+        notifyErrors.set(side.id, { at: new Date().toISOString(), message: errMsg });
+      }
+      if (!closed) {
+        db.query("UPDATE threads SET version = version + 1 WHERE id = ?").run(side.thread_id);
+        wake(`t:${side.thread_id}`);
+      }
+    };
     for (const side of sides) {
       const stale = db
         .query(
@@ -1424,18 +1506,30 @@ export function createApp(opts: AppOptions) {
       const thread = getThread(side.thread_id);
       const who = agents.length ? "your agent has not picked up" : "no agent is connected on your side to read";
       const text = `Parley: ${who} ${stale.n} message${stale.n === 1 ? "" : "s"} from ${stale.authors} in "${thread.title}".`;
-      try {
-        // Resolved and checked at send time, and sent to the checked address: see src/webhook.ts.
-        const status = await sendWebhook(
+      // Resolved and checked at send time, and sent to the checked address: see src/webhook.ts.
+      calls.push(
+        sendWebhook(
           side.notify_url!,
           { text, thread: { id: thread.id, title: thread.title }, unread: stale.n },
           { allowPrivate: opts.allowPrivateWebhooks, resolve: opts.resolveHost },
-        );
-        if (status < 200 || status >= 300) console.error(`notify webhook for side ${side.id} returned ${status}`);
-      } catch (err) {
-        console.error(`notify webhook for side ${side.id} failed: ${(err as Error).message}`);
-      }
+        ).then(
+          (status) => {
+            if (status >= 200 && status < 300) {
+              recordOutcome(side, null);
+            } else {
+              recordOutcome(side, `HTTP ${status}`);
+              console.error(`notify webhook for side ${side.id} returned ${status}`);
+            }
+          },
+          (err) => {
+            const message = (err as Error).message;
+            recordOutcome(side, message);
+            console.error(`notify webhook for side ${side.id} failed: ${message}`);
+          },
+        ),
+      );
     }
+    await Promise.all(calls);
   }
 
   // ---- waking an agent that has no session running ------------------------
@@ -1567,6 +1661,7 @@ export function createApp(opts: AppOptions) {
     // Humans, authenticated by a thread link token.
     if (method === "POST" && path === "/api/threads") return createThread(req, address);
     if (method === "GET" && path === "/api/state") return getState(req, url);
+    if (method === "GET" && path === "/api/messages") return getMessages(req, url);
     if (method === "POST" && path === "/api/messages") {
       const p = authHuman(req);
       return post(p, await readMessageBody(req));

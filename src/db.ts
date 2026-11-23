@@ -141,7 +141,7 @@ export interface MessageRow {
 
 export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
-  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
 
   const { user_version: found } = db.query("PRAGMA user_version").get() as { user_version: number };
   const hasTables = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'").get() !== null;
