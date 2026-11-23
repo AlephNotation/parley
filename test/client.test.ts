@@ -1163,6 +1163,45 @@ describe("one session attends a room", () => {
     expect(outside.stderr).toContain("not running inside a Claude Code session");
   });
 
+  test("a session taking the room over is not shown what the last one already dealt with", async () => {
+    const { acme, vers, id } = await scene();
+    // Both sessions have looked at the room before, so each has its own read mark.
+    await acme.run(["read"], as("A"));
+    await acme.run(["read"], as("B"));
+    await prompt(acme, "A", "SessionStart");
+    await s.send(vers.token, id, "answered by A");
+    expect((await acme.run(["read"], as("A"))).stdout).toContain("answered by A");
+    expect((await acme.run(["say", "done"], as("A"))).code).toBe(0);
+
+    expect((await acme.run(["attend"], as("B"))).code).toBe(0);
+    expect((await prompt(acme, "B")).stdout).toBe("");
+    expect((await acme.run(["read"], as("B"))).stdout).toContain("No new messages.");
+
+    // The same holds when the room passes on because the session ended.
+    await acme.run(["read"], as("C"));
+    await s.send(vers.token, id, "answered by B");
+    expect((await acme.run(["read"], as("B"))).stdout).toContain("answered by B");
+    await acme.run(["hook", "end"], { stdin: hookJson(acme, "SessionEnd", "B") });
+    expect((await prompt(acme, "C")).stdout).toBe("");
+    // What arrives afterwards does reach the new session.
+    await s.send(vers.token, id, "new for C");
+    expect(context(await prompt(acme, "C"))).toContain("unread Parley message");
+    expect((await acme.run(["read"], as("C"))).stdout).toContain("new for C");
+  });
+
+  test("a waiter already waiting when its room is taken over does not wake its session", async () => {
+    const { acme, vers, id } = await scene();
+    await prompt(acme, "A", "SessionStart");
+    const waiting = acme.spawn(["hook", "wait"], { stdin: hookJson(acme, "Stop", "A"), env: { PARLEY_HOOK_WAIT: "20" } });
+    // Give A's waiter time to be inside its long poll, then move the room and send mail.
+    await Bun.sleep(1500);
+    expect((await acme.run(["attend"], as("B"))).code).toBe(0);
+    await s.send(vers.token, id, "for whoever attends now");
+    const [code, stderr] = await Promise.all([waiting.exited, new Response(waiting.stderr).text()]);
+    expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+    expect(context(await prompt(acme, "B"))).toContain("1 unread Parley message");
+  }, 30_000);
+
   test("a session that joins the room itself is the one attending it", async () => {
     const t = await s.thread(false);
     const vers = await s.seat(t.versHuman);
