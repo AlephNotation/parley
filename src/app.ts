@@ -67,6 +67,8 @@ export interface AppOptions {
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
+/** Hard wire limit for any JSON or message request body, enforced while streaming before buffering. */
+const MAX_REQUEST_BYTES = 128 * 1024;
 /** Where an agent finds the plain-Markdown guide: the llms.txt convention, and the names agents guess. */
 const AGENT_PATHS = new Set(["/llms.txt", "/agents.md", "/agents", "/agent", "/agent.md"]);
 /** A client between two long-polls still counts as listening for this long. */
@@ -116,15 +118,22 @@ class RateLimit {
   }
 }
 
-const noStore = { "cache-control": "no-store", "referrer-policy": "no-referrer" };
+const noStore = {
+  "cache-control": "no-store",
+  "referrer-policy": "no-referrer",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+};
 const apiHeaders = { ...noStore, "x-parley-client-version": CLIENT_VERSION };
+const htmlCsp =
+  "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: apiHeaders });
 }
 
 function html(body: string): Response {
-  return new Response(body, { headers: { ...noStore, "content-type": "text/html; charset=utf-8" } });
+  return new Response(body, { headers: { ...noStore, "content-security-policy": htmlCsp, "content-type": "text/html; charset=utf-8" } });
 }
 
 const sha256 = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
@@ -150,8 +159,35 @@ function intParam(url: URL, name: string, fallback: number): number {
   return value;
 }
 
+/** Reads a request body as UTF-8 up to `maxBytes`, aborting before buffering oversized payloads. */
+async function readLimitedText(req: Request, maxBytes: number, code: string, message: string, hint?: string): Promise<string> {
+  const declared = Number(req.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new HttpError(413, code, message, hint);
+  }
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new HttpError(413, code, message, hint);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total).toString("utf8");
+}
+
 async function readJson(req: Request): Promise<Record<string, unknown>> {
-  const text = await req.text();
+  const text = await readLimitedText(req, MAX_REQUEST_BYTES, "body_too_large", `Request body exceeds ${MAX_REQUEST_BYTES} bytes.`);
   if (text.trim() === "") return {};
   try {
     const value = JSON.parse(text);
@@ -192,6 +228,8 @@ export function createApp(opts: AppOptions) {
   const touchedAt = new Map<string, number>();
   /** Latest notification webhook failure per side, cleared on a 2xx delivery or when notify_url changes. */
   const notifyErrors = new Map<string, { at: string; message: string }>();
+  /** Latest wake webhook failure per mailbox, cleared on a 2xx delivery or when wake_url changes. */
+  const wakeErrors = new Map<string, { at: string; message: string }>();
 
   // ---- long-poll plumbing -------------------------------------------------
 
@@ -985,6 +1023,50 @@ export function createApp(opts: AppOptions) {
     return json({ approval: now.approval === 1, notify_url: now.notify_url });
   }
 
+  async function testNotify(req: Request): Promise<Response> {
+    const p = authHuman(req);
+    const input = await readJson(req);
+    const side = getSide(p.side_id);
+    let target: string;
+    if (input.notify_url !== undefined && input.notify_url !== null) {
+      if (typeof input.notify_url !== "string") throw new HttpError(400, "bad_request", '"notify_url" must be a URL string.');
+      const trimmed = input.notify_url.trim();
+      target = trimmed ? checkWebhook(trimmed) : "";
+    } else {
+      target = side.notify_url ?? "";
+    }
+    if (!target) {
+      throw new HttpError(400, "no_notify_url", "No notification webhook URL is set.", "Enter an https webhook URL first.");
+    }
+    const thread = getThread(p.thread_id);
+    const text = `Parley: test notification for ${side.name} in "${thread.title}".`;
+    const tracksSaved = side.notify_url === target;
+    try {
+      const status = await sendWebhook(
+        target,
+        { text, thread: { id: thread.id, title: thread.title }, test: true },
+        { allowPrivate: opts.allowPrivateWebhooks, resolve: opts.resolveHost },
+      );
+      if (status >= 200 && status < 300) {
+        if (tracksSaved && notifyErrors.delete(side.id)) bump(p.thread_id);
+        return json({ ok: true, status });
+      }
+      if (tracksSaved) {
+        notifyErrors.set(side.id, { at: new Date().toISOString(), message: `HTTP ${status}` });
+        bump(p.thread_id);
+      }
+      throw new HttpError(502, "webhook_failed", `Webhook returned HTTP ${status}.`, "Check the URL and make sure it accepts JSON POST requests.");
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      const message = (err as Error).message;
+      if (tracksSaved) {
+        notifyErrors.set(side.id, { at: new Date().toISOString(), message });
+        bump(p.thread_id);
+      }
+      throw new HttpError(502, "webhook_failed", `Webhook test failed: ${message}`);
+    }
+  }
+
   /**
    * Replaces the side's room link: a new human token, the old one rejected from now on. Agents already
    * seated keep their own tokens and are unaffected; invites not yet redeemed are cancelled, since
@@ -1047,7 +1129,13 @@ export function createApp(opts: AppOptions) {
   type Draft = { body: string; to?: string[]; fyi?: boolean; from?: string };
 
   async function readMessageBody(req: Request): Promise<Draft> {
-    const raw = await req.text();
+    const raw = await readLimitedText(
+      req,
+      MAX_REQUEST_BYTES,
+      "message_too_large",
+      `Message exceeds ${MAX_BODY_BYTES} bytes.`,
+      "Split it, or summarise and offer details on request.",
+    );
     let body = raw;
     // Plain-text posts address through the query string: ?to=Acme,vers-claude-ab12cd or ?fyi=1.
     const query = new URL(req.url).searchParams;
@@ -1280,7 +1368,7 @@ export function createApp(opts: AppOptions) {
 
   function getMe(req: Request): Response {
     const box = authMailbox(req);
-    return json({ mailbox: { address: box.address, label: box.label }, threads: seats(box).length });
+    return json({ mailbox: { address: box.address, label: box.label, wake_error: wakeErrors.get(box.id) ?? null }, threads: seats(box).length });
   }
 
   function getInstructions(req: Request): Response {
@@ -1385,7 +1473,7 @@ export function createApp(opts: AppOptions) {
       };
     });
     return json({
-      mailbox: { address: box.address, label: box.label },
+      mailbox: { address: box.address, label: box.label, wake_error: wakeErrors.get(box.id) ?? null },
       unread_count: threads.reduce((n, t) => n + t.unread.length, 0),
       threads,
       /** Rooms named in `threads=` that a human removed this agent from. */
@@ -1544,9 +1632,10 @@ export function createApp(opts: AppOptions) {
       // Start from the present so turning wakes on does not replay old mail.
       const newest = (db.query("SELECT COALESCE(MAX(id), 0) AS id FROM messages").get() as { id: number }).id;
       db.query("UPDATE mailboxes SET wake_url = ?, woken_message_id = ?, woken_at = 0 WHERE id = ?").run(value, newest, box.id);
-      return json({ wake_url: value });
+      wakeErrors.delete(box.id);
+      return json({ wake_url: value, wake_error: null });
     }
-    return json({ wake_url: box.wake_url });
+    return json({ wake_url: box.wake_url, wake_error: wakeErrors.get(box.id) ?? null });
   }
 
   /**
@@ -1588,9 +1677,18 @@ export function createApp(opts: AppOptions) {
           { allowPrivate: opts.allowPrivateWebhooks, resolve: opts.resolveHost, timeoutMs: 60_000 },
         ).then(
           (status) => {
-            if (status < 200 || status >= 300) console.error(`wake webhook for ${box.address} returned ${status}`);
+            if (status >= 200 && status < 300) {
+              wakeErrors.delete(box.id);
+            } else {
+              wakeErrors.set(box.id, { at: new Date().toISOString(), message: `HTTP ${status}` });
+              console.error(`wake webhook for ${box.address} returned ${status}`);
+            }
           },
-          (err) => console.error(`wake webhook for ${box.address} failed: ${(err as Error).message}`),
+          (err) => {
+            const message = (err as Error).message;
+            wakeErrors.set(box.id, { at: new Date().toISOString(), message });
+            console.error(`wake webhook for ${box.address} failed: ${message}`);
+          },
         ),
       );
     }
@@ -1673,6 +1771,7 @@ export function createApp(opts: AppOptions) {
     if (method === "POST" && path === "/api/archive") return setArchived(req);
     if (method === "GET" && path === "/api/transcript") return transcript(authHuman(req), url);
     if (method === "POST" && path === "/api/settings") return setSettings(req);
+    if (method === "POST" && path === "/api/settings/test-notify") return testNotify(req);
     if (method === "POST" && path === "/api/invites") return createInvite(req);
     if (method === "POST" && path === "/api/link/rotate") return rotateLink(req);
     if (method === "POST" && (match = /^\/api\/agents\/([0-9a-f]+)\/revoke$/.exec(path))) return revokeAgent(req, match[1]!);
