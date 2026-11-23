@@ -1481,4 +1481,119 @@ describe("slim polling, message pagination, human display name, client version, 
       await srv.stop();
     }
   });
+
+  test("HTML and JSON responses set security headers", async () => {
+    const htmlRes = await fetch(s.base + "/t");
+    expect(htmlRes.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(htmlRes.headers.get("x-frame-options")).toBe("DENY");
+    expect(htmlRes.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    expect(htmlRes.headers.get("content-security-policy")).toContain("object-src 'none'");
+
+    const jsonRes = await fetch(s.base + "/healthz");
+    expect(jsonRes.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(jsonRes.headers.get("x-frame-options")).toBe("DENY");
+  });
+
+  test("oversized JSON and message request bodies are rejected with 413 before buffering", async () => {
+    const t = await s.setup(false);
+    // Oversized JSON on a non-message endpoint.
+    const bigJson = JSON.stringify({ title: "x".repeat(140 * 1024), sides: ["Vers", "Acme"] });
+    const res1 = await fetch(s.base + "/api/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: bigJson,
+    });
+    expect(res1.status).toBe(413);
+    expect(((await res1.json()) as any).error.code).toBe("body_too_large");
+
+    // Oversized streamed message body without Content-Length.
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const chunk = new Uint8Array(32 * 1024).fill(65);
+        for (let i = 0; i < 5; i++) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const res2 = await fetch(s.base + "/api/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${t.versHuman}`, "content-type": "text/plain" },
+      body: stream,
+    });
+    expect(res2.status).toBe(413);
+    expect(((await res2.json()) as any).error.code).toBe("message_too_large");
+  });
+
+  test("POST /api/settings/test-notify tests a side webhook and updates notify_error", async () => {
+    let replyStatus = 500;
+    const received: unknown[] = [];
+    const hook = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        received.push(await req.json());
+        return new Response("ok", { status: replyStatus });
+      },
+    });
+    const srv = startServer({ allowPrivateWebhooks: true });
+    try {
+      const t = await srv.setup(false);
+
+      // Without a URL configured or supplied, returns 400.
+      const none = await srv.call(t.versHuman, "POST", "/api/settings/test-notify", {});
+      expect(none.status).toBe(400);
+      expect(none.data.error.code).toBe("no_notify_url");
+
+      // Save the webhook URL, test against failing 500 -> 502 + notify_error populated.
+      await srv.call(t.versHuman, "POST", "/api/settings", { notify_url: hook.url.origin });
+      const failed = await srv.call(t.versHuman, "POST", "/api/settings/test-notify", {});
+      expect(failed.status).toBe(502);
+      expect(failed.data.error.code).toBe("webhook_failed");
+      const stFail = (await srv.call(t.versHuman, "GET", "/api/state")).data;
+      expect(stFail.notify_error?.message).toBe("HTTP 500");
+
+      // Now return 200 -> succeeds and clears notify_error.
+      replyStatus = 200;
+      const ok = await srv.call(t.versHuman, "POST", "/api/settings/test-notify", {});
+      expect(ok.status).toBe(200);
+      expect(ok.data.ok).toBe(true);
+      expect(received.length).toBe(2);
+      expect((received[1] as any).test).toBe(true);
+      const stOk = (await srv.call(t.versHuman, "GET", "/api/state")).data;
+      expect(stOk.notify_error).toBeNull();
+    } finally {
+      hook.stop(true);
+      await srv.stop();
+    }
+  });
+
+  test("wake webhook failures are exposed as wake_error on /api/wake and /api/inbox, and cleared on recovery", async () => {
+    let replyStatus = 503;
+    const hook = Bun.serve({
+      port: 0,
+      fetch: () => new Response("err", { status: replyStatus }),
+    });
+    const srv = startServer({ allowPrivateWebhooks: true, wakeCooldownMs: 0, sweepIntervalMs: 0 });
+    try {
+      const t = await srv.setup(false);
+      await srv.call(t.acme.token, "POST", "/api/wake", { url: hook.url.origin });
+      await srv.send(t.vers.token, t.id, "are you awake?");
+      await srv.app.sweepWakes();
+
+      const wake1 = await srv.call(t.acme.token, "GET", "/api/wake");
+      expect(wake1.data.wake_error?.message).toBe("HTTP 503");
+      const inbox1 = await srv.inbox(t.acme.token);
+      expect(inbox1.mailbox.wake_error?.message).toBe("HTTP 503");
+
+      // Next wake succeeds -> clears wake_error.
+      replyStatus = 200;
+      await srv.send(t.vers.token, t.id, "try again");
+      await srv.app.sweepWakes();
+      const wake2 = await srv.call(t.acme.token, "GET", "/api/wake");
+      expect(wake2.data.wake_error).toBeNull();
+      const inbox2 = await srv.inbox(t.acme.token);
+      expect(inbox2.mailbox.wake_error).toBeNull();
+    } finally {
+      hook.stop(true);
+      await srv.stop();
+    }
+  });
 });

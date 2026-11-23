@@ -12,13 +12,14 @@
 # saves a copy in .deploy/vers.env (git-ignored).
 set -eu
 
-id="${1:?usage: scripts/deploy-vers.sh <computer-id> [--init] [--skip-client]}"
+id="${1:?usage: scripts/deploy-vers.sh <computer-id> [--init] [--build-client]}"
 shift
 init=0
-client=1
+client=0
 for arg in "$@"; do
   case "$arg" in
     --init) init=1 ;;
+    --build-client) client=1 ;;
     --skip-client) client=0 ;;
     *) echo "unknown option $arg" >&2; exit 1 ;;
   esac
@@ -62,7 +63,7 @@ run 'cd /app && tar xzf release.tgz && rm release.tgz && ls'
 
 if [ "$client" = 1 ]; then
   echo "building client binaries on the computer"
-  run 'cd /app && bun scripts/build-client.ts 2>&1 | grep -E "built|rror"' 290
+  run 'cd /app && bun scripts/build-client.ts' 290
 fi
 
 echo "restarting the server"

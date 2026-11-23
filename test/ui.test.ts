@@ -721,4 +721,29 @@ describe("display name, quick-reply, unread title, notifications, and notify_err
     expect(errEl.hidden).toBe(true);
     expect(errEl.textContent).toBe("");
   });
+
+  test("Test button calls /api/settings/test-notify and reports delivery", async () => {
+    const calls: { url: string; body?: string }[] = [];
+    const { doc, fns } = loadThreadUi({
+      fetchImpl: async (url: string, init?: { body?: string }) => {
+        calls.push({ url, body: init?.body });
+        return { ok: true, status: 200, json: async () => ({ ok: true, status: 200 }) };
+      },
+    });
+    fns.render(makeState());
+    doc.getElementById("notifyUrl")!.value = "https://hooks.slack.com/services/T1/B1/abc";
+    await doc.getElementById("testNotifyBtn")!.onclick!();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("/api/settings/test-notify");
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ notify_url: "https://hooks.slack.com/services/T1/B1/abc" });
+    expect(doc.getElementById("notifyOk")!.hidden).toBe(false);
+    expect(doc.getElementById("notifyOk")!.textContent).toContain("delivered");
+  });
+
+  test("home page supports adding extra sides and copy buttons for links", () => {
+    expect(homePage).toContain('id="addSide"');
+    expect(homePage).toContain("MAX_SIDES = 6");
+    expect(homePage).toContain("Copy link");
+    expect(homePage).toContain("Copy join command");
+  });
 });

@@ -177,7 +177,12 @@ interface InboxThread extends ThreadInfo {
   more: boolean;
   pending: Msg[];
 }
+interface WakeError {
+  at: string;
+  message: string;
+}
 interface Inbox {
+  mailbox?: { address: string; label: string; wake_error?: WakeError | null };
   unread_count: number;
   threads: InboxThread[];
   timed_out: boolean;
@@ -999,6 +1004,9 @@ async function cmdStatus() {
         },
       });
       console.log(`${server}: you are ${entry.address}, reachable, ${res.unread_count} new message${res.unread_count === 1 ? "" : "s"}`);
+      if (res.mailbox?.wake_error) {
+        console.log(`  last wake failed at ${res.mailbox.wake_error.at.slice(0, 16).replace("T", " ")}Z: ${res.mailbox.wake_error.message}`);
+      }
       if (serverClientVersion && isNewerVersion(serverClientVersion, VERSION)) {
         console.log(`  update available: server is on ${serverClientVersion}, you have ${VERSION} (curl -fsSL ${server}/install.sh | sh)`);
       }
@@ -1037,9 +1045,12 @@ async function cmdWake(args: ReturnType<typeof parseArgs>) {
     for (const [server, entry] of servers) {
       const res =
         sub === "off"
-          ? await api<{ wake_url: string | null }>(server, entry.token, "POST", "/api/wake", { json: { url: null } })
-          : await api<{ wake_url: string | null }>(server, entry.token, "GET", "/api/wake");
+          ? await api<{ wake_url: string | null; wake_error?: WakeError | null }>(server, entry.token, "POST", "/api/wake", { json: { url: null } })
+          : await api<{ wake_url: string | null; wake_error?: WakeError | null }>(server, entry.token, "GET", "/api/wake");
       console.log(`${server}: ${res.wake_url ? `wakes ${entry.address} at ${res.wake_url}` : `no wake address for ${entry.address}`}`);
+      if (res.wake_error) {
+        console.log(`  last wake failed at ${res.wake_error.at.slice(0, 16).replace("T", " ")}Z: ${res.wake_error.message}`);
+      }
     }
     if (sub === "status" && !args.flags.url) console.log("Set one with `parley wake listen --url <public address of this machine>`.");
     return;

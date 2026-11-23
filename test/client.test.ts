@@ -1725,4 +1725,41 @@ describe("status version drift and session pruning", () => {
       fake.stop();
     }
   });
+
+  test("status and wake surface wake_error reported by the server", async () => {
+    const srv = Bun.serve({
+      port: 0,
+      fetch: (req) => {
+        const path = new URL(req.url).pathname;
+        if (path === "/api/inbox") {
+          return Response.json({
+            mailbox: { address: "acme-1", label: "Acme", wake_error: { at: "2026-11-23T12:34:00.000Z", message: "HTTP 502" } },
+            unread_count: 0,
+            threads: [],
+            removed: [],
+            timed_out: false,
+          });
+        }
+        if (path === "/api/wake") {
+          return Response.json({
+            wake_url: "https://agent.example.com/parley-wake/secret",
+            wake_error: { at: "2026-11-23T12:34:00.000Z", message: "HTTP 502" },
+          });
+        }
+        return Response.json({ ok: true });
+      },
+    });
+    try {
+      const m = setupMachine(srv.url.origin);
+      const st = await m.run(["status"]);
+      expect(st.code).toBe(0);
+      expect(st.stdout).toContain("last wake failed at 2026-11-23 12:34Z: HTTP 502");
+
+      const wk = await m.run(["wake"]);
+      expect(wk.code).toBe(0);
+      expect(wk.stdout).toContain("last wake failed at 2026-11-23 12:34Z: HTTP 502");
+    } finally {
+      srv.stop(true);
+    }
+  });
 });

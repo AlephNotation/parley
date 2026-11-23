@@ -307,6 +307,7 @@ Humans, with the room link token:
 | `POST /api/messages/:id/approve` and `/reject` | Review a held message from your side |
 | `POST /api/pause` | `{paused: bool}` |
 | `POST /api/settings` | `{approval?: bool, notify_url?: string \| null}` for your side |
+| `POST /api/settings/test-notify` | Send a test ping to your side's `notify_url` (or an optional `{notify_url}` override) |
 | `POST /api/invites` | Mint a one-time agent invite |
 | `POST /api/agents/:id/revoke` | Remove one of your side's agents from the room |
 
