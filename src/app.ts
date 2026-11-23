@@ -471,6 +471,8 @@ export function createApp(opts: AppOptions) {
     last_seen_seconds_ago: number | null;
     /** For agents: delivered messages it has not acknowledged yet. */
     unread: number | null;
+    /** For agents: false when its machine says no session attends this room; null when not known. */
+    attended: boolean | null;
     side_id: string;
     id: string;
   };
@@ -493,6 +495,7 @@ export function createApp(opts: AppOptions) {
         state: r.last_seen === null ? "not_joined" : listening ? "listening" : "away",
         last_seen_seconds_ago: r.last_seen === null ? null : Math.round((now - r.last_seen) / 1000),
         unread: r.kind === "agent" ? unreadFor(r, 1000).length : null,
+        attended: r.kind === "agent" && r.attended !== null ? r.attended === 1 : null,
         side_id: r.side_id,
         id: r.id,
       };
@@ -522,6 +525,8 @@ export function createApp(opts: AppOptions) {
         parts.push(`${a.name} is listening and will be notified now.`);
       } else if (a.mailbox_id && (db.query("SELECT wake_url FROM mailboxes WHERE id = ?").get(a.mailbox_id) as { wake_url: string | null } | null)?.wake_url) {
         parts.push(`${a.name} has no session running; Parley is calling its wake address to start one.`);
+      } else if (seen?.attended === false) {
+        parts.push(`${a.name} has no session attending this room, so it is not told about this until its human assigns one.`);
       } else {
         parts.push(`${a.name} is not listening right now (last active ${seen?.last_seen_seconds_ago}s ago); it will see this when it next checks.`);
       }
@@ -1352,6 +1357,23 @@ export function createApp(opts: AppOptions) {
     return json({ ok: true });
   }
 
+  /** An agent's client says whether one of its sessions attends a room, so others can see when none does. */
+  async function setAttending(req: Request): Promise<Response> {
+    const box = authMailbox(req);
+    const input = await readJson(req);
+    if (typeof input.thread !== "string" || typeof input.attending !== "boolean") {
+      throw new HttpError(400, "bad_request", 'Body must be {"thread": "<id>", "attending": true|false}.');
+    }
+    const p = seat(box, input.thread);
+    const value = input.attending ? 1 : 0;
+    if (p.attended !== value) {
+      db.query("UPDATE participants SET attended = ? WHERE id = ?").run(value, p.id);
+      db.query("UPDATE threads SET version = version + 1 WHERE id = ?").run(p.thread_id);
+      wake(`t:${p.thread_id}`);
+    }
+    return json({ ok: true, attending: input.attending });
+  }
+
   function listThreads(req: Request): Response {
     const box = authMailbox(req);
     return json({
@@ -1566,6 +1588,7 @@ export function createApp(opts: AppOptions) {
     if (method === "GET" && path === "/api/agent") return getInstructions(req);
     if (method === "GET" && path === "/api/inbox") return getInbox(req, url);
     if (method === "POST" && path === "/api/inbox/ack") return ackInbox(req);
+    if (method === "POST" && path === "/api/attending") return setAttending(req);
     if ((method === "GET" || method === "POST") && path === "/api/wake") return wakeSettings(req);
     if (method === "GET" && path === "/api/threads") return listThreads(req);
     if (method === "GET" && (match = /^\/api\/threads\/([0-9a-f]+)\/transcript$/.exec(path))) {

@@ -151,6 +151,8 @@ interface Person {
   side: string;
   kind: string;
   state: "not_joined" | "listening" | "away";
+  /** For agents: false when its machine says no session attends this room. Null when not known. */
+  attended?: boolean | null;
   last_seen_seconds_ago: number | null;
   unread: number | null;
 }
@@ -393,7 +395,7 @@ function renderPeople(people: Person[]): string {
   return people
     .map((p) => {
       const state = p.state === "listening" ? "listening" : p.state === "not_joined" ? "not joined" : `away ${p.last_seen_seconds_ago}s`;
-      return `${p.name} [${state}]`;
+      return `${p.name} [${state}${p.state === "away" && p.attended === false ? ", no session attending" : ""}]`;
     })
     .join(", ");
 }
@@ -581,6 +583,7 @@ async function cmdJoin(args: ReturnType<typeof parseArgs>) {
   // Joined from inside a session: that session is the one in the conversation.
   const joiner = commandSession();
   if (joiner) takeRooms(joiner, [res.thread.id]);
+  await reportAttending(cfg, [res.thread.id], joiner !== null);
 
   const t = res.thread as ThreadInfo;
   const me = selfName();
@@ -595,9 +598,13 @@ async function cmdJoin(args: ReturnType<typeof parseArgs>) {
       console.log(
         joiner
           ? `This session attends the room: it is told about new messages, and other sessions in ${process.cwd()} are not (hooks in ${path}).`
-          : `One Claude Code session in ${process.cwd()} at a time attends this room and is told about new messages: the first to start or take a turn, until it ends (hooks in ${path}).`,
+          : `No Claude Code session attends this room yet, so none is told about its messages (hooks in ${path}).`,
       );
-      console.log(`To move the room to another session, run \`${me} attend\` in it.`);
+      console.log(
+        joiner
+          ? `To move the room to another session, run \`${me} attend\` in it.`
+          : `In the Claude Code session in ${process.cwd()} that should handle the room, ask it to attend the Parley room; it runs \`${me} attend\`.`,
+      );
       console.log(RUNNING_SESSION_NOTE);
     } catch (err) {
       const reason = (err as Error).message.replace(/\.?$/, ".");
@@ -750,7 +757,10 @@ async function cmdSay(args: ReturnType<typeof parseArgs>) {
   const res = await post(t, body, audienceFlags(args));
   // Whoever speaks in a room is the one the answer should come back to.
   const speaker = commandSession();
-  if (speaker) takeRooms(speaker, [t.id]);
+  if (speaker && loadAttending()[t.id]?.session !== speaker) {
+    takeRooms(speaker, [t.id]);
+    await reportAttending(cfg, [t.id], true);
+  }
   console.log(res.message.status === "sent" ? `Posted as #${res.message.seq}.` : "Not posted yet: held for review.");
   console.log(res.note);
 }
@@ -846,7 +856,7 @@ function cmdBind(args: ReturnType<typeof parseArgs>) {
 }
 
 /** `parley attend [room]`: make this session the one told about a room's messages. */
-function cmdAttend(args: ReturnType<typeof parseArgs>) {
+async function cmdAttend(args: ReturnType<typeof parseArgs>) {
   const cfg = loadConfig();
   const session = commandSession();
   if (!session) {
@@ -858,8 +868,8 @@ function cmdAttend(args: ReturnType<typeof parseArgs>) {
   const rooms = args.positional[0] ? [resolveRoom(cfg, args.positional[0]).id] : defaultRooms(cfg, process.cwd()).map(([id]) => id);
   if (rooms.length === 0) fail("no Parley rooms are connected to this directory", "Name one: `parley attend <room>`. `parley rooms` lists them.");
   takeRooms(session, rooms);
-  const names = rooms.map((id) => `"${cfg.threads[id]?.title ?? id}" [${id}]`).join(", ");
-  console.log(`This session now attends ${names}: it is the one told about new messages, and other sessions here are not.`);
+  await reportAttending(cfg, rooms, true);
+  console.log(`This session now attends ${roomNames(cfg, rooms)}: it is the one told about new messages, and other sessions here are not.`);
 }
 
 async function cmdStatus() {
@@ -1000,6 +1010,8 @@ interface SessionState {
   authWarned?: string[];
   /** Per thread, this session's own read mark, so another session reading does not hide mail from it. */
   read?: Seen;
+  /** Rooms this session was already told nobody attends, so it hears that once and not every turn. */
+  toldUnattended?: string[];
 }
 
 const sessionPath = (id: string) => join(HOME, "sessions", `${id.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
@@ -1007,7 +1019,7 @@ const sessionPath = (id: string) => join(HOME, "sessions", `${id.replace(/[^A-Za
 function loadSession(id: string): SessionState {
   try {
     const raw = JSON.parse(readFileSync(sessionPath(id), "utf8")) as Partial<SessionState>;
-    return { pid: raw.pid, notified: raw.notified ?? {}, authWarned: raw.authWarned, read: raw.read };
+    return { pid: raw.pid, notified: raw.notified ?? {}, authWarned: raw.authWarned, read: raw.read, toldUnattended: raw.toldUnattended };
   } catch {
     return { notified: {} };
   }
@@ -1118,14 +1130,17 @@ async function roomNotice(cfg: Config, cwd: string, targets: Map<string, string[
 // ---- Which session attends a room ------------------------------------------
 //
 // Several Claude Code sessions often run in one directory. Telling all of them about every message
-// interrupts work that has nothing to do with the room, and gets several answers to one question.
-// So one session at a time attends a room: the one that joined it or last posted to it, else the
-// first whose hooks run. The rest stay quiet until one takes it over with `parley attend`.
+// interrupts work that has nothing to do with the room, gets several answers to one question, and
+// puts what outsiders write into sessions that were never meant to see it. So a room is attended
+// by one session, and only because someone chose it: the session that joined the room, one that
+// posts to it, or one told to with `parley attend`. No session picks a room up on its own.
 
 interface Attendance {
   session: string;
   /** When the attending session last showed signs of life. */
   at: number;
+  /** The session ended. It keeps the room in case it is resumed, but nobody is attending meanwhile. */
+  ended?: boolean;
 }
 
 const ATTENDING_PATH = join(HOME, "attending.json");
@@ -1151,8 +1166,8 @@ function pidAlive(pid: number | undefined): boolean {
   }
 }
 
-/** Whether the session holding a room looks gone: nothing heard for a while and no waiter running for it. */
-const attendanceLapsed = (held: Attendance) => Date.now() - held.at > ATTEND_STALE_MS && !pidAlive(loadSession(held.session).pid);
+/** Whether the session holding a room is gone: it ended, or nothing was heard for a while and no waiter runs for it. */
+const attendanceLapsed = (held: Attendance) => held.ended === true || (Date.now() - held.at > ATTEND_STALE_MS && !pidAlive(loadSession(held.session).pid));
 
 /**
  * A session taking a room over starts from what the agent has read, not from where this session
@@ -1178,26 +1193,49 @@ function takeRooms(session: string, rooms: string[]) {
   startFromSharedMark(session, gained);
 }
 
-/** Gives up every room `session` attends, so the next session to show up takes them. */
-function releaseRooms(session: string) {
+/** Notes that `session` has ended. Returns the rooms it was attending, which nobody attends now. */
+function endAttendance(session: string): string[] {
   const all = loadAttending();
-  const mine = Object.keys(all).filter((id) => all[id]!.session === session);
-  if (mine.length === 0) return;
-  for (const id of mine) delete all[id];
+  const mine = Object.keys(all).filter((id) => all[id]!.session === session && !all[id]!.ended);
+  if (mine.length === 0) return [];
+  for (const id of mine) all[id]!.ended = true;
   writePrivate(ATTENDING_PATH, all);
+  return mine;
 }
 
 /**
- * Splits the rooms in scope into those this session attends and those another session does. A room
- * nobody attends, or whose session has gone, becomes this session's. A hook with no session id, and
- * a run started by `parley wake listen`, attend everything in scope without claiming it.
+ * Tells the server whether a session attends each room, so the other side can see when nobody
+ * does. Best effort: a server that predates this, or is unreachable, changes nothing here.
  */
-function attended(targets: Map<string, string[] | undefined>, session: string | null): { mine: Map<string, string[] | undefined>; others: string[] } {
-  if (!session || process.env.PARLEY_WOKEN) return { mine: targets, others: [] };
+async function reportAttending(cfg: Config, rooms: string[], attending: boolean, timeoutMs = 4000) {
+  await Promise.all(
+    rooms.map(async (id) => {
+      const server = cfg.threads[id]?.server;
+      const token = server ? cfg.servers[server]?.token : undefined;
+      if (!server || !token) return;
+      try {
+        await api(server, token, "POST", "/api/attending", { json: { thread: id, attending }, timeoutMs });
+      } catch {}
+    }),
+  );
+}
+
+/**
+ * Splits the rooms in scope into those this session attends, those another session does, and those
+ * nobody does. Nothing is claimed here: a session attends a room only once it was chosen. A session
+ * that ended and is running again (resumed) picks its rooms back up; they are listed in `resumed`.
+ * A hook with no session id, and a run started by `parley wake listen`, attend everything in scope.
+ */
+function attended(
+  targets: Map<string, string[] | undefined>,
+  session: string | null,
+): { mine: Map<string, string[] | undefined>; others: string[]; unattended: string[]; resumed: string[] } {
+  if (!session || process.env.PARLEY_WOKEN) return { mine: targets, others: [], unattended: [], resumed: [] };
   const all = loadAttending();
   const mine = new Map<string, string[] | undefined>();
   const others: string[] = [];
-  const gained: string[] = [];
+  const unattended: string[] = [];
+  const resumed: string[] = [];
   let changed = false;
   for (const [server, ids] of targets) {
     if (!ids) {
@@ -1207,13 +1245,13 @@ function attended(targets: Map<string, string[] | undefined>, session: string | 
     const kept: string[] = [];
     for (const id of ids) {
       const held = all[id];
-      if (held && held.session !== session && !attendanceLapsed(held)) {
-        others.push(id);
+      if (held?.session !== session) {
+        (held && !attendanceLapsed(held) ? others : unattended).push(id);
         continue;
       }
       // Rewriting the file on every hook run would be wasteful; a minute's precision is plenty.
-      if (!held || held.session !== session || Date.now() - held.at > 60_000) {
-        if (held?.session !== session) gained.push(id);
+      if (held.ended || Date.now() - held.at > 60_000) {
+        if (held.ended) resumed.push(id);
         all[id] = { session, at: Date.now() };
         changed = true;
       }
@@ -1224,20 +1262,32 @@ function attended(targets: Map<string, string[] | undefined>, session: string | 
   if (changed) {
     try {
       writePrivate(ATTENDING_PATH, all);
-      startFromSharedMark(session, gained);
     } catch {}
   }
-  return { mine, others };
+  return { mine, others, unattended, resumed };
 }
+
+const roomNames = (cfg: Config, rooms: string[]) => rooms.map((id) => `"${cfg.threads[id]?.title ?? id}" [${id}]`).join(", ");
 
 /** What a session is told at its start about rooms here that another session attends. */
 function elsewhereNotice(cfg: Config, others: string[]): string | null {
   if (others.length === 0) return null;
-  const names = others.map((id) => `"${cfg.threads[id]?.title ?? id}" [${id}]`).join(", ");
+  const one = others.length === 1;
   return (
-    `This directory is connected to Parley room${others.length === 1 ? "" : "s"} ${names}, which another session here is attending. ` +
-    `You will not be told about ${others.length === 1 ? "its" : "their"} messages and need do nothing. ` +
-    `Only if your human asks this session to handle ${others.length === 1 ? "it" : "them"}, run \`${selfName()} attend\`.`
+    `This directory is connected to Parley room${one ? "" : "s"} ${roomNames(cfg, others)}, which another session here is attending. ` +
+    `You will not be told about ${one ? "its" : "their"} messages and need do nothing. ` +
+    `Only if your human asks this session to handle ${one ? "it" : "them"}, run \`${selfName()} attend\`.`
+  );
+}
+
+/** What a session is told, once, about rooms here that no session attends. */
+function unattendedNotice(cfg: Config, rooms: string[]): string | null {
+  if (rooms.length === 0) return null;
+  const one = rooms.length === 1;
+  return (
+    `This directory is connected to Parley room${one ? "" : "s"} ${roomNames(cfg, rooms)}, a chat room shared with other agents and the humans they work for. ` +
+    `No session is attending ${one ? "it" : "them"}, so nobody here is told about ${one ? "its" : "their"} messages. ` +
+    `Carry on with your own work. Only if your human asks this session to handle ${one ? "the room" : "a room"}, run \`${selfName()} attend\`.`
   );
 }
 
@@ -1253,7 +1303,8 @@ async function hookPrompt() {
     const cwd = input.cwd ?? process.cwd();
     const inScope = scope(cfg, cwd, false);
     if (inScope.size === 0) return;
-    const { mine: targets, others } = attended(inScope, input.session_id ?? null);
+    const { mine: targets, others, unattended, resumed } = attended(inScope, input.session_id ?? null);
+    if (resumed.length) await reportAttending(cfg, resumed, true);
     const starting = input.hook_event_name === "SessionStart";
     let threads: Awaited<ReturnType<typeof fetchInbox>> = [];
     if (targets.size) {
@@ -1269,6 +1320,18 @@ async function hookPrompt() {
       if (notice) parts.push(notice);
       const elsewhere = elsewhereNotice(cfg, others);
       if (elsewhere) parts.push(elsewhere);
+    }
+    if (unattended.length && input.session_id) {
+      // Said once per session, on whichever turn comes first, so a session already running when
+      // the room was joined (or the client upgraded) learns of it too.
+      const state = loadSession(input.session_id);
+      const fresh = unattended.filter((id) => !state.toldUnattended?.includes(id));
+      const notice = unattendedNotice(cfg, fresh);
+      if (notice) {
+        parts.push(notice);
+        state.toldUnattended = [...(state.toldUnattended ?? []), ...fresh];
+        writePrivate(sessionPath(input.session_id), state);
+      }
     }
     if (threads.length) {
       if (input.session_id) markNotified(input.session_id, threads);
@@ -1332,8 +1395,8 @@ async function hookWait() {
     // Stand down if a newer waiter took over this session, or the session that started us is gone.
     if (loadSession(session).pid !== process.pid) process.exit(0);
     if (parent !== 1 && process.ppid !== parent) {
-      // The session is gone: let the next one here take its rooms straight away.
-      if (input.session_id) releaseRooms(input.session_id);
+      // The session is gone: its rooms are unattended until it is resumed or another is told to attend.
+      if (input.session_id) await reportAttending(loadConfig(), endAttendance(input.session_id), false);
       process.exit(0);
     }
     let threads: Awaited<ReturnType<typeof fetchInbox>>;
@@ -1402,11 +1465,11 @@ async function hookWait() {
   process.exit(0);
 }
 
-/** SessionEnd: give up this session's rooms, so the next session started here attends them. */
+/** SessionEnd: this session's rooms are unattended until it is resumed or another is told to attend. */
 async function hookEnd() {
   try {
     const input = await hookInput();
-    if (input.session_id) releaseRooms(input.session_id);
+    if (input.session_id) await reportAttending(loadConfig(), endAttendance(input.session_id), false);
   } catch {}
 }
 
@@ -1490,8 +1553,8 @@ function cmdSetup(args: ReturnType<typeof parseArgs>) {
   console.log("  SessionStart: tell Claude which room this project is in");
   console.log("  SessionStart, UserPromptSubmit: tell Claude about new messages");
   console.log("  Stop: wait in the background and wake Claude when a message arrives");
-  console.log("  SessionEnd: hand the room to the next session started here");
-  console.log("Only one session at a time is told about a room; `parley attend` moves it to another.");
+  console.log("  SessionEnd: note that the session attending a room has gone");
+  console.log("A session is told about a room only once it attends it: it joined the room, or was asked to run `parley attend`.");
   console.log(askToPost ? "Reading is pre-approved; posting asks for permission each time." : "Reading and posting are pre-approved (use --ask-to-post to be asked before each post).");
   console.log(RUNNING_SESSION_NOTE);
 }
@@ -1660,6 +1723,7 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
                [--exec '<cmd>']    (default: one headless Claude Code turn); \`wake off\` stops it
   parley bind <room> [dir]         Connect a room to a different directory (--global for all)
   parley attend [room]             Make this session the one told about the room's messages
+                                   (no session is until it joins the room or runs this)
   parley setup claude-code         Reinstall or remove the Claude Code hooks (--remove, --ask-to-post)
   parley status                    Check the connection
   parley channel                   Experimental Claude Code channel server (MCP over stdio)

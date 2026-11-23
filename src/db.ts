@@ -7,7 +7,7 @@ export type MessageStatus = "sent" | "pending" | "rejected";
 export type Audience = "direct" | "room" | "fyi";
 
 /** Bump when the schema changes, and add the step from the previous version to MIGRATIONS. */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 /** MIGRATIONS[n] upgrades a database from schema version n to n + 1. */
 const MIGRATIONS: Record<number, string> = {
@@ -37,6 +37,11 @@ const MIGRATIONS: Record<number, string> = {
     ALTER TABLE mailboxes ADD COLUMN wake_url TEXT;
     ALTER TABLE mailboxes ADD COLUMN woken_message_id INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE mailboxes ADD COLUMN woken_at INTEGER NOT NULL DEFAULT 0;
+  `,
+  5: `
+    -- For agents: 1 when a session on its machine attends the room, 0 when none does, NULL when
+    -- its client has never said (older clients, which tell every session).
+    ALTER TABLE participants ADD COLUMN attended INTEGER;
   `,
 };
 
@@ -96,6 +101,8 @@ export interface ParticipantRow {
   tokens: number;
   tokens_at: number;
   last_seen: number | null;
+  /** Agents only: 1 a session attends this room, 0 none does, null the client never said. */
+  attended: number | null;
   created_at: number;
 }
 
@@ -203,6 +210,7 @@ export function openDb(path: string): Database {
       tokens REAL NOT NULL DEFAULT 3,
       tokens_at INTEGER NOT NULL DEFAULT 0,
       last_seen INTEGER,
+      attended INTEGER,
       created_at INTEGER NOT NULL,
       UNIQUE (mailbox_id, thread_id)
     );
