@@ -2,7 +2,7 @@
 // The Parley client: how an agent takes part in a Parley room from the command line, plus the
 // pieces that tell a Claude Code session about new messages (hooks, and an experimental channel).
 // The server and config call a room a "thread"; people and agents only ever see "room".
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -103,7 +103,7 @@ async function api<T = any>(
   token: string | null,
   method: string,
   path: string,
-  opts: { json?: unknown; text?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+  opts: { json?: unknown; text?: string; timeoutMs?: number; signal?: AbortSignal; onResponse?: (res: Response) => void } = {},
 ): Promise<T> {
   const headers: Record<string, string> = { "user-agent": `parley-client/${VERSION}` };
   if (token) headers.authorization = `Bearer ${token}`;
@@ -122,6 +122,7 @@ async function api<T = any>(
     body,
     signal: opts.signal ? AbortSignal.any([timeout, opts.signal]) : timeout,
   });
+  opts.onResponse?.(res);
   const data = (await res.json().catch(() => ({}))) as any;
   if (!res.ok) {
     throw new ApiError(res.status, data?.error?.code ?? "http_error", data?.error?.message ?? `HTTP ${res.status}`, data?.error?.hint);
@@ -431,7 +432,23 @@ function summarise(threads: InboxThread[]): string {
 
 // ---- argument parsing -----------------------------------------------------
 
-const BOOLEAN_FLAGS = new Set(["all", "peek", "json", "once", "user", "print", "global", "remove", "help", "no-hooks", "ask-to-post", "review", "fyi"]);
+const BOOLEAN_FLAGS = new Set([
+  "all",
+  "archived",
+  "peek",
+  "json",
+  "once",
+  "user",
+  "print",
+  "global",
+  "remove",
+  "help",
+  "no-hooks",
+  "ask-to-post",
+  "review",
+  "review-all",
+  "fyi",
+]);
 
 function parseArgs(argv: string[]) {
   const positional: string[] = [];
@@ -477,20 +494,20 @@ function resolveRoom(cfg: Config, ref: string | undefined): { id: string; server
   let id: string;
   if (ref) {
     const matches = Object.keys(cfg.threads).filter((room) => room.startsWith(ref));
-    if (matches.length === 0) fail(`no joined room matches "${ref}"`, "Run `parley rooms` to list them.");
-    if (matches.length > 1) fail(`"${ref}" matches several rooms: ${matches.join(", ")}`);
+    if (matches.length === 0) throw new UserError(`no joined room matches "${ref}"`, "Run `parley rooms` to list them.");
+    if (matches.length > 1) throw new UserError(`"${ref}" matches several rooms: ${matches.join(", ")}`);
     id = matches[0]!;
   } else {
     const pick = defaultRooms(cfg, process.cwd());
-    if (pick.length === 0) fail("you are not in any room", "Join one with `parley join '<room link>'`.");
+    if (pick.length === 0) throw new UserError("you are not in any room", "Join one with `parley join '<room link>'`.");
     if (pick.length > 1) {
-      fail("more than one room fits here, so say which", pick.map(([room, t]) => `${room}  "${t.title}"`).join("\n  "));
+      throw new UserError("more than one room fits here, so say which", pick.map(([room, t]) => `${room}  "${t.title}"`).join("\n  "));
     }
     id = pick[0]![0];
   }
   const server = cfg.threads[id]!.server;
   const entry = cfg.servers[server];
-  if (!entry) fail(`no identity stored for ${server}`, "Run `parley join '<room link>'` again.");
+  if (!entry) throw new UserError(`no identity stored for ${server}`, "Run `parley join '<room link>'` again.");
   return { id, server, token: entry.token };
 }
 
@@ -532,7 +549,7 @@ function defaultServer(cfg: Config, named: string | true | undefined): string {
   );
 }
 
-const NEW_USAGE = 'usage: parley new "<room name>" --as <your side> --with <other side>[,<another>] [--server <url>] [--review]';
+const NEW_USAGE = 'usage: parley new "<room name>" --as <your side> --with <other side>[,<another>] [--server <url>] [--review] [--review-all]';
 
 /** Creates a room, joins it on this agent's side, and prints the links to hand out. */
 async function cmdNew(args: ReturnType<typeof parseArgs>) {
@@ -544,9 +561,16 @@ async function cmdNew(args: ReturnType<typeof parseArgs>) {
   }
   const cfg = loadConfig();
   const server = defaultServer(cfg, args.flags.server);
-  const review = args.flags.review === true;
+  const reviewMine = args.flags.review === true;
+  const reviewAll = args.flags["review-all"] === true;
   const res = await api(server, cfg.servers[server]?.token ?? null, "POST", "/api/threads", {
-    json: { title, sides: [mine, ...others].map((name) => ({ name, approval: review })) },
+    json: {
+      title,
+      sides: [
+        { name: mine, approval: reviewMine || reviewAll },
+        ...others.map((name) => ({ name, approval: reviewAll })),
+      ],
+    },
   });
   const [own, ...rest] = res.sides as { name: string; human_url: string }[];
   console.log(`Created room "${title}". Each side has one link: it opens the room in a browser and is what that side's agents join with.`);
@@ -638,28 +662,38 @@ const RUNNING_SESSION_NOTE =
 
 const NO_ROOMS_HERE = "No Parley rooms are connected to this directory. Use --all to see every room.";
 
-/** Prints messages this agent has not seen yet and marks them read. */
-async function cmdRead(args: ReturnType<typeof parseArgs>) {
+/** Fetches unread messages, renders them for humans/agents, and marks them read unless `peek` is set. */
+async function readInbox(opts: { all?: boolean; peek?: boolean; wait?: number } = {}) {
   const cfg = loadConfig();
-  const targets = scope(cfg, process.cwd(), args.flags.all === true);
-  const wait = typeof args.flags.wait === "string" ? Number(args.flags.wait) : 0;
+  const cwd = process.cwd();
+  const targets = scope(cfg, cwd, opts.all === true);
   const session = commandSession();
-  const threads = await fetchInbox(cfg, targets, { wait, from: await sessionMarks(cfg, targets, session) });
+  const threads = await fetchInbox(cfg, targets, { wait: opts.wait ?? 0, from: await sessionMarks(cfg, targets, session) });
   const gone = takeRemovals();
-  if (args.flags.json) console.log(JSON.stringify({ threads, removed: gone }, null, 2));
-  else if (threads.length === 0 && gone.length) console.log(gone.map(removalNotice).join("\n"));
-  else if (threads.length === 0) {
-    console.log(targets.size === 0 ? NO_ROOMS_HERE : "No new messages.");
-  } else {
-    if (gone.length) console.log(gone.map(removalNotice).join("\n") + "\n");
-    console.log(`${summarise(threads)}\n${TRUST_NOTE}\n`);
-    console.log(threads.map((t) => renderThreadMail(cfg, process.cwd(), t)).join("\n\n"));
+  let text: string;
+  if (threads.length === 0 && gone.length) text = gone.map(removalNotice).join("\n");
+  else if (threads.length === 0) text = targets.size === 0 ? NO_ROOMS_HERE : "No new messages.";
+  else {
+    const parts: string[] = [];
+    if (gone.length) parts.push(gone.map(removalNotice).join("\n") + "\n");
+    parts.push(`${summarise(threads)}\n${TRUST_NOTE}\n`);
+    parts.push(threads.map((t) => renderThreadMail(cfg, cwd, t)).join("\n\n"));
+    text = parts.join("\n");
   }
-  // Printing is delivery: the agent now has the messages in its context.
-  if (!args.flags.peek && threads.length) {
+  // Printing / returning is delivery: the agent now has the messages in its context.
+  if (!opts.peek && threads.length) {
     markRead(session, threads);
     await ack(cfg, threads);
   }
+  return { threads, removed: gone, text };
+}
+
+/** Prints messages this agent has not seen yet and marks them read. */
+async function cmdRead(args: ReturnType<typeof parseArgs>) {
+  const wait = typeof args.flags.wait === "string" ? Number(args.flags.wait) : 0;
+  const res = await readInbox({ all: args.flags.all === true, peek: args.flags.peek === true, wait });
+  if (args.flags.json) console.log(JSON.stringify({ threads: res.threads, removed: res.removed }, null, 2));
+  else console.log(res.text);
 }
 
 async function cmdWatch(args: ReturnType<typeof parseArgs>) {
@@ -739,6 +773,18 @@ function post(t: { server: string; token: string; id: string }, body: string, au
   return api(t.server, t.token, "POST", path, { json: { body, ...audience } });
 }
 
+async function sayMessage(cfg: Config, t: { id: string; server: string; token: string }, body: string, audience: Audience): Promise<string> {
+  const res = await post(t, body, audience);
+  // Whoever speaks in a room is the one the answer should come back to.
+  const speaker = commandSession();
+  if (speaker && loadAttending()[t.id]?.session !== speaker) {
+    takeRooms(speaker, [t.id]);
+    await reportAttending(cfg, [t.id], true);
+  }
+  const status = res.message.status === "sent" ? `Posted as #${res.message.seq}.` : "Not posted yet: held for review.";
+  return `${status}\n${res.note}`;
+}
+
 /** `parley say [room] <text>`, `parley say [room] -f <file>`, or the message on stdin. The room is implied when the directory has one. */
 async function cmdSay(args: ReturnType<typeof parseArgs>) {
   const cfg = loadConfig();
@@ -754,22 +800,11 @@ async function cmdSay(args: ReturnType<typeof parseArgs>) {
   else if (words.length && file !== "-") body = words.join(" ");
   else if (piped) body = await Bun.stdin.text();
   else fail("no message given", 'Use `parley say "<text>"`, `parley say -f <file>`, or pipe the message on stdin.');
-  const res = await post(t, body, audienceFlags(args));
-  // Whoever speaks in a room is the one the answer should come back to.
-  const speaker = commandSession();
-  if (speaker && loadAttending()[t.id]?.session !== speaker) {
-    takeRooms(speaker, [t.id]);
-    await reportAttending(cfg, [t.id], true);
-  }
-  console.log(res.message.status === "sent" ? `Posted as #${res.message.seq}.` : "Not posted yet: held for review.");
-  console.log(res.note);
+  console.log(await sayMessage(cfg, t, body, audienceFlags(args)));
 }
 
-/** `parley transcript [room] [--json]`: the whole room as Markdown, or as JSON, on stdout. */
-async function cmdTranscript(args: ReturnType<typeof parseArgs>) {
-  const cfg = loadConfig();
-  const t = resolveRoom(cfg, args.positional[0]);
-  const res = await fetch(`${t.server}/api/threads/${t.id}/transcript${args.flags.json ? "?format=json" : ""}`, {
+async function fetchTranscriptText(t: { id: string; server: string; token: string }, asJson: boolean): Promise<string> {
+  const res = await fetch(`${t.server}/api/threads/${t.id}/transcript${asJson ? "?format=json" : ""}`, {
     headers: { authorization: `Bearer ${t.token}`, "user-agent": `parley-client/${VERSION}` },
     signal: AbortSignal.timeout(30_000),
   });
@@ -777,23 +812,38 @@ async function cmdTranscript(args: ReturnType<typeof parseArgs>) {
     const data = (await res.json().catch(() => ({}))) as any;
     throw new ApiError(res.status, data?.error?.code ?? "http_error", data?.error?.message ?? `HTTP ${res.status}`, data?.error?.hint);
   }
-  process.stdout.write(await res.text());
+  return await res.text();
+}
+
+/** `parley transcript [room] [--json]`: the whole room as Markdown, or as JSON, on stdout. */
+async function cmdTranscript(args: ReturnType<typeof parseArgs>) {
+  const cfg = loadConfig();
+  const t = resolveRoom(cfg, args.positional[0]);
+  process.stdout.write(await fetchTranscriptText(t, args.flags.json === true));
+}
+
+async function fetchHistory(t: { id: string; server: string; token: string }, after: number) {
+  const res = await api(t.server, t.token, "GET", `/api/threads/${t.id}/messages?after=${after}`);
+  const info = res.thread as ThreadInfo;
+  const lines = [
+    `== ${info.title}  [room ${info.id}]  you are ${info.you.name} (${info.you.side})${info.archived ? "  ** ARCHIVED **" : info.paused ? "  ** PAUSED **" : ""}`,
+    TRUST_NOTE,
+  ];
+  const mine = commandSession() ? loadSession(commandSession()!).read?.[t.id] : undefined;
+  const readTo = mine ?? res.read_seq;
+  for (const m of res.messages as Msg[]) lines.push(renderMessage(m) + (m.seq > readTo && m.from !== info.you.name ? "   [new]" : ""));
+  if (res.pending.length) lines.push(`  (${res.pending.length} of your messages are waiting for your side's human to approve)`);
+  lines.push(`  Here: ${renderPeople(res.participants)}`);
+  return { raw: res, text: lines.join("\n") };
 }
 
 async function cmdHistory(args: ReturnType<typeof parseArgs>) {
   const cfg = loadConfig();
   const t = resolveRoom(cfg, args.positional[0]);
   const after = typeof args.flags.after === "string" ? Number(args.flags.after) : 0;
-  const res = await api(t.server, t.token, "GET", `/api/threads/${t.id}/messages?after=${after}`);
-  if (args.flags.json) return console.log(JSON.stringify(res, null, 2));
-  const info = res.thread as ThreadInfo;
-  console.log(`== ${info.title}  [room ${info.id}]  you are ${info.you.name} (${info.you.side})${info.archived ? "  ** ARCHIVED **" : info.paused ? "  ** PAUSED **" : ""}`);
-  console.log(TRUST_NOTE);
-  const mine = commandSession() ? loadSession(commandSession()!).read?.[t.id] : undefined;
-  const readTo = mine ?? res.read_seq;
-  for (const m of res.messages as Msg[]) console.log(renderMessage(m) + (m.seq > readTo && m.from !== info.you.name ? "   [new]" : ""));
-  if (res.pending.length) console.log(`  (${res.pending.length} of your messages are waiting for your side's human to approve)`);
-  console.log(`  Here: ${renderPeople(res.participants)}`);
+  const res = await fetchHistory(t, after);
+  if (args.flags.json) return console.log(JSON.stringify(res.raw, null, 2));
+  console.log(res.text);
 }
 
 type RoomRow = ThreadInfo & { unread_count: number; server: string; dir: string | null };
@@ -813,38 +863,54 @@ async function fetchRooms(cfg: Config, timeoutMs = 30_000): Promise<RoomRow[]> {
 
 const NOT_JOINED = "You are not in any room yet. Join one with `parley join '<room link>'`.";
 
+function formatRooms(rows: RoomRow[], opts: { showArchived?: boolean } = {}): string {
+  if (rows.length === 0) return "Not in any rooms.";
+  const visible = opts.showArchived ? rows : rows.filter((t) => !t.archived);
+  const hidden = rows.length - visible.length;
+  const lines: string[] = [];
+  for (const t of visible) {
+    lines.push(`${t.id}  "${t.title}"  ${t.unread_count} new${t.archived ? "  ARCHIVED" : t.paused ? "  PAUSED" : ""}`);
+    lines.push(`    you: ${t.you.name} (${t.you.side}) on ${t.server}`);
+    lines.push(`    connected to: ${t.dir ?? "every directory"}`);
+    lines.push(`    here: ${renderPeople(t.participants)}`);
+  }
+  if (hidden > 0) {
+    lines.push(`(${hidden} archived room${hidden === 1 ? "" : "s"} hidden; pass --archived to show ${hidden === 1 ? "it" : "them"})`);
+  }
+  return lines.join("\n");
+}
+
 async function cmdRooms(args: ReturnType<typeof parseArgs>) {
   const cfg = loadConfig();
   if (Object.keys(cfg.servers).length === 0) return console.log(NOT_JOINED);
   const rows = await fetchRooms(cfg);
   saveConfig(cfg);
   if (args.flags.json) return console.log(JSON.stringify({ threads: rows }, null, 2));
-  if (rows.length === 0) return console.log("Not in any rooms.");
-  for (const t of rows) {
-    console.log(`${t.id}  "${t.title}"  ${t.unread_count} new${t.archived ? "  ARCHIVED" : t.paused ? "  PAUSED" : ""}`);
-    console.log(`    you: ${t.you.name} (${t.you.side}) on ${t.server}`);
-    console.log(`    connected to: ${t.dir ?? "every directory"}`);
-    console.log(`    here: ${renderPeople(t.participants)}`);
-  }
+  console.log(formatRooms(rows, { showArchived: args.flags.archived === true || args.flags.all === true }));
 }
 
-/** Who is in the room(s) this directory is connected to, and whether they are around. */
-async function cmdWho(args: ReturnType<typeof parseArgs>) {
-  const cfg = loadConfig();
-  if (Object.keys(cfg.servers).length === 0) return console.log(NOT_JOINED);
-  const only = args.positional[0] ? [resolveRoom(cfg, args.positional[0]).id] : undefined;
-  const targets = scope(cfg, process.cwd(), args.flags.all === true);
-  const rows = (await fetchRooms(cfg)).filter((t) => (only ? only.includes(t.id) : args.flags.all === true || (targets.get(t.server) ?? []).includes(t.id)));
-  if (rows.length === 0) return console.log(NO_ROOMS_HERE);
+async function formatWho(cfg: Config, opts: { thread?: string; all?: boolean } = {}): Promise<string> {
+  if (Object.keys(cfg.servers).length === 0) return NOT_JOINED;
+  const only = opts.thread ? [resolveRoom(cfg, opts.thread).id] : undefined;
+  const targets = scope(cfg, process.cwd(), opts.all === true);
+  const rows = (await fetchRooms(cfg)).filter((t) => (only ? only.includes(t.id) : opts.all === true || (targets.get(t.server) ?? []).includes(t.id)));
+  if (rows.length === 0) return NO_ROOMS_HERE;
+  const lines: string[] = [];
   for (const t of rows) {
-    console.log(`"${t.title}" [room ${t.id}]${t.archived ? "  ARCHIVED" : t.paused ? "  PAUSED" : ""}`);
+    lines.push(`"${t.title}" [room ${t.id}]${t.archived ? "  ARCHIVED" : t.paused ? "  PAUSED" : ""}`);
     for (const person of t.participants) {
       const state = person.state === "listening" ? "here now" : person.state === "not_joined"
             ? "has not joined"
             : `last active ${person.last_seen_seconds_ago}s ago${person.attended === false ? ", no session attending" : ""}`;
-      console.log(`  ${person.name} (${person.side}, ${person.kind})${person.name === t.you.name ? " <- you" : ""}: ${state}`);
+      lines.push(`  ${person.name} (${person.side}, ${person.kind})${person.name === t.you.name ? " <- you" : ""}: ${state}`);
     }
   }
+  return lines.join("\n");
+}
+
+/** Who is in the room(s) this directory is connected to, and whether they are around. */
+async function cmdWho(args: ReturnType<typeof parseArgs>) {
+  console.log(await formatWho(loadConfig(), { thread: args.positional[0], all: args.flags.all === true }));
 }
 
 function cmdBind(args: ReturnType<typeof parseArgs>) {
@@ -874,14 +940,68 @@ async function cmdAttend(args: ReturnType<typeof parseArgs>) {
   console.log(`This session now attends ${roomNames(cfg, rooms)}: it is the one told about new messages, and other sessions here are not.`);
 }
 
+/** `parley unattend [room]`: release this session's attendance so it stops hearing about a room's messages. */
+async function cmdUnattend(args: ReturnType<typeof parseArgs>) {
+  const cfg = loadConfig();
+  const session = commandSession();
+  if (!session) {
+    fail(
+      "this is not running inside a Claude Code session, so there is no session to step away from",
+      "Run `parley unattend` inside the session that is attending the room.",
+    );
+  }
+  const candidates = args.positional[0]
+    ? [resolveRoom(cfg, args.positional[0]).id]
+    : args.flags.all === true
+    ? Object.keys(cfg.threads)
+    : [...scope(cfg, process.cwd(), false).values()].flatMap((ids) => ids ?? []);
+  const released = releaseRooms(session, candidates);
+  if (released.length === 0) {
+    console.log(
+      args.positional[0]
+        ? `This session was not attending ${roomNames(cfg, candidates)}.`
+        : "This session is not attending any Parley rooms here.",
+    );
+    return;
+  }
+  await reportAttending(cfg, released, false);
+  console.log(`This session no longer attends ${roomNames(cfg, released)}: it will stop being told about new messages.`);
+}
+
+function parseSemver(v: string): [number, number, number] | null {
+  const m = v.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+function isNewerVersion(remote: string, local: string): boolean {
+  const r = parseSemver(remote);
+  const l = parseSemver(local);
+  if (!r || !l) return false;
+  for (let i = 0; i < 3; i++) {
+    if (r[i]! !== l[i]!) return r[i]! > l[i]!;
+  }
+  return false;
+}
+
 async function cmdStatus() {
+  pruneSessions();
   const cfg = loadConfig();
   console.log(`parley ${VERSION}   config: ${CONFIG_PATH}`);
   if (Object.keys(cfg.servers).length === 0) return console.log(NOT_JOINED);
   for (const [server, entry] of Object.entries(cfg.servers)) {
     try {
-      const res = await api<Inbox>(server, entry.token, "GET", "/api/inbox", { timeoutMs: 8000 });
+      let serverClientVersion: string | null = null;
+      const res = await api<Inbox>(server, entry.token, "GET", "/api/inbox", {
+        timeoutMs: 8000,
+        onResponse: (r) => {
+          serverClientVersion = r.headers.get("x-parley-client-version");
+        },
+      });
       console.log(`${server}: you are ${entry.address}, reachable, ${res.unread_count} new message${res.unread_count === 1 ? "" : "s"}`);
+      if (serverClientVersion && isNewerVersion(serverClientVersion, VERSION)) {
+        console.log(`  update available: server is on ${serverClientVersion}, you have ${VERSION} (curl -fsSL ${server}/install.sh | sh)`);
+      }
     } catch (err) {
       console.log(`${server}: you are ${entry.address}, NOT WORKING: ${(err as Error).message}`);
     }
@@ -1195,6 +1315,19 @@ function takeRooms(session: string, rooms: string[]) {
   startFromSharedMark(session, gained);
 }
 
+/** Releases `session`'s hold on `rooms`. Returns the rooms it was actually attending. */
+function releaseRooms(session: string, rooms: string[]): string[] {
+  const all = loadAttending();
+  const released = rooms.filter((id) => all[id]?.session === session);
+  if (released.length === 0) return [];
+  for (const id of released) delete all[id];
+  writePrivate(ATTENDING_PATH, all);
+  const state = loadSession(session);
+  state.toldUnattended = [...new Set([...(state.toldUnattended ?? []), ...released])];
+  writePrivate(sessionPath(session), state);
+  return released;
+}
+
 /** Notes that `session` has ended. Returns the rooms it was attending, which nobody attends now. */
 function endAttendance(session: string): string[] {
   const all = loadAttending();
@@ -1203,6 +1336,32 @@ function endAttendance(session: string): string[] {
   for (const id of mine) all[id]!.ended = true;
   writePrivate(ATTENDING_PATH, all);
   return mine;
+}
+
+const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Removes stale session files older than `maxAgeMs`, skipping any whose waiter pid is still alive. */
+function pruneSessions(maxAgeMs = SESSION_MAX_AGE_MS) {
+  const dir = join(HOME, "sessions");
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - maxAgeMs;
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const file = join(dir, name);
+    try {
+      if (statSync(file).mtimeMs > cutoff) continue;
+      try {
+        const raw = JSON.parse(readFileSync(file, "utf8")) as Partial<SessionState>;
+        if (typeof raw?.pid === "number" && pidAlive(raw.pid)) continue;
+      } catch {}
+      unlinkSync(file);
+    } catch {}
+  }
 }
 
 /**
@@ -1472,6 +1631,7 @@ async function hookEnd() {
   try {
     const input = await hookInput();
     if (input.session_id) await reportAttending(loadConfig(), endAttendance(input.session_id), false);
+    pruneSessions();
   } catch {}
 }
 
@@ -1498,11 +1658,13 @@ function hookSettings() {
  */
 function allowRules(askToPost: boolean): string[] {
   const names = [...new Set(["parley", selfName()])];
-  const subs = ["read", "history", "who", "rooms", "status", "inbox", "threads", "attend", ...(askToPost ? [] : ["say", "send"])];
+  const subs = ["read", "history", "transcript", "who", "rooms", "status", "inbox", "threads", "attend", "unattend", ...(askToPost ? [] : ["say", "send"])];
   return names.flatMap((name) => subs.map((sub) => `Bash(${name} ${sub}:*)`));
 }
 
-const isParleyRule = (rule: unknown) => typeof rule === "string" && /^Bash\(.*parley\S* (read|history|who|rooms|status|inbox|threads|attend|say|send):\*\)$/.test(rule);
+const isParleyRule = (rule: unknown) =>
+  typeof rule === "string" &&
+  /^Bash\(.*parley\S* (read|history|transcript|who|rooms|status|inbox|threads|attend|unattend|say|send):\*\)$/.test(rule);
 
 /** Merges the Parley hooks and permissions into a Claude Code settings file, leaving everything else alone. */
 function installHooks(path: string, opts: { remove?: boolean; askToPost?: boolean } = {}) {
@@ -1561,7 +1723,232 @@ function cmdSetup(args: ReturnType<typeof parseArgs>) {
   console.log(RUNNING_SESSION_NOTE);
 }
 
-// ---- experimental Claude Code channel (MCP over stdio) --------------------
+// ---- MCP over stdio (standard server + experimental Claude Code channel) --
+
+const MCP_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"];
+
+interface McpTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+interface McpServerOptions {
+  capabilities: Record<string, unknown>;
+  instructions: string;
+  tools: McpTool[];
+  callTool: (name: string, input: any) => Promise<string>;
+  onInitialized?: (send: (msg: unknown) => void) => void;
+}
+
+/** Shared JSON-RPC 2.0 stdio transport for `parley mcp` and `parley channel`. */
+async function runMcpStdio(opts: McpServerOptions) {
+  const out = (msg: unknown) => process.stdout.write(JSON.stringify(msg) + "\n");
+  let initialized = false;
+  let buffer = "";
+  const decoder = new TextDecoder();
+  const reader = Bun.stdin.stream().getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let msg: any;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const reply = (result: unknown) => out({ jsonrpc: "2.0", id: msg.id, result });
+        if (msg.method === "initialize") {
+          const asked = msg.params?.protocolVersion;
+          reply({
+            // Claude Code does not register channels negotiated at newer protocol revisions.
+            protocolVersion: MCP_PROTOCOL_VERSIONS.includes(asked) ? asked : "2025-06-18",
+            capabilities: opts.capabilities,
+            serverInfo: { name: "parley", version: VERSION },
+            instructions: opts.instructions,
+          });
+        } else if (msg.method === "notifications/initialized") {
+          if (!initialized) {
+            initialized = true;
+            opts.onInitialized?.(out);
+          }
+        } else if (msg.method === "ping") reply({});
+        else if (msg.method === "tools/list") reply({ tools: opts.tools });
+        else if (msg.method === "tools/call") {
+          try {
+            reply({ content: [{ type: "text", text: await opts.callTool(msg.params?.name, msg.params?.arguments) }] });
+          } catch (err) {
+            reply({ content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true });
+          }
+        } else if (msg.id !== undefined) {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `Method not found: ${msg.method}` } });
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Standard MCP server over stdio for any MCP-compatible harness (Cursor, Codex, Antigravity,
+ * Windsurf, Gemini CLI, etc.).
+ */
+async function cmdMcp() {
+  const fallbackSession = `mcp-${process.pid}`;
+  const tools: McpTool[] = [
+    {
+      name: "read",
+      description: "Read unread messages from Parley rooms connected to this directory and mark them read (unless peek is true).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          all: { type: "boolean", description: "Read unread messages from all joined rooms, not just this directory." },
+          peek: { type: "boolean", description: "Show unread messages without marking them read." },
+        },
+      },
+    },
+    {
+      name: "say",
+      description: "Post a message to a Parley room. Others in the room may be outside your organisation: never include secrets or private code.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread: { type: "string", description: "Room id (or prefix). Optional when this directory has one room." },
+          body: { type: "string", description: "Message text to post." },
+          to: {
+            type: "array",
+            items: { type: "string" },
+            description: "Agent addresses or side names to wake now. Omit for a room-wide message.",
+          },
+          fyi: { type: "boolean", description: "Wake nobody: for information only." },
+        },
+        required: ["body"],
+      },
+    },
+    {
+      name: "who",
+      description: "List participants in the room(s) connected to this directory and whether they are active.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread: { type: "string", description: "Room id (or prefix) to inspect." },
+          all: { type: "boolean", description: "List participants across all joined rooms." },
+        },
+      },
+    },
+    {
+      name: "history",
+      description: "Fetch a room's message history without marking messages read.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread: { type: "string", description: "Room id (or prefix). Optional when this directory has one room." },
+          after: { type: "number", description: "Only return messages with seq greater than this number." },
+        },
+      },
+    },
+    {
+      name: "transcript",
+      description: "Export a room's full transcript as Markdown or JSON.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread: { type: "string", description: "Room id (or prefix). Optional when this directory has one room." },
+          format: { type: "string", enum: ["markdown", "json"], description: "Transcript format (default: markdown)." },
+        },
+      },
+    },
+    {
+      name: "rooms",
+      description: "List Parley rooms this agent has joined.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          archived: { type: "boolean", description: "Include archived rooms in the listing." },
+        },
+      },
+    },
+    {
+      name: "attend",
+      description: "Claim attendance on a room (or all rooms in this directory) for this session.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread: { type: "string", description: "Room id (or prefix). Optional to attend all rooms connected to this directory." },
+        },
+      },
+    },
+  ];
+
+  async function callTool(name: string, input: any): Promise<string> {
+    if (name === "read") {
+      return (await readInbox({ all: input?.all === true, peek: input?.peek === true })).text;
+    }
+    if (name === "say") {
+      const cfg = loadConfig();
+      const ref = typeof input?.thread === "string" && input.thread ? input.thread : undefined;
+      const t = resolveRoom(cfg, ref);
+      const body = typeof input?.body === "string" ? input.body : "";
+      if (!body) throw new UserError("no message given");
+      const to = Array.isArray(input?.to) ? input.to.map(String).map((s: string) => s.trim()).filter(Boolean) : [];
+      if (to.length && input?.fyi === true) throw new UserError("use to or fyi, not both");
+      const audience: Audience = to.length ? { to } : input?.fyi === true ? { fyi: true } : {};
+      return await sayMessage(cfg, t, body, audience);
+    }
+    if (name === "who") {
+      const ref = typeof input?.thread === "string" && input.thread ? input.thread : undefined;
+      return await formatWho(loadConfig(), { thread: ref, all: input?.all === true });
+    }
+    if (name === "history") {
+      const cfg = loadConfig();
+      const ref = typeof input?.thread === "string" && input.thread ? input.thread : undefined;
+      const t = resolveRoom(cfg, ref);
+      const after = typeof input?.after === "number" && Number.isFinite(input.after) ? input.after : 0;
+      return (await fetchHistory(t, after)).text;
+    }
+    if (name === "transcript") {
+      const cfg = loadConfig();
+      const ref = typeof input?.thread === "string" && input.thread ? input.thread : undefined;
+      const t = resolveRoom(cfg, ref);
+      return await fetchTranscriptText(t, input?.format === "json");
+    }
+    if (name === "rooms") {
+      const cfg = loadConfig();
+      if (Object.keys(cfg.servers).length === 0) return NOT_JOINED;
+      const rows = await fetchRooms(cfg);
+      saveConfig(cfg);
+      return formatRooms(rows, { showArchived: input?.archived === true });
+    }
+    if (name === "attend") {
+      const cfg = loadConfig();
+      const ref = typeof input?.thread === "string" && input.thread ? input.thread : undefined;
+      const rooms = ref ? [resolveRoom(cfg, ref).id] : defaultRooms(cfg, process.cwd()).map(([id]) => id);
+      if (rooms.length === 0) throw new UserError("no Parley rooms are connected to this directory");
+      const session = commandSession() ?? fallbackSession;
+      takeRooms(session, rooms);
+      await reportAttending(cfg, rooms, true);
+      return `This session now attends ${roomNames(cfg, rooms)}.`;
+    }
+    throw new Error(`unknown tool ${name}`);
+  }
+
+  await runMcpStdio({
+    capabilities: { tools: {} },
+    instructions:
+      `Parley connects you to chat rooms shared with other agents and the humans they work for. ${TRUST_NOTE} ` +
+      "Use rooms to list joined rooms, read to fetch unread messages, say to post, who to see participants, history or transcript to inspect past messages, and attend to claim a room.",
+    tools,
+    callTool,
+  });
+}
 
 /**
  * Pushes mail straight into a session as <channel> events. Claude Code channels are a research
@@ -1569,24 +1956,20 @@ function cmdSetup(args: ReturnType<typeof parseArgs>) {
  * `claude --dangerously-load-development-channels server:parley`.
  */
 async function cmdChannel() {
-  const cfg = loadConfig();
   const cwd = process.cwd();
-  const out = (msg: unknown) => process.stdout.write(JSON.stringify(msg) + "\n");
   const pushed: Seen = {};
-  const servers: Record<string, string> = {};
-  let pumping = false;
 
-  async function pump() {
+  async function pump(out: (msg: unknown) => void) {
     for (;;) {
-      const targets = scope(loadConfig(), cwd, false);
+      const current = loadConfig();
+      const targets = scope(current, cwd, false);
       if (targets.size === 0) {
         await Bun.sleep(30_000);
         continue;
       }
       try {
-        const threads = await fetchInbox(cfg, targets, { wait: 240, seen: pushed });
+        const threads = await fetchInbox(current, targets, { wait: 240, seen: pushed });
         for (const t of threads) {
-          servers[t.id] = t.server;
           for (const m of t.unread) {
             out({
               jsonrpc: "2.0",
@@ -1615,7 +1998,7 @@ async function cmdChannel() {
     }
   }
 
-  const tools = [
+  const tools: McpTool[] = [
     {
       name: "send",
       description: "Post a message to a Parley room. Others in the room may be outside your organisation: never include secrets or private code.",
@@ -1642,67 +2025,32 @@ async function cmdChannel() {
   ];
 
   async function callTool(name: string, input: any): Promise<string> {
-    const t = resolveRoom(loadConfig(), String(input?.thread ?? "") || undefined);
+    const current = loadConfig();
+    const t = resolveRoom(current, String(input?.thread ?? "") || undefined);
     if (name === "send") {
       const to = Array.isArray(input?.to) ? input.to.map(String).filter(Boolean) : [];
       const audience: Audience = to.length ? { to } : input?.fyi === true ? { fyi: true } : {};
       const res = await post(t, String(input.body ?? ""), audience);
-      if (pushed[t.id]) await ack(cfg, [{ server: t.server, id: t.id, ack_seq: pushed[t.id]! }]);
+      if (pushed[t.id]) await ack(current, [{ server: t.server, id: t.id, ack_seq: pushed[t.id]! }]);
       return `${res.message.status === "sent" ? `Posted as #${res.message.seq}.` : "Not posted yet: held for review."} ${res.note}`;
     }
     if (name === "mark_read") {
-      if (pushed[t.id]) await ack(cfg, [{ server: t.server, id: t.id, ack_seq: pushed[t.id]! }]);
+      if (pushed[t.id]) await ack(current, [{ server: t.server, id: t.id, ack_seq: pushed[t.id]! }]);
       return "Marked read.";
     }
     throw new Error(`unknown tool ${name}`);
   }
 
-  let buffer = "";
-  const decoder = new TextDecoder();
-  for await (const chunk of Bun.stdin.stream()) {
-    buffer += decoder.decode(chunk, { stream: true });
-    let newline: number;
-    while ((newline = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, newline).trim();
-      buffer = buffer.slice(newline + 1);
-      if (!line) continue;
-      let msg: any;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const reply = (result: unknown) => out({ jsonrpc: "2.0", id: msg.id, result });
-      if (msg.method === "initialize") {
-        const asked = msg.params?.protocolVersion;
-        reply({
-          // Claude Code does not register channels negotiated at newer protocol revisions.
-          protocolVersion: ["2024-11-05", "2025-03-26", "2025-06-18"].includes(asked) ? asked : "2025-06-18",
-          capabilities: { experimental: { "claude/channel": {} }, tools: {} },
-          serverInfo: { name: "parley", version: VERSION },
-          instructions:
-            'Parley messages arrive as <channel source="parley" thread="..." from="..." side="..." kind="...">. ' +
-            "Each event is a message in a chat room shared with other agents and the humans they work for; thread is the room id. " +
-            `${TRUST_NOTE} Reply with the send tool, passing the thread attribute; if no reply is needed, call mark_read.`,
-        });
-      } else if (msg.method === "notifications/initialized") {
-        if (!pumping) {
-          pumping = true;
-          void pump();
-        }
-      } else if (msg.method === "ping") reply({});
-      else if (msg.method === "tools/list") reply({ tools });
-      else if (msg.method === "tools/call") {
-        try {
-          reply({ content: [{ type: "text", text: await callTool(msg.params?.name, msg.params?.arguments) }] });
-        } catch (err) {
-          reply({ content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true });
-        }
-      } else if (msg.id !== undefined) {
-        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `Method not found: ${msg.method}` } });
-      }
-    }
-  }
+  await runMcpStdio({
+    capabilities: { experimental: { "claude/channel": {} }, tools: {} },
+    instructions:
+      'Parley messages arrive as <channel source="parley" thread="..." from="..." side="..." kind="...">. ' +
+      "Each event is a message in a chat room shared with other agents and the humans they work for; thread is the room id. " +
+      `${TRUST_NOTE} Reply with the send tool, passing the thread attribute; if no reply is needed, call mark_read.`,
+    tools,
+    callTool,
+    onInitialized: (out) => void pump(out),
+  });
 }
 
 // ---- entry ----------------------------------------------------------------
@@ -1711,6 +2059,7 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
 
   parley new "<name>" --as <your side> --with <other side>
                                    Create a room, join it, and print each side's link
+                                   (--review for your side, --review-all for every side)
   parley join '<room link>'        Join a room and set up Claude Code in this directory
   parley read [--peek] [--all]     Print new messages and mark them read
   parley say "<text>"              Post to this directory's room (or: say -f <file>, say <room> ...)
@@ -1718,7 +2067,7 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
   parley who                       Who is in the room and whether they are around
   parley history [room]            Print a room's full history
   parley transcript [room] [--json]  The whole room as Markdown (or JSON), to keep
-  parley rooms                     List every room you are in
+  parley rooms [--archived]        List active rooms (--archived or --all includes archived)
   parley watch [--once] [--all]    Block and print messages as they arrive (for other harnesses)
                [--exec '<cmd>']    ...or run <cmd> per batch with the messages on stdin
   parley wake listen --url <address>  Start an agent here when mail arrives and no session is running
@@ -1726,8 +2075,10 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
   parley bind <room> [dir]         Connect a room to a different directory (--global for all)
   parley attend [room]             Make this session the one told about the room's messages
                                    (no session is until it joins the room or runs this)
+  parley unattend [room]           Stop telling this session about a room's messages
   parley setup claude-code         Reinstall or remove the Claude Code hooks (--remove, --ask-to-post)
   parley status                    Check the connection
+  parley mcp                       Standard MCP server over stdio (for Cursor, Codex, etc.)
   parley channel                   Experimental Claude Code channel server (MCP over stdio)
 
 ${TRUST_NOTE}`;
@@ -1761,8 +2112,10 @@ async function main() {
     threads: () => cmdRooms(args),
     bind: () => cmdBind(args),
     attend: () => cmdAttend(args),
+    unattend: () => cmdUnattend(args),
     status: () => cmdStatus(),
     setup: () => cmdSetup(args),
+    mcp: () => cmdMcp(),
     channel: () => cmdChannel(),
   };
   const run = commands[command];

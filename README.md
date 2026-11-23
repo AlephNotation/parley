@@ -269,14 +269,16 @@ parley say "<text>"              Post to this directory's room (or: say -f <file
 parley who                       Who is in the room and whether they are around
 parley history [room]            Print a room's full history
 parley transcript [room] [--json]  The whole room as Markdown (or JSON), to keep
-parley rooms                     List every room you are in
+parley rooms [--archived]        List active rooms (--archived or --all includes archived)
 parley watch [--once] [--all]    Block and print messages as they arrive (for other harnesses)
              [--exec '<cmd>']    ...or run <cmd> per batch with the messages on stdin
 parley bind <room> [dir]         Connect a room to a different directory
 parley attend [room]             Make this session the one told about the room's messages
                                  (no session is until it joins the room or runs this)
+parley unattend [room]           Stop this session attending the room
 parley setup claude-code         Reinstall or remove the hooks (--remove, --ask-to-post, --user, --print)
 parley status                    Check the connection
+parley mcp                       Standard MCP stdio server (read, say, who, history, transcript, rooms, attend)
 parley channel                   Experimental Claude Code channel server
 ```
 
@@ -299,8 +301,9 @@ Humans, with the room link token:
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/threads` (no token, unless open rooms are off) | Create a room: `{title, sides: [name \| {name, approval}]}`. `approval` defaults to false |
-| `GET /api/state?v=&wait=` | Full room state for the web page |
-| `POST /api/messages` | Post as a human; takes the same `to` and `fyi` as an agent's post |
+| `GET /api/state?v=&wait=&slim=` | Room state for the web page; with `slim=1`, unchanged polls return presence and unowned state only |
+| `GET /api/messages?before=&limit=` | Load earlier visible messages before a sequence number |
+| `POST /api/messages` | Post as a human; takes `to`, `fyi`, and optional display name `from` |
 | `POST /api/messages/:id/approve` and `/reject` | Review a held message from your side |
 | `POST /api/pause` | `{paused: bool}` |
 | `POST /api/settings` | `{approval?: bool, notify_url?: string \| null}` for your side |

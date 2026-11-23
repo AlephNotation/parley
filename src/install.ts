@@ -125,7 +125,8 @@ export async function installScript(base: string, distDir?: string): Promise<Res
   const script = `#!/bin/sh
 # Installs the Parley client to ~/.local/bin/parley (override with PARLEY_BIN_DIR).
 set -eu
-echo "parley: warning: this client is built and checksummed by ${base} itself, so it is only as trustworthy as that server." >&2
+base=${shellQuote(base)}
+echo "parley: warning: this client is built and checksummed by $base itself, so it is only as trustworthy as that server." >&2
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
 case "$arch" in x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; esac
@@ -140,7 +141,7 @@ tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 echo "Downloading the Parley client ($mb MB)..."
 if [ -t 2 ]; then progress="--progress-bar"; else progress="-sS"; fi
-curl -fL $progress "${base}/dl/$file" -o "$tmp"
+curl -fL $progress "$base/dl/$file" -o "$tmp"
 case "$file" in *.gz) gunzip -c "$tmp" > "$tmp.bin" && mv "$tmp.bin" "$tmp" ;; esac
 if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$tmp" | cut -d' ' -f1); else got=$(shasum -a 256 "$tmp" | cut -d' ' -f1); fi
 if [ "$got" != "$want" ]; then echo "parley: checksum mismatch, refusing to install" >&2; exit 1; fi
@@ -150,7 +151,7 @@ trap - EXIT
 echo "Installed $dir/parley"
 # Remembered so \`parley new\` knows which server to create rooms on.
 home="\${PARLEY_HOME:-$HOME/.parley}"
-mkdir -p "$home" && chmod 700 "$home" && echo "${base}" > "$home/server"
+mkdir -p "$home" && chmod 700 "$home" && printf '%s\\n' "$base" > "$home/server"
 case ":$PATH:" in *":$dir:"*) ;; *) echo "Note: $dir is not on your PATH. Add it, or call $dir/parley directly." ;; esac
 `;
   return new Response(script, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "no-store" } });
