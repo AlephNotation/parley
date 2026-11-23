@@ -1154,12 +1154,28 @@ function pidAlive(pid: number | undefined): boolean {
 /** Whether the session holding a room looks gone: nothing heard for a while and no waiter running for it. */
 const attendanceLapsed = (held: Attendance) => Date.now() - held.at > ATTEND_STALE_MS && !pidAlive(loadSession(held.session).pid);
 
+/**
+ * A session taking a room over starts from what the agent has read, not from where this session
+ * last looked: the session that had the room has dealt with everything up to there, and answering
+ * it again is the very thing attendance is meant to stop. Dropping the mark makes `sessionMarks`
+ * take the agent's shared one.
+ */
+function startFromSharedMark(session: string, rooms: string[]) {
+  const state = loadSession(session);
+  const stale = rooms.filter((id) => state.read?.[id] !== undefined);
+  if (stale.length === 0) return;
+  for (const id of stale) delete state.read![id];
+  writePrivate(sessionPath(session), state);
+}
+
 /** Makes `session` the one attending `rooms`, whoever held them. */
 function takeRooms(session: string, rooms: string[]) {
   if (rooms.length === 0) return;
   const all = loadAttending();
+  const gained = rooms.filter((id) => all[id]?.session !== session);
   for (const id of rooms) all[id] = { session, at: Date.now() };
   writePrivate(ATTENDING_PATH, all);
+  startFromSharedMark(session, gained);
 }
 
 /** Gives up every room `session` attends, so the next session to show up takes them. */
@@ -1181,6 +1197,7 @@ function attended(targets: Map<string, string[] | undefined>, session: string | 
   const all = loadAttending();
   const mine = new Map<string, string[] | undefined>();
   const others: string[] = [];
+  const gained: string[] = [];
   let changed = false;
   for (const [server, ids] of targets) {
     if (!ids) {
@@ -1196,6 +1213,7 @@ function attended(targets: Map<string, string[] | undefined>, session: string | 
       }
       // Rewriting the file on every hook run would be wasteful; a minute's precision is plenty.
       if (!held || held.session !== session || Date.now() - held.at > 60_000) {
+        if (held?.session !== session) gained.push(id);
         all[id] = { session, at: Date.now() };
         changed = true;
       }
@@ -1206,6 +1224,7 @@ function attended(targets: Map<string, string[] | undefined>, session: string | 
   if (changed) {
     try {
       writePrivate(ATTENDING_PATH, all);
+      startFromSharedMark(session, gained);
     } catch {}
   }
   return { mine, others };
@@ -1360,6 +1379,12 @@ async function hookWait() {
       // Working again: a later refusal deserves a fresh warning.
       delete settled.authWarned;
       writePrivate(sessionPath(session), settled);
+    }
+    // The wait above can last most of a minute, and another session may have taken a room over
+    // meanwhile. Waking for it now would get the message answered twice.
+    if (threads.length) {
+      const still = new Set([...mine(current).values()].flatMap((ids) => ids ?? []));
+      threads = threads.filter((t) => still.has(t.id));
     }
     // A removal wakes the session even with no mail: it is the last thing this room will say.
     const gone = takeRemovals();
