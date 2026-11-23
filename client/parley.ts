@@ -578,6 +578,9 @@ async function cmdJoin(args: ReturnType<typeof parseArgs>) {
   const dir = args.flags.global ? null : canonical(process.cwd());
   cfg.threads[res.thread.id] = { server, title: res.thread.title, dir };
   saveConfig(cfg);
+  // Joined from inside a session: that session is the one in the conversation.
+  const joiner = commandSession();
+  if (joiner) takeRooms(joiner, [res.thread.id]);
 
   const t = res.thread as ThreadInfo;
   const me = selfName();
@@ -589,7 +592,12 @@ async function cmdJoin(args: ReturnType<typeof parseArgs>) {
     try {
       const path = join(process.cwd(), ".claude", "settings.local.json");
       installHooks(path, { askToPost: args.flags["ask-to-post"] === true });
-      console.log(`Claude Code sessions started in ${process.cwd()} now know about this room and are told about new messages (hooks in ${path}).`);
+      console.log(
+        joiner
+          ? `This session attends the room: it is told about new messages, and other sessions in ${process.cwd()} are not (hooks in ${path}).`
+          : `One Claude Code session in ${process.cwd()} at a time attends this room and is told about new messages: the first to start or take a turn, until it ends (hooks in ${path}).`,
+      );
+      console.log(`To move the room to another session, run \`${me} attend\` in it.`);
       console.log(RUNNING_SESSION_NOTE);
     } catch (err) {
       const reason = (err as Error).message.replace(/\.?$/, ".");
@@ -740,6 +748,9 @@ async function cmdSay(args: ReturnType<typeof parseArgs>) {
   else if (piped) body = await Bun.stdin.text();
   else fail("no message given", 'Use `parley say "<text>"`, `parley say -f <file>`, or pipe the message on stdin.');
   const res = await post(t, body, audienceFlags(args));
+  // Whoever speaks in a room is the one the answer should come back to.
+  const speaker = commandSession();
+  if (speaker) takeRooms(speaker, [t.id]);
   console.log(res.message.status === "sent" ? `Posted as #${res.message.seq}.` : "Not posted yet: held for review.");
   console.log(res.note);
 }
@@ -832,6 +843,23 @@ function cmdBind(args: ReturnType<typeof parseArgs>) {
   cfg.threads[t.id]!.dir = dir;
   saveConfig(cfg);
   console.log(dir ? `Room ${t.id} is now connected to sessions working in ${dir}.` : `Room ${t.id} is now connected to every session.`);
+}
+
+/** `parley attend [room]`: make this session the one told about a room's messages. */
+function cmdAttend(args: ReturnType<typeof parseArgs>) {
+  const cfg = loadConfig();
+  const session = commandSession();
+  if (!session) {
+    fail(
+      "this is not running inside a Claude Code session, so there is no session to attend with",
+      "Ask the Claude Code session that should handle the room to run `parley attend`.",
+    );
+  }
+  const rooms = args.positional[0] ? [resolveRoom(cfg, args.positional[0]).id] : defaultRooms(cfg, process.cwd()).map(([id]) => id);
+  if (rooms.length === 0) fail("no Parley rooms are connected to this directory", "Name one: `parley attend <room>`. `parley rooms` lists them.");
+  takeRooms(session, rooms);
+  const names = rooms.map((id) => `"${cfg.threads[id]?.title ?? id}" [${id}]`).join(", ");
+  console.log(`This session now attends ${names}: it is the one told about new messages, and other sessions here are not.`);
 }
 
 async function cmdStatus() {
@@ -1087,6 +1115,113 @@ async function roomNotice(cfg: Config, cwd: string, targets: Map<string, string[
   );
 }
 
+// ---- Which session attends a room ------------------------------------------
+//
+// Several Claude Code sessions often run in one directory. Telling all of them about every message
+// interrupts work that has nothing to do with the room, and gets several answers to one question.
+// So one session at a time attends a room: the one that joined it or last posted to it, else the
+// first whose hooks run. The rest stay quiet until one takes it over with `parley attend`.
+
+interface Attendance {
+  session: string;
+  /** When the attending session last showed signs of life. */
+  at: number;
+}
+
+const ATTENDING_PATH = join(HOME, "attending.json");
+/** How long an attending session may be silent, with no waiter running, before another may take the room. */
+const ATTEND_STALE_MS = Number(process.env.PARLEY_ATTEND_STALE_MS ?? 10 * 60_000);
+
+function loadAttending(): Record<string, Attendance> {
+  try {
+    const raw = JSON.parse(readFileSync(ATTENDING_PATH, "utf8"));
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, Attendance>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function pidAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Whether the session holding a room looks gone: nothing heard for a while and no waiter running for it. */
+const attendanceLapsed = (held: Attendance) => Date.now() - held.at > ATTEND_STALE_MS && !pidAlive(loadSession(held.session).pid);
+
+/** Makes `session` the one attending `rooms`, whoever held them. */
+function takeRooms(session: string, rooms: string[]) {
+  if (rooms.length === 0) return;
+  const all = loadAttending();
+  for (const id of rooms) all[id] = { session, at: Date.now() };
+  writePrivate(ATTENDING_PATH, all);
+}
+
+/** Gives up every room `session` attends, so the next session to show up takes them. */
+function releaseRooms(session: string) {
+  const all = loadAttending();
+  const mine = Object.keys(all).filter((id) => all[id]!.session === session);
+  if (mine.length === 0) return;
+  for (const id of mine) delete all[id];
+  writePrivate(ATTENDING_PATH, all);
+}
+
+/**
+ * Splits the rooms in scope into those this session attends and those another session does. A room
+ * nobody attends, or whose session has gone, becomes this session's. A hook with no session id, and
+ * a run started by `parley wake listen`, attend everything in scope without claiming it.
+ */
+function attended(targets: Map<string, string[] | undefined>, session: string | null): { mine: Map<string, string[] | undefined>; others: string[] } {
+  if (!session || process.env.PARLEY_WOKEN) return { mine: targets, others: [] };
+  const all = loadAttending();
+  const mine = new Map<string, string[] | undefined>();
+  const others: string[] = [];
+  let changed = false;
+  for (const [server, ids] of targets) {
+    if (!ids) {
+      mine.set(server, ids);
+      continue;
+    }
+    const kept: string[] = [];
+    for (const id of ids) {
+      const held = all[id];
+      if (held && held.session !== session && !attendanceLapsed(held)) {
+        others.push(id);
+        continue;
+      }
+      // Rewriting the file on every hook run would be wasteful; a minute's precision is plenty.
+      if (!held || held.session !== session || Date.now() - held.at > 60_000) {
+        all[id] = { session, at: Date.now() };
+        changed = true;
+      }
+      kept.push(id);
+    }
+    if (kept.length) mine.set(server, kept);
+  }
+  if (changed) {
+    try {
+      writePrivate(ATTENDING_PATH, all);
+    } catch {}
+  }
+  return { mine, others };
+}
+
+/** What a session is told at its start about rooms here that another session attends. */
+function elsewhereNotice(cfg: Config, others: string[]): string | null {
+  if (others.length === 0) return null;
+  const names = others.map((id) => `"${cfg.threads[id]?.title ?? id}" [${id}]`).join(", ");
+  return (
+    `This directory is connected to Parley room${others.length === 1 ? "" : "s"} ${names}, which another session here is attending. ` +
+    `You will not be told about ${others.length === 1 ? "its" : "their"} messages and need do nothing. ` +
+    `Only if your human asks this session to handle ${others.length === 1 ? "it" : "them"}, run \`${selfName()} attend\`.`
+  );
+}
+
 /**
  * SessionStart: say which room this project is in, plus anything unread.
  * UserPromptSubmit: add one line of context only when there are unread messages.
@@ -1097,18 +1232,24 @@ async function hookPrompt() {
     const input = await hookInput();
     const cfg = loadConfig();
     const cwd = input.cwd ?? process.cwd();
-    const targets = scope(cfg, cwd, false);
-    if (targets.size === 0) return;
+    const inScope = scope(cfg, cwd, false);
+    if (inScope.size === 0) return;
+    const { mine: targets, others } = attended(inScope, input.session_id ?? null);
     const starting = input.hook_event_name === "SessionStart";
     let threads: Awaited<ReturnType<typeof fetchInbox>> = [];
-    try {
-      const from = await sessionMarks(cfg, targets, input.session_id ?? null);
-      threads = await fetchInbox(cfg, targets, { timeoutMs: 4000, from });
-    } catch {}
-    const parts: string[] = takeRemovals().map(removalNotice);
+    if (targets.size) {
+      try {
+        const from = await sessionMarks(cfg, targets, input.session_id ?? null);
+        threads = await fetchInbox(cfg, targets, { timeoutMs: 4000, from });
+      } catch {}
+    }
+    // A removal is told to the attending session; one that attends nothing here stays quiet.
+    const parts: string[] = targets.size ? takeRemovals().map(removalNotice) : [];
     if (starting) {
-      const notice = await roomNotice(cfg, cwd, targets);
+      const notice = targets.size ? await roomNotice(cfg, cwd, targets) : null;
       if (notice) parts.push(notice);
+      const elsewhere = elsewhereNotice(cfg, others);
+      if (elsewhere) parts.push(elsewhere);
     }
     if (threads.length) {
       if (input.session_id) markNotified(input.session_id, threads);
@@ -1143,7 +1284,8 @@ async function hookWait() {
   const session = input.session_id ?? "manual";
   const cwd = input.cwd ?? process.cwd();
   const cfg = loadConfig();
-  let targets = scope(cfg, cwd, false);
+  const mine = (c: Config) => attended(scope(c, cwd, false), input.session_id ?? null).mine;
+  let targets = mine(cfg);
   if (targets.size === 0) process.exit(0);
 
   const state = loadSession(session);
@@ -1170,12 +1312,17 @@ async function hookWait() {
   while (Date.now() < deadline) {
     // Stand down if a newer waiter took over this session, or the session that started us is gone.
     if (loadSession(session).pid !== process.pid) process.exit(0);
-    if (parent !== 1 && process.ppid !== parent) process.exit(0);
+    if (parent !== 1 && process.ppid !== parent) {
+      // The session is gone: let the next one here take its rooms straight away.
+      if (input.session_id) releaseRooms(input.session_id);
+      process.exit(0);
+    }
     let threads: Awaited<ReturnType<typeof fetchInbox>>;
     let current: Config;
     try {
       current = loadConfig();
-      targets = scope(current, cwd, false);
+      // Also keeps this session's hold on its rooms fresh, and drops any another session took over.
+      targets = mine(current);
       if (targets.size === 0) process.exit(0);
       const from = await sessionMarks(current, targets, input.session_id ?? null);
       threads = await withDeadline(
@@ -1230,6 +1377,14 @@ async function hookWait() {
   process.exit(0);
 }
 
+/** SessionEnd: give up this session's rooms, so the next session started here attends them. */
+async function hookEnd() {
+  try {
+    const input = await hookInput();
+    if (input.session_id) releaseRooms(input.session_id);
+  } catch {}
+}
+
 function hookSettings() {
   const cmd = (sub: string) =>
     selfArgv()
@@ -1242,6 +1397,7 @@ function hookSettings() {
     SessionStart: [{ hooks: [context, waiter] }],
     UserPromptSubmit: [{ hooks: [context] }],
     Stop: [{ hooks: [waiter] }],
+    SessionEnd: [{ hooks: [{ type: "command", command: cmd("end"), timeout: 10 }] }],
   };
 }
 
@@ -1252,11 +1408,11 @@ function hookSettings() {
  */
 function allowRules(askToPost: boolean): string[] {
   const names = [...new Set(["parley", selfName()])];
-  const subs = ["read", "history", "who", "rooms", "status", "inbox", "threads", ...(askToPost ? [] : ["say", "send"])];
+  const subs = ["read", "history", "who", "rooms", "status", "inbox", "threads", "attend", ...(askToPost ? [] : ["say", "send"])];
   return names.flatMap((name) => subs.map((sub) => `Bash(${name} ${sub}:*)`));
 }
 
-const isParleyRule = (rule: unknown) => typeof rule === "string" && /^Bash\(.*parley\S* (read|history|who|rooms|status|inbox|threads|say|send):\*\)$/.test(rule);
+const isParleyRule = (rule: unknown) => typeof rule === "string" && /^Bash\(.*parley\S* (read|history|who|rooms|status|inbox|threads|attend|say|send):\*\)$/.test(rule);
 
 /** Merges the Parley hooks and permissions into a Claude Code settings file, leaving everything else alone. */
 function installHooks(path: string, opts: { remove?: boolean; askToPost?: boolean } = {}) {
@@ -1270,7 +1426,7 @@ function installHooks(path: string, opts: { remove?: boolean; askToPost?: boolea
     }
     if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new UserError(`${path} is not a JSON object.`);
   }
-  const isOurs = (group: any) => (group?.hooks ?? []).some((h: any) => /\bhook (prompt|wait)$/.test(h?.command ?? "") && /parley/.test(h.command));
+  const isOurs = (group: any) => (group?.hooks ?? []).some((h: any) => /\bhook (prompt|wait|end)$/.test(h?.command ?? "") && /parley/.test(h.command));
   settings.hooks ??= {};
   for (const [event, groups] of Object.entries(hookSettings())) {
     const kept = (settings.hooks[event] ?? []).filter((group: any) => !isOurs(group));
@@ -1309,6 +1465,8 @@ function cmdSetup(args: ReturnType<typeof parseArgs>) {
   console.log("  SessionStart: tell Claude which room this project is in");
   console.log("  SessionStart, UserPromptSubmit: tell Claude about new messages");
   console.log("  Stop: wait in the background and wake Claude when a message arrives");
+  console.log("  SessionEnd: hand the room to the next session started here");
+  console.log("Only one session at a time is told about a room; `parley attend` moves it to another.");
   console.log(askToPost ? "Reading is pre-approved; posting asks for permission each time." : "Reading and posting are pre-approved (use --ask-to-post to be asked before each post).");
   console.log(RUNNING_SESSION_NOTE);
 }
@@ -1476,6 +1634,7 @@ const HELP = `parley ${VERSION}: chat rooms for agents and the humans they work 
   parley wake listen --url <address>  Start an agent here when mail arrives and no session is running
                [--exec '<cmd>']    (default: one headless Claude Code turn); \`wake off\` stops it
   parley bind <room> [dir]         Connect a room to a different directory (--global for all)
+  parley attend [room]             Make this session the one told about the room's messages
   parley setup claude-code         Reinstall or remove the Claude Code hooks (--remove, --ask-to-post)
   parley status                    Check the connection
   parley channel                   Experimental Claude Code channel server (MCP over stdio)
@@ -1491,7 +1650,8 @@ async function main() {
     // Hooks must never surface errors into the user's session.
     if (args.positional[0] === "prompt") return hookPrompt();
     if (args.positional[0] === "wait") return hookWait().catch(() => process.exit(0));
-    fail("usage: parley hook prompt|wait");
+    if (args.positional[0] === "end") return hookEnd();
+    fail("usage: parley hook prompt|wait|end");
   }
   const commands: Record<string, () => unknown> = {
     new: () => cmdNew(args),
@@ -1509,6 +1669,7 @@ async function main() {
     send: () => cmdSay(args),
     threads: () => cmdRooms(args),
     bind: () => cmdBind(args),
+    attend: () => cmdAttend(args),
     status: () => cmdStatus(),
     setup: () => cmdSetup(args),
     channel: () => cmdChannel(),

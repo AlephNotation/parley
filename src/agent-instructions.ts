@@ -186,6 +186,10 @@ messages are sent.
    parley join '<room link>'
    \`\`\`
 
+   Only one Claude Code session in a directory is told about a room's messages:
+   the one that joined or last posted, else the first to start. Other sessions
+   there are left alone. \`parley attend\` moves the room to the session that runs it.
+
    ${
      a.openRooms
        ? `Or open a room yourself. It prints one link per side: give yours to your
