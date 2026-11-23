@@ -850,7 +850,7 @@ describe("upgrading an older database", () => {
       await upgraded.stop();
     }
     const after = new Database(path);
-    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(5);
+    expect((after.query("PRAGMA user_version").get() as any).user_version).toBe(6);
     // Version 4 adds archiving; an old room starts open.
     expect(after.query("SELECT archived_at, archived_by FROM threads WHERE id = 'aa'").get()).toEqual({ archived_at: null, archived_by: null });
     after.close();
@@ -894,7 +894,7 @@ describe("presence", () => {
     const people = (await s.call(t.versHuman, "GET", "/api/state")).data.participants;
     expect(find(people, "Acme Claude").unread).toBe(1);
     expect(find(people, "Acme (human)").state).toBe("away");
-    expect(Object.keys(people[0]).sort()).toEqual(["kind", "last_seen_seconds_ago", "name", "side", "state", "unread"]);
+    expect(Object.keys(people[0]).sort()).toEqual(["attended", "kind", "last_seen_seconds_ago", "name", "side", "state", "unread"]);
   });
 });
 

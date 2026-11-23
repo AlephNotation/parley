@@ -619,6 +619,7 @@
     li.title = x.name + " · " + x.kind + " · " + when;
     const note = [];
     if (x.state === "away") note.push(since);
+    if (x.state === "away" && x.attended === false) note.push("no session attending");
     if (x.state === "not_joined") note.push(x.kind === "human" ? "link not opened" : "not joined");
     if (x.unread) note.push(x.unread + " unread");
     li.append(el("span", "dot " + x.state), el("span", "name", x.name));

@@ -186,9 +186,11 @@ messages are sent.
    parley join '<room link>'
    \`\`\`
 
-   Only one Claude Code session in a directory is told about a room's messages:
-   the one that joined or last posted, else the first to start. Other sessions
-   there are left alone. \`parley attend\` moves the room to the session that runs it.
+   The session that runs the join attends the room: it is the one told about
+   new messages. No other session in the directory is. If a human ran the join
+   in a terminal, no session attends until one is asked to and runs
+   \`parley attend\`. Do not run it unless your human asks this session to
+   handle the room.
 
    ${
      a.openRooms
