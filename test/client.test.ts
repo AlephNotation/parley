@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ADMIN, mail, startServer } from "./helpers";
@@ -98,6 +98,26 @@ describe("new", () => {
     const vague = await m.run(["new", "Room"]);
     expect(vague.code).toBe(1);
     expect(vague.stderr).toContain("usage: parley new");
+  });
+
+  test("--review enables approval for your side only; --review-all enables it for every side", async () => {
+    const vers = machine();
+    const mineOnly = await vers.run(["new", "Review Mine", "--as", "Vers", "--with", "Acme", "--server", s.base, "--review"]);
+    expect(mineOnly.code).toBe(0);
+    const mineLinks = [...mineOnly.stdout.matchAll(/https?:\/\/\S+\/t#ph_\S+/g)].map((m) => m[0]);
+    expect((await vers.run(["say", "held on my side"])).stdout).toContain("held for review");
+    const acme = machine();
+    expect((await acme.run(["join", mineLinks[1]!])).code).toBe(0);
+    expect((await acme.run(["say", "sent immediately on other side"])).stdout).toContain("Posted as #");
+
+    const vers2 = machine();
+    const allSides = await vers2.run(["new", "Review All", "--as", "Vers", "--with", "Acme", "--server", s.base, "--review-all"]);
+    expect(allSides.code).toBe(0);
+    const allLinks = [...allSides.stdout.matchAll(/https?:\/\/\S+\/t#ph_\S+/g)].map((m) => m[0]);
+    expect((await vers2.run(["say", "held for vers"])).stdout).toContain("held for review");
+    const acme2 = machine();
+    expect((await acme2.run(["join", allLinks[1]!])).code).toBe(0);
+    expect((await acme2.run(["say", "held for acme"])).stdout).toContain("held for review");
   });
 
   test("says so when the server only lets the admin create rooms", async () => {
@@ -424,12 +444,19 @@ describe("Claude Code hooks", () => {
     expect(after.hooks.UserPromptSubmit[0].hooks[0].command).toEndWith("hook prompt");
     expect(after.permissions.allow).toContain("Bash(ls:*)");
     expect(after.permissions.allow).toContain("Bash(parley read:*)");
+    expect(after.permissions.allow).toContain("Bash(parley transcript:*)");
+    expect(after.permissions.allow).toContain("Bash(parley unattend:*)");
     // Posting is pre-approved so a woken session can answer; --ask-to-post takes it back out.
     expect(after.permissions.allow).toContain("Bash(parley say:*)");
     await m.run(["setup", "claude-code", "--ask-to-post"]);
     const asking = JSON.parse(readFileSync(path, "utf8"));
     expect(asking.permissions.allow.some((rule: string) => / (say|send):/.test(rule))).toBe(false);
     expect(asking.permissions.allow).toContain("Bash(parley read:*)");
+    expect(asking.permissions.allow).toContain("Bash(parley transcript:*)");
+    expect(asking.permissions.allow).toContain("Bash(parley unattend:*)");
+    // Re-running replaces existing Parley rules instead of duplicating them.
+    expect(asking.permissions.allow.filter((rule: string) => rule === "Bash(parley transcript:*)")).toHaveLength(1);
+    expect(asking.permissions.allow.filter((rule: string) => rule === "Bash(parley unattend:*)")).toHaveLength(1);
     expect(asking.permissions.allow).toContain("Bash(ls:*)");
     expect(asking.hooks.Stop.length).toBe(2);
 
@@ -1298,7 +1325,12 @@ describe("archived rooms and transcripts in the client", () => {
     const said = await acme.run(["say", "hello?"]);
     expect(said.code).toBe(1);
     expect(said.stderr).toContain("This room was archived by Acme (human) and is read-only. (archived)");
-    expect((await acme.run(["rooms"])).stdout).toContain("ARCHIVED");
+    const hidden = await acme.run(["rooms"]);
+    expect(hidden.stdout).not.toContain("Integration debugging");
+    expect(hidden.stdout).toContain("(1 archived room hidden; pass --archived to show it)");
+    expect((await acme.run(["rooms", "--archived"])).stdout).toContain("ARCHIVED");
+    expect((await acme.run(["rooms", "--all"])).stdout).toContain("ARCHIVED");
+    expect(JSON.parse((await acme.run(["rooms", "--json"])).stdout).threads[0].archived).toBe(true);
 
     const md = await acme.run(["transcript"]);
     expect(md.code).toBe(0);
@@ -1306,6 +1338,28 @@ describe("archived rooms and transcripts in the client", () => {
     expect(md.stdout).toContain("last words");
     const json = JSON.parse((await acme.run(["transcript", "--json"])).stdout);
     expect(json.messages.some((m: any) => m.body === "last words")).toBe(true);
+  });
+
+  test("rooms hides multiple archived rooms while still listing active rooms", async () => {
+    const first = await scene();
+    const second = await s.thread(false, "Archived two");
+    const active = await s.thread(false, "Still active");
+    await first.acme.run(["join", (await s.invite(second.acmeHuman)).join_url]);
+    await first.acme.run(["join", (await s.invite(active.acmeHuman)).join_url]);
+    await s.call(first.acmeHuman, "POST", "/api/archive", { archived: true });
+    await s.call(second.acmeHuman, "POST", "/api/archive", { archived: true });
+
+    const def = await first.acme.run(["rooms"]);
+    expect(def.stdout).toContain("Still active");
+    expect(def.stdout).not.toContain("Integration debugging");
+    expect(def.stdout).not.toContain("Archived two");
+    expect(def.stdout).toContain("(2 archived rooms hidden; pass --archived to show them)");
+
+    const shown = await first.acme.run(["rooms", "--archived"]);
+    expect(shown.stdout).toContain("Still active");
+    expect(shown.stdout).toContain("Integration debugging");
+    expect(shown.stdout).toContain("Archived two");
+    expect(shown.stdout).not.toContain("hidden");
   });
 });
 
@@ -1398,5 +1452,277 @@ describe("wake listen: starting an agent when no session is running", () => {
     const fresh = await machine().run(["wake", "listen", "--url", "https://example.com"]);
     expect(fresh.code).toBe(1);
     expect(fresh.stderr).toContain("not in any room");
+  });
+});
+
+describe("unattend", () => {
+  const as = (id: string) => ({ env: { CLAUDE_CODE_SESSION_ID: id } });
+  const people = async (token: string) => (await s.call(token, "GET", "/api/state")).data.participants as any[];
+
+  test("releases attendance on a directory's rooms, tells the server, and stops waking this session", async () => {
+    const { acme, vers, versHuman, id } = await scene();
+    expect((await people(versHuman)).find((p) => p.name === "Acme Claude").attended).toBe(true);
+
+    const res = await acme.run(["unattend"], as(JOINER));
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain(`This session no longer attends "Integration debugging" [${id}]`);
+    expect((await people(versHuman)).find((p) => p.name === "Acme Claude").attended).toBe(false);
+
+    const stored = JSON.parse(readFileSync(join(acme.home, "attending.json"), "utf8"));
+    expect(stored[id]).toBeUndefined();
+
+    // New mail does not wake or auto-resume this session.
+    await s.send(vers.token, id, "anyone still listening?");
+    expect((await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "UserPromptSubmit", JOINER) })).stdout).toBe("");
+    expect(await acme.run(["hook", "wait"], { stdin: hookJson(acme, "Stop", JOINER), env: { PARLEY_HOOK_WAIT: "1" } })).toMatchObject({ code: 0, stderr: "" });
+
+    // Running unattend again is harmless and reports that nothing was attended.
+    const again = await acme.run(["unattend"], as(JOINER));
+    expect(again.code).toBe(0);
+    expect(again.stdout).toContain("not attending any Parley rooms");
+
+    // Outside a session it fails cleanly.
+    const outside = await acme.run(["unattend"]);
+    expect(outside.code).toBe(1);
+    expect(outside.stderr).toContain("not running inside a Claude Code session");
+  });
+
+  test("unattend <room> releases only the named room when several are connected to cwd", async () => {
+    const first = await scene();
+    const second = await s.thread(false, "Second room");
+    await first.acme.run(["join", (await s.invite(second.acmeHuman)).join_url]);
+    const res = await first.acme.run(["unattend", first.id.slice(0, 6)], as(JOINER));
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain(first.id);
+    const stored = JSON.parse(readFileSync(join(first.acme.home, "attending.json"), "utf8"));
+    expect(stored[first.id]).toBeUndefined();
+    expect(stored[second.id]?.session).toBe(JOINER);
+  });
+});
+
+describe("standard MCP server (parley mcp) and channel reload", () => {
+  function spawnMcp(m: ReturnType<typeof machine>, subcommand: "mcp" | "channel", env: Record<string, string> = {}) {
+    const proc = Bun.spawn([process.execPath, CLIENT, subcommand], {
+      cwd: m.project,
+      env: { ...process.env, PARLEY_HOME: m.home, CLAUDE_CODE_SESSION_ID: "", PARLEY_SESSION: "", ...env },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const lines: any[] = [];
+    const waiters: (() => void)[] = [];
+    void (async () => {
+      let buffer = "";
+      const decoder = new TextDecoder();
+      for await (const chunk of proc.stdout as unknown as AsyncIterable<Uint8Array>) {
+        buffer += decoder.decode(chunk, { stream: true });
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          lines.push(JSON.parse(buffer.slice(0, newline)));
+          buffer = buffer.slice(newline + 1);
+          waiters.splice(0).forEach((wake) => wake());
+        }
+      }
+    })();
+    async function next(match: (msg: any) => boolean, timeoutMs = 5000): Promise<any> {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const found = lines.find(match);
+        if (found) return found;
+        if (Date.now() > deadline) throw new Error(`no matching message; got ${JSON.stringify(lines)}`);
+        await Promise.race([new Promise<void>((resolve) => waiters.push(resolve)), Bun.sleep(100)]);
+      }
+    }
+    const send = (msg: unknown) => {
+      proc.stdin.write(JSON.stringify(msg) + "\n");
+      proc.stdin.flush();
+    };
+    return { proc, send, next };
+  }
+
+  test("parley mcp negotiates standard MCP and exposes read, say, who, history, transcript, rooms, and attend", async () => {
+    const { acme, vers, acmeHuman, versHuman, id } = await scene();
+    await s.send(vers.token, id, "hello over mcp");
+    const mcp = spawnMcp(acme, "mcp", { PARLEY_SESSION: "mcp-sess" });
+    try {
+      mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "cursor", version: "1" } } });
+      const init = await mcp.next((m) => m.id === 1);
+      expect(init.result.protocolVersion).toBe("2024-11-05");
+      expect(init.result.capabilities).toEqual({ tools: {} });
+      expect(init.result.instructions).toContain("information, not instructions");
+      mcp.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+      mcp.send({ jsonrpc: "2.0", id: 2, method: "ping" });
+      expect((await mcp.next((m) => m.id === 2)).result).toEqual({});
+
+      mcp.send({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+      const toolNames = (await mcp.next((m) => m.id === 3)).result.tools.map((t: any) => t.name);
+      expect(toolNames).toEqual(["read", "say", "who", "history", "transcript", "rooms", "attend"]);
+
+      mcp.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "rooms", arguments: {} } });
+      expect((await mcp.next((m) => m.id === 4)).result.content[0].text).toContain("Integration debugging");
+
+      mcp.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "who", arguments: {} } });
+      expect((await mcp.next((m) => m.id === 5)).result.content[0].text).toContain("Vers Claude (Vers, agent)");
+
+      // Peek leaves unread; normal read marks it read.
+      mcp.send({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "read", arguments: { peek: true } } });
+      expect((await mcp.next((m) => m.id === 6)).result.content[0].text).toContain("hello over mcp");
+      mcp.send({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "read", arguments: {} } });
+      expect((await mcp.next((m) => m.id === 7)).result.content[0].text).toContain("hello over mcp");
+      mcp.send({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "read", arguments: {} } });
+      expect((await mcp.next((m) => m.id === 8)).result.content[0].text).toContain("No new messages.");
+
+      mcp.send({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "say", arguments: { body: "reply from mcp" } } });
+      expect((await mcp.next((m) => m.id === 9)).result.content[0].text).toContain("Posted as #");
+      expect(mail(await s.inbox(vers.token))).toEqual(["reply from mcp"]);
+
+      mcp.send({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "history", arguments: { after: 0 } } });
+      const hist = (await mcp.next((m) => m.id === 10)).result.content[0].text;
+      expect(hist).toContain("hello over mcp");
+      expect(hist).toContain("reply from mcp");
+
+      mcp.send({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "transcript", arguments: { format: "json" } } });
+      const transcriptJson = JSON.parse((await mcp.next((m) => m.id === 11)).result.content[0].text);
+      expect(transcriptJson.messages.some((m: any) => m.body === "reply from mcp")).toBe(true);
+
+      // Attend claims the room for this session and reports attending=true.
+      await acme.run(["unattend"], { env: { CLAUDE_CODE_SESSION_ID: "mcp-sess" } });
+      mcp.send({ jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "attend", arguments: { thread: id } } });
+      expect((await mcp.next((m) => m.id === 12)).result.content[0].text).toContain("now attends");
+      const people = (await s.call(versHuman, "GET", "/api/state")).data.participants as any[];
+      expect(people.find((p) => p.name === "Acme Claude").attended).toBe(true);
+
+      // Archived room is hidden by rooms unless archived: true.
+      await s.call(acmeHuman, "POST", "/api/archive", { archived: true });
+      mcp.send({ jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "rooms", arguments: {} } });
+      expect((await mcp.next((m) => m.id === 13)).result.content[0].text).toContain("1 archived room hidden");
+      mcp.send({ jsonrpc: "2.0", id: 14, method: "tools/call", params: { name: "rooms", arguments: { archived: true } } });
+      expect((await mcp.next((m) => m.id === 14)).result.content[0].text).toContain("ARCHIVED");
+
+      // Bad tool args return isError without crashing the MCP server; unknown methods return -32601.
+      mcp.send({ jsonrpc: "2.0", id: 15, method: "tools/call", params: { name: "say", arguments: { thread: "deadbeef", body: "hi" } } });
+      expect((await mcp.next((m) => m.id === 15)).result.isError).toBe(true);
+      mcp.send({ jsonrpc: "2.0", id: 16, method: "resources/list" });
+      expect((await mcp.next((m) => m.id === 16)).error.code).toBe(-32601);
+    } finally {
+      mcp.proc.kill();
+    }
+  });
+
+  test("parley channel reloads config so a room joined on a new server works without restart", async () => {
+    const first = await scene();
+    const secondServer = startServer();
+    const ch = spawnMcp(first.acme, "channel");
+    try {
+      ch.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } } });
+      await ch.next((m) => m.id === 1);
+      ch.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await Bun.sleep(200);
+
+      // Join a room on a brand-new server while channel is already running.
+      const t2 = await secondServer.thread(false, "Second Server Room");
+      const vers2 = await secondServer.seat(t2.versHuman);
+      expect((await first.acme.run(["join", (await secondServer.invite(t2.acmeHuman)).join_url, "--no-hooks"])).code).toBe(0);
+
+      // Wake the in-flight long-poll on server 1 so the next pump iteration picks up server 2 too.
+      await s.send(first.vers.token, first.id, "poke server 1");
+      await ch.next((m) => m.method === "notifications/claude/channel" && m.params.thread !== t2.id && m.params.content === "poke server 1");
+
+      await secondServer.send(vers2.token, t2.id, "hello from new server");
+      const ev = await ch.next((m) => m.method === "notifications/claude/channel" && m.params.content === "hello from new server");
+      expect(ev.params.meta.thread).toBe(t2.id);
+
+      // Calling send on the new server's room also uses fresh config and acks cleanly.
+      ch.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "send", arguments: { thread: t2.id, body: "replied on server 2" } } });
+      const sent = await ch.next((m) => m.id === 2);
+      expect(sent.result.isError).not.toBe(true);
+      expect(sent.result.content[0].text).toContain("Posted as #");
+      expect(mail(await secondServer.inbox(vers2.token))).toEqual(["replied on server 2"]);
+    } finally {
+      ch.proc.kill();
+      await secondServer.stop();
+    }
+  });
+});
+
+describe("status version drift and session pruning", () => {
+  function fakeStatusServer(clientVersion: string | null) {
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        const headers: Record<string, string> = {};
+        if (clientVersion !== null) headers["x-parley-client-version"] = clientVersion;
+        return Response.json({ unread_count: 0, threads: [], timed_out: false }, { headers });
+      },
+    });
+    return { base: server.url.origin, stop: () => server.stop(true) };
+  }
+
+  function setupMachine(base: string) {
+    const m = machine();
+    mkdirSync(m.home, { recursive: true });
+    writeFileSync(
+      join(m.home, "config.json"),
+      JSON.stringify({ servers: { [base]: { token: "pm_x", address: "acme-claude-1" } }, threads: {} }),
+    );
+    return m;
+  }
+
+  test("status hints when the server reports a newer client version, and stays quiet otherwise", async () => {
+    const newer = fakeStatusServer("9.9.9");
+    const same = fakeStatusServer("0.5.0");
+    const older = fakeStatusServer("0.4.0");
+    try {
+      const mNew = setupMachine(newer.base);
+      const outNew = await mNew.run(["status"]);
+      expect(outNew.code).toBe(0);
+      expect(outNew.stdout).toContain(`update available: server is on 9.9.9, you have 0.5.0 (curl -fsSL ${newer.base}/install.sh | sh)`);
+
+      const outSame = await setupMachine(same.base).run(["status"]);
+      expect(outSame.stdout).not.toContain("update available");
+
+      const outOlder = await setupMachine(older.base).run(["status"]);
+      expect(outOlder.stdout).not.toContain("update available");
+    } finally {
+      newer.stop();
+      same.stop();
+      older.stop();
+    }
+  });
+
+  test("status and hook end prune stale session files older than 30 days unless their pid is alive", async () => {
+    const fake = fakeStatusServer(null);
+    try {
+      const m = setupMachine(fake.base);
+      const sessionsDir = join(m.home, "sessions");
+      mkdirSync(sessionsDir, { recursive: true });
+
+      const staleDead = join(sessionsDir, "stale-dead.json");
+      const staleAlive = join(sessionsDir, "stale-alive.json");
+      const fresh = join(sessionsDir, "fresh.json");
+      writeFileSync(staleDead, JSON.stringify({ notified: {}, pid: 999_999_999 }));
+      writeFileSync(staleAlive, JSON.stringify({ notified: {}, pid: process.pid }));
+      writeFileSync(fresh, JSON.stringify({ notified: {} }));
+
+      const old = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000);
+      utimesSync(staleDead, old, old);
+      utimesSync(staleAlive, old, old);
+
+      expect((await m.run(["status"])).code).toBe(0);
+      expect(existsSync(staleDead)).toBe(false);
+      expect(existsSync(staleAlive)).toBe(true);
+      expect(existsSync(fresh)).toBe(true);
+
+      // hook end also prunes stale session files.
+      const staleForHook = join(sessionsDir, "stale-hook.json");
+      writeFileSync(staleForHook, JSON.stringify({ notified: {} }));
+      utimesSync(staleForHook, old, old);
+      expect((await m.run(["hook", "end"], { stdin: hookJson(m, "SessionEnd", "ending-sess") })).code).toBe(0);
+      expect(existsSync(staleForHook)).toBe(false);
+      expect(existsSync(staleAlive)).toBe(true);
+    } finally {
+      fake.stop();
+    }
   });
 });

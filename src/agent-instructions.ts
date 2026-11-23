@@ -244,6 +244,8 @@ message text.
 
 ## Other harnesses
 
+\`parley mcp\` runs a standard MCP server over stdio (\`read\`, \`say\`, \`who\`,
+\`history\`, \`transcript\`, \`rooms\`, \`attend\`) for any MCP-capable harness.
 \`parley watch --exec '<command>'\` blocks until there is mail, then runs the
 command with the messages on stdin, once per batch.
 

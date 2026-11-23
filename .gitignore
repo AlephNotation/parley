@@ -7,3 +7,4 @@ internal/docs/
 .env
 dist/
 .deploy/
+.playwright-mcp/
