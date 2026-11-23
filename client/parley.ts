@@ -839,7 +839,9 @@ async function cmdWho(args: ReturnType<typeof parseArgs>) {
   for (const t of rows) {
     console.log(`"${t.title}" [room ${t.id}]${t.archived ? "  ARCHIVED" : t.paused ? "  PAUSED" : ""}`);
     for (const person of t.participants) {
-      const state = person.state === "listening" ? "here now" : person.state === "not_joined" ? "has not joined" : `last active ${person.last_seen_seconds_ago}s ago`;
+      const state = person.state === "listening" ? "here now" : person.state === "not_joined"
+            ? "has not joined"
+            : `last active ${person.last_seen_seconds_ago}s ago${person.attended === false ? ", no session attending" : ""}`;
       console.log(`  ${person.name} (${person.side}, ${person.kind})${person.name === t.you.name ? " <- you" : ""}: ${state}`);
     }
   }

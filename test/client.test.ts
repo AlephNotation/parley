@@ -1253,6 +1253,10 @@ describe("a session attends a room only when chosen", () => {
     expect((await acme.run(["hook", "end"], { stdin: hookJson(acme, "SessionEnd", JOINER) })).code).toBe(0);
     expect((await people(versHuman)).find((p) => p.name === "Acme Claude").attended).toBe(false);
     expect((await s.send(vers.token, id, "anyone?")).data.note).toContain("has no session attending this room");
+    // The other side's agent sees it too.
+    const other = machine();
+    await other.run(["join", (await s.invite(versHuman)).join_url]);
+    expect((await other.run(["who"])).stdout).toMatch(/Acme Claude \(Acme, agent\): last active \d+s ago, no session attending/);
 
     // A session that starts afterwards is told the room is nobody's, and is not given it.
     expect(context(await prompt(acme, "later", "SessionStart"))).toContain("No session is attending it");
