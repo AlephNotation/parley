@@ -138,7 +138,7 @@ describe("join", () => {
     expect(res.stdout).not.toContain("ph_");
 
     const settings = JSON.parse(readFileSync(join(m.project, ".claude", "settings.local.json"), "utf8"));
-    expect(Object.keys(settings.hooks).sort()).toEqual(["SessionStart", "Stop", "UserPromptSubmit"]);
+    expect(Object.keys(settings.hooks).sort()).toEqual(["SessionEnd", "SessionStart", "Stop", "UserPromptSubmit"]);
     expect(settings.permissions.allow).toContain("Bash(parley say:*)");
 
     // Joining again from the same machine is harmless.
@@ -309,6 +309,8 @@ describe("Claude Code hooks", () => {
     expect(out.additionalContext).not.toContain("unread");
 
     await s.send(vers.token, id, "before you started");
+    // The first session ends, so the next one started here attends the room.
+    await acme.run(["hook", "end"], { stdin: hookJson(acme, "SessionEnd") });
     const withMail = await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "SessionStart", "sess-2") });
     expect(JSON.parse(withMail.stdout).hookSpecificOutput.additionalContext).toContain("1 unread Parley message");
 
@@ -1106,6 +1108,95 @@ describe("read marks per session", () => {
     await acme.run(["read"], as("A"));
     expect((await acme.run(["history"], as("A"))).stdout).not.toMatch(/history check\s+\[new\]/);
     expect((await acme.run(["history"], as("B"))).stdout).toMatch(/history check\s+\[new\]/);
+  });
+});
+
+describe("one session attends a room", () => {
+  const as = (id: string) => ({ env: { CLAUDE_CODE_SESSION_ID: id } });
+  const context = (out: { stdout: string }) => (out.stdout ? (JSON.parse(out.stdout).hookSpecificOutput.additionalContext as string) : "");
+  const prompt = (m: ReturnType<typeof machine>, session: string, event = "UserPromptSubmit") =>
+    m.run(["hook", "prompt"], { stdin: hookJson(m, event, session) });
+  const wait = (m: ReturnType<typeof machine>, session: string) =>
+    m.run(["hook", "wait"], { stdin: hookJson(m, "Stop", session), env: { PARLEY_HOOK_WAIT: "1" } });
+
+  test("of several sessions in one directory, only the first is told about messages", async () => {
+    const { acme, vers, id } = await scene();
+    expect(context(await prompt(acme, "A", "SessionStart"))).toContain("you are Acme Claude");
+    // The others learn once that the room exists and is not theirs, and are then left alone.
+    for (const other of ["B", "C"]) {
+      const start = context(await prompt(acme, other, "SessionStart"));
+      expect(start).toContain("which another session here is attending");
+      expect(start).toContain("You will not be told about its messages");
+      expect(start).not.toContain("you are Acme Claude");
+    }
+    await s.send(vers.token, id, "one answer please");
+    for (const other of ["B", "C"]) {
+      expect((await prompt(acme, other)).stdout).toBe("");
+      expect(await wait(acme, other)).toMatchObject({ code: 0, stderr: "" });
+    }
+    const woken = await wait(acme, "A");
+    expect(woken.code).toBe(2);
+    expect(woken.stderr).toContain("1 unread Parley message");
+    expect(context(await prompt(acme, "A"))).toContain("1 unread Parley message");
+    // A session that is not attending can still read the room when asked to.
+    expect((await acme.run(["read"], as("B"))).stdout).toContain("one answer please");
+  });
+
+  test("attend moves the room to another session, and so does posting to it", async () => {
+    const { acme, vers, id } = await scene();
+    await prompt(acme, "A", "SessionStart");
+    await prompt(acme, "B", "SessionStart");
+    const took = await acme.run(["attend"], as("B"));
+    expect(took.code).toBe(0);
+    expect(took.stdout).toContain(`This session now attends "Integration debugging" [${id}]`);
+    await s.send(vers.token, id, "after the handover");
+    expect((await prompt(acme, "A")).stdout).toBe("");
+    expect(context(await prompt(acme, "B"))).toContain("1 unread Parley message");
+
+    expect((await acme.run(["say", "A here, taking this one"], as("A"))).code).toBe(0);
+    await s.send(vers.token, id, "an answer for A");
+    expect((await prompt(acme, "B")).stdout).toBe("");
+    expect(context(await prompt(acme, "A"))).toContain("unread Parley message");
+
+    const outside = await acme.run(["attend"]);
+    expect(outside.code).toBe(1);
+    expect(outside.stderr).toContain("not running inside a Claude Code session");
+  });
+
+  test("a session that joins the room itself is the one attending it", async () => {
+    const t = await s.thread(false);
+    const vers = await s.seat(t.versHuman);
+    const acme = machine();
+    // Another session is already at work in the directory when this one joins.
+    const joined = await acme.run(["join", (await s.invite(t.acmeHuman)).join_url], as("joiner"));
+    expect(joined.stdout).toContain("This session attends the room");
+    await s.send(vers.token, t.id, "hello joiner");
+    expect((await prompt(acme, "bystander")).stdout).toBe("");
+    expect(context(await prompt(acme, "joiner"))).toContain("1 unread Parley message");
+  });
+
+  test("the room passes on when the attending session ends, or goes quiet with no waiter", async () => {
+    const { acme, vers, id } = await scene();
+    await prompt(acme, "A", "SessionStart");
+    await s.send(vers.token, id, "anyone?");
+    expect((await prompt(acme, "B")).stdout).toBe("");
+    expect((await acme.run(["hook", "end"], { stdin: hookJson(acme, "SessionEnd", "A") })).code).toBe(0);
+    expect(context(await prompt(acme, "B"))).toContain("1 unread Parley message");
+
+    // B never says goodbye (a crash, or hooks from before SessionEnd was installed): C takes over once B has lapsed.
+    expect((await prompt(acme, "C")).stdout).toBe("");
+    const lapsed = await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "UserPromptSubmit", "C"), env: { PARLEY_ATTEND_STALE_MS: "0" } });
+    expect(context(lapsed)).toContain("1 unread Parley message");
+  });
+
+  test("a run started by wake listen is told about mail whoever attends the room", async () => {
+    const { acme, vers, id } = await scene();
+    await prompt(acme, "A", "SessionStart");
+    await s.send(vers.token, id, "wake up");
+    const woken = await acme.run(["hook", "prompt"], { stdin: hookJson(acme, "SessionStart", "headless"), env: { PARLEY_WOKEN: "1" } });
+    expect(context(woken)).toContain("1 unread Parley message");
+    // It did not take the room from A.
+    expect(context(await prompt(acme, "A"))).toContain("1 unread Parley message");
   });
 });
 
